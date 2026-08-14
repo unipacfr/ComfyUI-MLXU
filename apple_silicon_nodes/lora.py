@@ -814,7 +814,14 @@ def _ensure_adaptable(leaf: nn.Linear) -> AdaptableLinear:
     """
     if isinstance(leaf, AdaptableLinear):
         clone = copy.copy(leaf)
+        # BOTH adapter lists must be copied. `copy.copy` on an MLX Module (a
+        # dict subclass) is shallow, so any list left uncopied stays SHARED
+        # with the original -- a second LoRA attaching to the same leaf then
+        # appends into the first one's list too, double-applying every
+        # adapter. Missing `_lokr_factors` here produced black (NaN) images
+        # for both ASDX_LoraSchedule and ASDX_MultiLoraLoader.
         clone._lora_factors = list(leaf._lora_factors)
+        clone._lokr_factors = list(getattr(leaf, "_lokr_factors", []))
         return clone
     return AdaptableLinear.from_linear(leaf)
 
@@ -1847,6 +1854,17 @@ class ASDX_LoraLoader(io.ComfyNode):
                 # minus any .weight suffix). Every target in a real LoRA
                 # file shares the same value in practice -- keep the first
                 # one found rather than tracking one per target.
+                #
+                # A full-w1/w2 LoKr target's alpha is NOT a scale: comfy uses
+                # it only to rebuild low-rank `lokr_w*_a/_b` factors
+                # (`weight_adapter/lokr.py`), and a real file on this machine
+                # carries a sentinel (9999220736.0). Reading it as the
+                # application scale made every LoKr generation overflow to a
+                # black image -- the delta itself was correct, the scale it
+                # was multiplied by was ~1e10.
+                stem = key[: -len(".alpha")]
+                if f"{stem}.lokr_w1" in raw and f"{stem}.lokr_w1_a" not in raw:
+                    continue
                 if alpha_value is None:
                     try:
                         alpha_value = float(weight)
