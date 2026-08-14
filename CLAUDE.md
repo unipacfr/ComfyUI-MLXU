@@ -23,11 +23,11 @@ Your goal is to build high-performance, robust, and clean custom nodes for Comfy
 
 3. **Precision & Data Types**:
    * Default to `torch.float32`, `torch.bfloat16`, or `mx.bfloat16` / `mx.float16` for MLX.
-   * **PyTorch MPS Caveat**: `torch.float16` on MPS can cause NaNs or black images in sensitive ops (LayerNorm, VAE). Use `float32` or `bfloat16` for PyTorch MPS fallbacks. MLX handles `float16` and `bfloat16` natively much more stably.
+   * **PyTorch MPS Caveat**: `torch.float16` on MPS can cause NaNs or black images in sensitive ops (LayerNorm, VAE, attention). Use `float32` or `bfloat16` for PyTorch MPS fallbacks. Example: Krea2's vision tower explicitly sets `torch.bfloat16` to avoid float16 overflow in attention (`conditioning.py:67`). MLX handles `float16` and `bfloat16` natively much more stably.
 
 4. **Memory Management (Unified Memory Architecture)**:
    * Apple Silicon shares RAM between CPU, GPU, and NPU.
-   * **MLX Memory**: MLX uses lazy evaluation. Call `mx.eval(...)` or `mx.synchronize()` strategically before passing arrays back to PyTorch/ComfyUI to release computational graphs.
+   * **MLX Memory**: MLX uses lazy evaluation. Call `mx.eval(...)` strategically before passing arrays back to PyTorch/ComfyUI to release computational graphs.
    * **PyTorch MPS Memory**: Explicitly call `torch.mps.empty_cache()` when freeing large tensors or between batch iterations.
 
 5. **MPS / MLX Limitations & Fallbacks**:
