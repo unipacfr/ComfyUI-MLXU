@@ -23,6 +23,25 @@ import torch
 _VAE_CACHE: dict[str, Any] = {}
 
 
+# ── MPS OOM detection ────────────────────────────────────────────────
+
+def _is_mps_oom(e: Exception) -> bool:
+    """True for the plain `RuntimeError` a real MPS OOM raises.
+
+    `comfy.sd.VAE.decode()`/`.encode()` already retry via tiled decode when
+    `model_management.is_oom(e)` recognises the exception — but `is_oom()` only
+    matches `torch.cuda.OutOfMemoryError` or `torch.AcceleratorError`
+    (error_code==2 / "out of memory" in message). A real MPS OOM on this machine
+    (torch 2.13) raises a plain `RuntimeError` ("MPS backend out of memory..."),
+    and `AcceleratorError` is a `RuntimeError` SUBCLASS, not the reverse — so
+    `is_oom()` returns False, `raise_non_oom()` re-raises, and the node crashes
+    instead of falling back to tiled decode. Verified directly against the
+    installed torch: `isinstance(plain_mps_runtimeerror, AcceleratorError)` is
+    False.
+    """
+    return isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+
+
 # ── VAE Loader ───────────────────────────────────────────────────────
 
 class ASDX_VAELoader(io.ComfyNode):
@@ -164,7 +183,26 @@ class ASDX_VAEDecode(io.ComfyNode):
         """
         if getattr(vae, "latent_dim", 2) == 3 and latent.dim() == 4:
             latent = latent.unsqueeze(2)
-        image = vae.decode(latent)
+
+        # comfy's own OOM->tiled retry never fires on MPS (see `_is_mps_oom`),
+        # so do it here. Mirrors `comfy/sd.py::VAE.decode`'s own structure: set a
+        # flag inside `except` and tile OUTSIDE it, because the live exception
+        # keeps every tensor allocated at raise-time referenced until the block
+        # exits — tiling inside it would run against that still-held memory.
+        do_tile = False
+        try:
+            image = vae.decode(latent)
+        except Exception as e:
+            if not _is_mps_oom(e):
+                raise
+            print("[ASDX] VAE Decode: MPS out of memory, retrying with tiled decode.")
+            do_tile = True
+
+        if do_tile:
+            import comfy.model_management
+            comfy.model_management.soft_empty_cache()
+            image = vae.decode_tiled(latent)
+
         if image.dim() == 5:
             image = image.reshape(-1, image.shape[-3], image.shape[-2], image.shape[-1])
         return (image,)
@@ -236,7 +274,23 @@ class ASDX_VAEEncode(io.ComfyNode):
         `[B,C,H,W]` (single image, no temporal axis) -- squeeze that axis back
         out here, the exact inverse of what `_fallback_decode` does before decode.
         """
-        latent = vae.encode(pixels)
+        # Same MPS OOM->tiled fallback as `_fallback_decode` above, same
+        # flag-outside-except reasoning. `encode_tiled` returns the same layout
+        # as `encode`, so the `latent_dim == 3` squeeze below covers both paths.
+        do_tile = False
+        try:
+            latent = vae.encode(pixels)
+        except Exception as e:
+            if not _is_mps_oom(e):
+                raise
+            print("[ASDX] VAE Encode: MPS out of memory, retrying with tiled encode.")
+            do_tile = True
+
+        if do_tile:
+            import comfy.model_management
+            comfy.model_management.soft_empty_cache()
+            latent = vae.encode_tiled(pixels)
+
         if getattr(vae, "latent_dim", 2) == 3 and latent.dim() == 5:
             latent = latent.squeeze(2)
         return latent
