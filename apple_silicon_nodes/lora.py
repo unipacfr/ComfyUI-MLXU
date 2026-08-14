@@ -481,6 +481,82 @@ _KREA2_RESIDUAL_TARGETS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("mlp",), "gate"), (("mlp",), "up"), (("mlp",), "down"),
 )
 
+# Leaf-name renames between a Krea2 HF-diffusers LoRA and this project's
+# native module tree. Unlike FLUX.1's `to_q`/`to_k`/`to_v`, Krea2's attention
+# keeps q/k/v as three SEPARATE native Linears (`wq`/`wk`/`wv`, see
+# `native/krea2/model.py::Attention`), so every entry here is a pure 1:1
+# rename -- no fused-weight assembly, and therefore no full-size delta
+# materialization: `_resolve_krea2_diffusers_lora` can hand back the raw
+# low-rank `(A, B)` pair and stay a true forward-time residual.
+_KREA2_DIFFUSERS_LEAF_RENAME: dict[str, str] = {
+    "attn.wq.weight": "attn.to_q.weight",
+    "attn.wk.weight": "attn.to_k.weight",
+    "attn.wv.weight": "attn.to_v.weight",
+    "attn.wo.weight": "attn.to_out.0.weight",
+    "attn.gate_proj.weight": "attn.to_gate.weight",
+    "mlp.gate.weight": "ff.gate.weight",
+    "mlp.up.weight": "ff.up.weight",
+    "mlp.down.weight": "ff.down.weight",
+}
+
+# Top-level (non-block-list) renames. `time_embed`/`txt_in`/`time_mod_proj`
+# are deliberately absent: they map to `tmlp`/`txtmlp`/`tproj`, which are
+# `nn.Sequential`-wrapped natively (`tmlp.layers.0.weight`), the same
+# pre-existing Sequential key-mapping gap flagged in the canon -- resolving
+# those needs a Sequential-aware mapper, not a rename entry.
+_KREA2_DIFFUSERS_TOPLEVEL_RENAME: dict[str, str] = {
+    "first.weight": "img_in.weight",
+    "last.linear.weight": "final_layer.linear.weight",
+    "txtfusion.projector.weight": "text_fusion.projector.weight",
+}
+
+_KREA2_BLOCK_RE = re.compile(r"^blocks\.(\d+)\.(.+)$")
+_KREA2_TXTFUSION_RE = re.compile(
+    r"^txtfusion\.(layerwise_blocks|refiner_blocks)\.(\d+)\.(.+)$"
+)
+
+
+def _resolve_krea2_diffusers_lora(
+    native_key: str, lora: "LoRAAdapter"
+) -> tuple[tuple[mx.array, mx.array] | None, mx.array | None]:
+    """Resolve a native Krea2 key against an HF-diffusers/PEFT-style LoRA.
+
+    Roughly a third of this machine's real Krea2 library (9/35 files, e.g.
+    `krea2_softwatercolor.safetensors` and its style siblings) ships genuine
+    diffusers module names -- `transformer_blocks.N.attn.to_q`, `ff.down`,
+    `text_fusion.*` -- which match neither the dotted-native nor the
+    kohya-flat form `_lookup_native_or_kohya` already covers. Every one of
+    those files resolved 0/264 targets and applied ZERO deltas, silently:
+    the LoRA loaded, logged no error, and simply had no effect on the image.
+
+    Returns the same `(factor_pair, delta)` shape as
+    `_lookup_native_or_kohya` so callers can treat both uniformly. The pair
+    is returned raw and unmaterialized -- see `_KREA2_DIFFUSERS_LEAF_RENAME`
+    for why Krea2 needs no fused assembly.
+    """
+    m = _KREA2_BLOCK_RE.match(native_key)
+    if m:
+        leaf = _KREA2_DIFFUSERS_LEAF_RENAME.get(m.group(2))
+        if leaf is None:
+            return None, None
+        candidate = f"transformer_blocks.{m.group(1)}.{leaf}"
+    else:
+        m = _KREA2_TXTFUSION_RE.match(native_key)
+        if m:
+            leaf = _KREA2_DIFFUSERS_LEAF_RENAME.get(m.group(3))
+            if leaf is None:
+                return None, None
+            candidate = f"text_fusion.{m.group(1)}.{m.group(2)}.{leaf}"
+        else:
+            candidate = _KREA2_DIFFUSERS_TOPLEVEL_RENAME.get(native_key)
+            if candidate is None:
+                return None, None
+
+    pair = lora.factors.get(candidate)
+    if pair is not None:
+        return pair, None
+    return None, lora.deltas.get(candidate)
+
 
 def _clone_block_path(
     container: list, touched: dict[int, Any], idx: int, path: tuple[str, ...]
@@ -562,10 +638,20 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
     applied = 0
     total = len(lora.factors) + len(lora.deltas)
 
+    def _lookup(native_key: str):
+        """Native-dotted / kohya-flat first, then the HF-diffusers rename.
+        Diffusers last because it is the narrowest convention -- a file that
+        matches either of the first two is not a diffusers file at all.
+        """
+        pair, delta = _lookup_native_or_kohya(lora, native_key)
+        if pair is not None or delta is not None:
+            return pair, delta
+        return _resolve_krea2_diffusers_lora(native_key, lora)
+
     for idx in range(len(new_blocks)):
         for path, leaf_name in _KREA2_RESIDUAL_TARGETS:
             native_key = f"blocks.{idx}." + "".join(f"{p}." for p in path) + f"{leaf_name}.weight"
-            pair, delta = _lookup_native_or_kohya(lora, native_key)
+            pair, delta = _lookup(native_key)
             if pair is None and delta is None:
                 continue
             leaf = _adapt_leaf(new_blocks, touched_blocks, idx, path, leaf_name)
@@ -599,7 +685,7 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
             for path, leaf_name in _KREA2_RESIDUAL_TARGETS:
                 native_key = (f"txtfusion.{sub_list_name}.{idx}."
                               + "".join(f"{p}." for p in path) + f"{leaf_name}.weight")
-                pair, delta = _lookup_native_or_kohya(lora, native_key)
+                pair, delta = _lookup(native_key)
                 if pair is None and delta is None:
                     continue
                 leaf = _adapt_leaf(container, touched_map, idx, path, leaf_name)
@@ -613,7 +699,7 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
                 applied += 1
 
     new_projector = None
-    proj_pair, proj_delta = _lookup_native_or_kohya(lora, "txtfusion.projector.weight")
+    proj_pair, proj_delta = _lookup("txtfusion.projector.weight")
     if proj_pair is not None or proj_delta is not None:
         new_projector = _ensure_adaptable(transformer.txtfusion.projector)
         if proj_pair is not None:
@@ -626,7 +712,7 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
     # `first` (image-token input projection) and `last.linear` (output
     # projection) are standalone top-level Linears, same treatment.
     new_first = None
-    first_pair, first_delta = _lookup_native_or_kohya(lora, "first.weight")
+    first_pair, first_delta = _lookup("first.weight")
     if first_pair is not None or first_delta is not None:
         new_first = _ensure_adaptable(transformer.first)
         if first_pair is not None:
@@ -637,7 +723,7 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
         applied += 1
 
     new_last = None
-    last_pair, last_delta = _lookup_native_or_kohya(lora, "last.linear.weight")
+    last_pair, last_delta = _lookup("last.linear.weight")
     if last_pair is not None or last_delta is not None:
         new_last_linear = _ensure_adaptable(transformer.last.linear)
         if last_pair is not None:
