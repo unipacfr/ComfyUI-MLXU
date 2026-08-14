@@ -260,6 +260,7 @@ def _normalize_native_lora_key(prefix: str) -> str:
         prefix = prefix.replace(".img_mlp.", ".img_mlp_")
     elif ".txt_mlp." in prefix:
         prefix = prefix.replace(".txt_mlp.", ".txt_mlp_")
+
     return prefix
 
 
@@ -508,6 +509,16 @@ _KREA2_DIFFUSERS_TOPLEVEL_RENAME: dict[str, str] = {
     "first.weight": "img_in.weight",
     "last.linear.weight": "final_layer.linear.weight",
     "txtfusion.projector.weight": "text_fusion.projector.weight",
+    # The three `nn.Sequential`s, addressed by native position. diffusers
+    # names each Linear individually instead of by index, so `tmlp` 0/2 ->
+    # time_embed.linear_1/2 and `txtmlp` 1/3 -> txt_in.linear_1/2 (txtmlp's
+    # position 0 is an RMSNorm, hence the 1/3 offset), while `tproj`'s single
+    # Linear at position 1 is a standalone `time_mod_proj`.
+    "tmlp.0.weight": "time_embed.linear_1.weight",
+    "tmlp.2.weight": "time_embed.linear_2.weight",
+    "txtmlp.1.weight": "txt_in.linear_1.weight",
+    "txtmlp.3.weight": "txt_in.linear_2.weight",
+    "tproj.1.weight": "time_mod_proj.weight",
 }
 
 _KREA2_BLOCK_RE = re.compile(r"^blocks\.(\d+)\.(.+)$")
@@ -618,6 +629,21 @@ def _adapt_leaf(
     module = _clone_block_path(container, touched, idx, path)
     if module is None:
         return None
+    # An all-digit leaf addresses an `nn.Sequential` element: MLX keeps those
+    # in a plain `.layers` LIST, so `getattr(module, "0")` is None and the leaf
+    # has to be reached (and written back) by index instead.
+    if leaf_name.isdigit():
+        elements = getattr(module, "layers", None)
+        if not isinstance(elements, list):
+            return None
+        pos = int(leaf_name)
+        if pos >= len(elements) or not isinstance(elements[pos], nn.Linear):
+            return None
+        elements = list(elements)
+        leaf = _ensure_adaptable(elements[pos])
+        elements[pos] = leaf
+        module.layers = elements
+        return leaf
     leaf = getattr(module, leaf_name, None)
     if leaf is None:
         return None
@@ -735,8 +761,46 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
         new_last.linear = new_last_linear
         applied += 1
 
+    # `tmlp`/`txtmlp`/`tproj` are top-level `nn.Sequential`s. MLX keeps their
+    # submodules in a plain `.layers` LIST, so the Linear at position i lives
+    # at `<module>.layers.{i}` -- while the real checkpoint AND every real
+    # LoRA file use the flat `<module>.{i}` form. `native/krea2/weight_map.py`
+    # already bridges that at CHECKPOINT load; it was simply never applied to
+    # LoRAs, so these targets silently matched nothing (see canon). Verified
+    # against the real library that the file's indices already equal the
+    # native Sequential positions (tmlp 0/2, txtmlp 1/3, tproj 1), so the
+    # positions are read straight off the live module rather than hard-coded.
+    new_sequentials: dict[str, Any] = {}
+    for seq_name in ("tmlp", "txtmlp", "tproj"):
+        seq = getattr(transformer, seq_name, None)
+        elements = getattr(seq, "layers", None)
+        if not isinstance(elements, list):
+            continue
+        updated = None
+        for pos, element in enumerate(elements):
+            if not isinstance(element, nn.Linear):
+                continue
+            pair, delta = _lookup(f"{seq_name}.{pos}.weight")
+            if pair is None and delta is None:
+                continue
+            leaf = _ensure_adaptable(element)
+            if pair is not None:
+                a, b = pair
+                _upsert_lora_factor(leaf, a, b, lora.scale)
+            else:
+                leaf.merge_delta(delta, lora.scale)
+            if updated is None:
+                updated = list(elements)
+            updated[pos] = leaf
+            applied += 1
+        if updated is not None:
+            new_seq = copy.copy(seq)
+            new_seq.layers = updated
+            new_sequentials[seq_name] = new_seq
+
     touched_txtfusion = bool(touched_layerwise) or bool(touched_refiner) or new_projector is not None
-    if not touched_blocks and not touched_txtfusion and new_first is None and new_last is None:
+    if (not touched_blocks and not touched_txtfusion and new_first is None
+            and new_last is None and not new_sequentials):
         print("[ASDX] LoRA: no matching weights found")
         return transformer
 
@@ -756,6 +820,8 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
         new_transformer.first = new_first
     if new_last is not None:
         new_transformer.last = new_last
+    for seq_name, new_seq in new_sequentials.items():
+        setattr(new_transformer, seq_name, new_seq)
     print(f"[ASDX] LoRA (residual): attached {applied}/{total} adapters")
     return new_transformer
 
@@ -985,6 +1051,13 @@ def _apply_lora_residual_to_flux(transformer: Any, lora: "LoRAAdapter", config: 
 _ZIMAGE_RESIDUAL_TARGETS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("attention",), "qkv"), (("attention",), "out"),
     (("feed_forward",), "w1"), (("feed_forward",), "w2"), (("feed_forward",), "w3"),
+    # `adaLN_modulation` is an nn.Sequential holding one Linear, so the leaf
+    # lives at `.layers.0` -- see `_normalize_native_lora_key`, which rewrites
+    # the flat `adaLN_modulation.0` form every real LoRA file ships into this
+    # path. Present in `layers`/`noise_refiner` only; `context_refiner` blocks
+    # are built with `modulation=False` and have no such attribute, which
+    # `_adapt_leaf` already handles by returning None.
+    (("adaLN_modulation",), "0"),
 )
 
 # Leaf renames between a Z-Image HF-diffusers LoRA and the native module tree.
