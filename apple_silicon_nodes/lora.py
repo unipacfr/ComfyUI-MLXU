@@ -1651,6 +1651,7 @@ class ASDX_LoraLoader(io.ComfyNode):
         # Extract deltas from raw weights
         lora = LoRAAdapter(name=name)
         deltas: dict[str, tuple[mx.array, mx.array]] = {}  # key -> (A, B) or diff
+        unsupported_lokr: list[str] = []
         alpha_value: float | None = None
 
         for key, weight in raw.items():
@@ -1721,6 +1722,52 @@ class ASDX_LoraLoader(io.ComfyNode):
                 # (up=B [out,rank], down=A [rank,in] -- comfy/weight_adapter/lora.py
                 # computes `diff = lora_up.weight @ lora_down.weight`, i.e. B @ A).
                 deltas[prefix] = (down_arr, weight_arr)
+            elif key.endswith(".lokr_w1"):
+                # LoKr (LyCORIS Kronecker factorization): the delta is
+                # `kron(w1, w2)`, NOT a low-rank product -- a different algebra
+                # from LoRA, so it cannot be stored in `factors` and is
+                # materialized here as a full-size delta instead.
+                #
+                # Math ported from comfy's own reference implementation
+                # (`comfy/weight_adapter/lokr.py::LokrDiff.__call__`), per
+                # CLAUDE.md's "port the exact math from a real reference" rule.
+                # Only the full-w1/full-w2 variant is handled: the low-rank
+                # rebuild (`lokr_w1_a`/`_b`) and Tucker (`lokr_t2`) variants are
+                # skipped rather than guessed, and their presence is reported.
+                #
+                # `alpha` is deliberately IGNORED: comfy applies it only when
+                # rebuilding factors from `lokr_w*_a/_b`. Confirmed on the real
+                # file that alpha is a sentinel (9999220736.0) -- applying it
+                # would destroy the weights.
+                stem = key[: -len(".lokr_w1")]
+                w2_key = f"{stem}.lokr_w2"
+                if w2_key not in raw:
+                    continue
+                if any(f"{stem}.{v}" in raw for v in
+                       ("lokr_w1_a", "lokr_w1_b", "lokr_w2_a", "lokr_w2_b", "lokr_t2")):
+                    unsupported_lokr.append(stem)
+                    continue
+                w2_raw = raw[w2_key]
+                w2_arr = w2_raw if isinstance(w2_raw, mx.array) else mx.array(w2_raw)
+                w1 = weight_arr.astype(mx.float32)
+                w2 = w2_arr.astype(mx.float32)
+                if w1.ndim != 2 or w2.ndim != 2:
+                    unsupported_lokr.append(stem)
+                    continue
+                # kron([a,b], [c,d]) -> [a*c, b*d], matching torch.kron for 2-D.
+                r1, c1 = w1.shape
+                r2, c2 = w2.shape
+                delta = (w1.reshape(r1, 1, c1, 1) * w2.reshape(1, r2, 1, c2)
+                         ).reshape(r1 * r2, c1 * c2).astype(w2_arr.dtype)
+                lokr_key = f"{stem}.weight"
+                for pfx in ("diffusion_model.", "model.", "transformer."):
+                    if lokr_key.startswith(pfx):
+                        lokr_key = lokr_key[len(pfx):]
+                        break
+                lora.deltas[_normalize_native_lora_key(lokr_key)] = delta
+            elif key.endswith((".lokr_w2", ".lokr_w1_a", ".lokr_w1_b",
+                               ".lokr_w2_a", ".lokr_w2_b", ".lokr_t2")):
+                continue  # consumed alongside its `.lokr_w1` sibling above
             elif ".diff_b" in key:
                 # ComfyUI diff format (bias delta). Real key is "{x}.diff_b" with
                 # NO .weight/.bias suffix on x (comfy/lora.py maps it to
@@ -1743,6 +1790,14 @@ class ASDX_LoraLoader(io.ComfyNode):
                         break
                 diff_key = _normalize_native_lora_key(diff_key)
                 lora.deltas[diff_key] = weight_arr
+
+        if unsupported_lokr:
+            # Never drop these silently: a LoKr whose factors need rebuilding
+            # would otherwise load "successfully" and apply nothing, the exact
+            # failure mode that hid the diffusers-key gap for so long.
+            print(f"[ASDX] LoRA: {len(unsupported_lokr)} LoKr target(s) use the "
+                  f"low-rank-rebuild or Tucker variant, which is not implemented "
+                  f"-- those targets are UNCHANGED (e.g. {unsupported_lokr[0]})")
 
         # Route each (A, B) pair into `lora.factors` as its raw low-rank
         # pair, UNMATERIALIZED -- the old code computed `delta = B @ A` for
