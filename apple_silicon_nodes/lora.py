@@ -987,6 +987,87 @@ _ZIMAGE_RESIDUAL_TARGETS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("feed_forward",), "w1"), (("feed_forward",), "w2"), (("feed_forward",), "w3"),
 )
 
+# Leaf renames between a Z-Image HF-diffusers LoRA and the native module tree.
+# `attention.qkv` is deliberately absent: it is the one FUSED native weight and
+# needs three separate diffusers deltas assembled, handled explicitly in
+# `_resolve_zimage_diffusers_lora` rather than as a 1:1 rename.
+_ZIMAGE_DIFFUSERS_LEAF_RENAME: dict[str, str] = {
+    "attention.out.weight": "attention.to_out.0.weight",
+    "feed_forward.w1.weight": "feed_forward.w1.weight",
+    "feed_forward.w2.weight": "feed_forward.w2.weight",
+    "feed_forward.w3.weight": "feed_forward.w3.weight",
+}
+
+_ZIMAGE_BLOCK_RE = re.compile(
+    r"^(layers|context_refiner|noise_refiner)\.(\d+)\.(.+)$"
+)
+
+
+def _materialize_delta_native_or_kohya(key: str, lora: "LoRAAdapter") -> mx.array | None:
+    """`_materialize_delta`, but also trying the kohya-flat spelling of `key`.
+
+    Needed because real Z-Image LoRAs mix the two axes independently: naming
+    convention (dotted vs. kohya-flat) and module vocabulary (native `qkv` vs.
+    diffusers `to_q`/`to_k`/`to_v`). A real file on this machine
+    (`AerithGainsborough_SoloLoRA_Zv1`) is kohya-flat AND diffusers-named
+    (`lora_unet_layers_0_attention_to_q`), so it matches neither
+    `_lookup_native_or_kohya` (wrong vocabulary) nor a plain diffusers lookup
+    (wrong naming) -- it resolved 90/210 until this was added.
+    """
+    pair, delta = _lookup_native_or_kohya(lora, key)
+    if delta is not None:
+        return delta
+    if pair is not None:
+        return _delta_from_factors(*pair)
+    return None
+
+
+def _resolve_zimage_diffusers_lora(
+    native_key: str, lora: "LoRAAdapter", qkv_widths: tuple[int, int, int] | None
+) -> tuple[tuple[mx.array, mx.array] | None, mx.array | None, int]:
+    """Resolve a native Z-Image key against an HF-diffusers/PEFT-style LoRA.
+
+    Every real Z-Image LoRA on this machine (9/9 files) uses diffusers module
+    names. Unlike Krea2, the loss here was PARTIAL and therefore far easier to
+    miss: `feed_forward.w1/w2/w3` happen to be spelled identically in both
+    conventions and always resolved, so each file applied ~90/240 targets --
+    its MLP but none of its attention. The visible result is a LoRA that looks
+    weak, not one that looks broken, which is why it was never reported.
+
+    `attention.to_q`/`to_k`/`to_v` are three separate diffusers weights that
+    must be concatenated into the native FUSED `attention.qkv` (see
+    `native/zimage/model.py::JointAttention`, which splits qkv in q,k,v output
+    order). That is the same situation FLUX.1's fused `qkv` is in, so it reuses
+    `_assemble_fused_delta` and, like FLUX, must materialize one full-size
+    delta for that target -- a fused weight cannot be represented as a single
+    low-rank residual when each component carries its own rank.
+
+    Returns `(pair, delta, consumed)`; `consumed` counts raw file entries
+    absorbed, which is >1 for an assembled qkv.
+    """
+    m = _ZIMAGE_BLOCK_RE.match(native_key)
+    if m is None:
+        return None, None, 0
+    container, idx, leaf = m.group(1), m.group(2), m.group(3)
+
+    if leaf == "attention.qkv.weight":
+        if qkv_widths is None:
+            return None, None, 0
+        pieces = [
+            _materialize_delta_native_or_kohya(f"{container}.{idx}.attention.{name}.weight", lora)
+            for name in ("to_q", "to_k", "to_v")
+        ]
+        delta, consumed = _assemble_fused_delta(pieces, list(qkv_widths))
+        return None, delta, consumed
+
+    renamed = _ZIMAGE_DIFFUSERS_LEAF_RENAME.get(leaf)
+    if renamed is None:
+        return None, None, 0
+    pair, delta = _lookup_native_or_kohya(lora, f"{container}.{idx}.{renamed}")
+    if pair is not None:
+        return pair, None, 1
+    return None, delta, (1 if delta is not None else 0)
+
 
 def _apply_lora_residual_to_zimage(transformer: Any, lora: "LoRAAdapter") -> Any:
     """Z-Image-only Phase 3 forward-time-residual LoRA attach -- see the
@@ -1001,11 +1082,35 @@ def _apply_lora_residual_to_zimage(transformer: Any, lora: "LoRAAdapter") -> Any
     applied = 0
     total = len(lora.factors) + len(lora.deltas)
 
+    # q/k/v output widths of the native fused `attention.qkv`, needed to
+    # assemble a diffusers LoRA's three separate deltas into it. Read off a
+    # live JointAttention rather than hard-coded, so a GQA variant
+    # (n_kv_heads < n_heads) stays correct -- the class is already written
+    # to be generic over that even though Z-Image itself is full MHA.
+    qkv_widths: tuple[int, int, int] | None = None
+    for _c in containers.values():
+        if _c:
+            _attn = getattr(_c[0], "attention", None)
+            if _attn is not None:
+                qkv_widths = (
+                    _attn.n_heads * _attn.head_dim,
+                    _attn.n_kv_heads * _attn.head_dim,
+                    _attn.n_kv_heads * _attn.head_dim,
+                )
+            break
+
     for container_name, container in containers.items():
         for idx in range(len(container)):
             for path, leaf_name in _ZIMAGE_RESIDUAL_TARGETS:
                 native_key = f"{container_name}.{idx}." + "".join(f"{p}." for p in path) + f"{leaf_name}.weight"
                 pair, delta = _lookup_native_or_kohya(lora, native_key)
+                consumed = 1 if (pair is not None or delta is not None) else 0
+                if consumed == 0:
+                    # Native-dotted and kohya-flat both missed -- try the
+                    # HF-diffusers convention every real Z-Image LoRA uses.
+                    pair, delta, consumed = _resolve_zimage_diffusers_lora(
+                        native_key, lora, qkv_widths
+                    )
                 if pair is None and delta is None:
                     continue
                 leaf = _adapt_leaf(container, touched[container_name], idx, path, leaf_name)
@@ -1016,7 +1121,7 @@ def _apply_lora_residual_to_zimage(transformer: Any, lora: "LoRAAdapter") -> Any
                     _upsert_lora_factor(leaf, a, b, lora.scale)
                 else:
                     leaf.merge_delta(delta, lora.scale)
-                applied += 1
+                applied += consumed
 
     if not any(touched.values()):
         print("[ASDX] LoRA: no matching weights found")
