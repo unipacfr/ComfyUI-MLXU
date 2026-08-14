@@ -107,7 +107,7 @@ heuristic assumes a single, stateless model call per step).
 ### LoRA
 | Node | Description |
 |------|-------------|
-| `🍏 ASDX LoRA Loader` | Load single LoRA (A/B, kohya, or ComfyUI diff format) with strength scaling |
+| `🍏 ASDX LoRA Loader` | Load single LoRA (A/B, kohya, ComfyUI diff, diffusers/PEFT, or LyCORIS LoKr/LoHa) with strength scaling |
 | `🍏 ASDX Multi LoRA Loader` | Stack up to 5 LoRAs simultaneously |
 | `🍏 ASDX LoRA Schedule` | Per-step LoRA strength modulation (linear/cosine/ease-in-out) |
 
@@ -163,7 +163,8 @@ heuristic assumes a single, stateless model call per step).
 - **Precomputed text projection**: `txt_in(emb)` computed once, reused across steps
 
 ### Advanced Conditioning
-- **LoRA Runtime Loading**: Standard A/B matrices, kohya-style, ComfyUI diff format, and diffusers/PEFT-style FLUX.1 (`transformer_blocks`/`single_transformer_blocks`) with per-LoRA alpha scaling
+- **LoRA Runtime Loading**: Standard A/B matrices, kohya-style, ComfyUI diff format (weights and `.diff_b` biases), and diffusers/PEFT-style keys for FLUX.1, Flux.2, Krea2 and Z-Image, with per-LoRA alpha scaling
+- **LyCORIS adapters**: LoKr (Kronecker) applied as a structured forward-time residual that never materializes the full `[out, in]` delta, and LoHa (Hadamard); both full and low-rank factor forms
 - **Multi-LoRA Stacking**: Up to 5 LoRAs applied simultaneously with strength scheduling
 - **Kontext KV Cache**: Reference image tokens cached and injected into transformer attention layers
 - **Quantized checkpoints**: FP8_SCALED and INT8 ConvRot/tensorwise dequantized on load
