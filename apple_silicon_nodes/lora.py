@@ -14,6 +14,7 @@ Supports:
 from __future__ import annotations
 
 import copy
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -236,6 +237,11 @@ class LoRAAdapter:
     # of deltas plus ~47GB of float32 intermediates on a real file, which
     # pushed a Krea2 generation to a 118.6GB peak on a 64GB machine.
     lokr_factors: dict[str, tuple[mx.array, mx.array]] = field(default_factory=dict)
+    # LoHa (LyCORIS Hadamard) factors: (w1_a, w1_b, w2_a, w2_b, scale). Unlike
+    # LoKr there is no structured deferred form -- the elementwise product of
+    # two low-rank products is inherently full-size -- so these materialize on
+    # demand like any other delta, one target at a time.
+    loha_factors: dict[str, tuple[mx.array, mx.array, mx.array, mx.array, float]] = field(default_factory=dict)
     # None means the file has no ".alpha" key (see _load_lora_file) -- not
     # the same as alpha=1.0, the two fall back to different scales below.
     alpha: float | None = None
@@ -338,6 +344,9 @@ def _materialize_delta(key: str, lora: "LoRAAdapter") -> mx.array | None:
     lokr = lora.lokr_factors.get(key)
     if lokr is not None:
         return _delta_from_lokr(*lokr)
+    loha = lora.loha_factors.get(key)
+    if loha is not None:
+        return _delta_from_loha(*loha)
     return None
 
 
@@ -366,6 +375,126 @@ def _kron_matmul(x: mx.array, w1: mx.array, w2: mx.array) -> mx.array:
     t = t @ w1.T                           # contract c1 -> [..., r2, r1]
     t = mx.swapaxes(t, -1, -2)             # [..., r1, r2]
     return t.reshape(*lead, r1 * r2)
+
+
+def _as_mx(value: Any) -> mx.array:
+    """Raw safetensors entry -> `mx.array`, without copying an existing one."""
+    return value if isinstance(value, mx.array) else mx.array(value)
+
+
+def _strip_and_normalize_key(key: str) -> str:
+    """Drop a ComfyUI wrapper prefix, then apply the native module renames.
+
+    Same two steps every other branch of `_load_lora_file` performs inline;
+    factored out here so the LyCORIS branches cannot drift from them.
+    """
+    for pfx in ("diffusion_model.", "model.", "transformer."):
+        if key.startswith(pfx):
+            key = key[len(pfx):]
+            break
+    return _normalize_native_lora_key(key)
+
+
+def _alpha_of(stem: str, raw: dict) -> float | None:
+    """This module's own `<stem>.alpha`, or None. LyCORIS writes alpha PER
+    MODULE, so a shared file-level value is the wrong granularity here."""
+    entry = raw.get(f"{stem}.alpha")
+    if entry is None:
+        return None
+    try:
+        return float(entry)
+    except (TypeError, ValueError):
+        return None
+
+
+def _lokr_factor_pair(
+    stem: str, raw: dict
+) -> tuple[mx.array, mx.array, int | None] | None:
+    """Resolve a LoKr module's two Kronecker factors, rebuilding either from
+    its low-rank `_a @ _b` pair when it is not stored full.
+
+    Returns `(w1, w2, rank)` where `rank` is None only when BOTH factors are
+    full -- the LyCORIS both-full case whose scale is forced to 1.0 (see
+    `_lycoris_scale`). Returns None for a variant this cannot represent
+    (missing factor, tucker/CP `lokr_t2`, or a non-2-D factor), so the caller
+    reports it instead of guessing.
+
+    Rebuilding a low-rank factor is bounded by the FACTOR dims, not by
+    `out x in`, so the result stays small and the delta stays deferrable --
+    the reasoning mlx-gen's `build_lokr_factors` documents.
+    """
+    if f"{stem}.lokr_t2" in raw:
+        return None                      # tucker/CP: conv-only, no 2-D form
+    rank: int | None = None
+    resolved: list[mx.array] = []
+    for idx in ("1", "2"):
+        full = raw.get(f"{stem}.lokr_w{idx}")
+        if full is not None:
+            arr = _as_mx(full)
+        else:
+            a = raw.get(f"{stem}.lokr_w{idx}_a")
+            b = raw.get(f"{stem}.lokr_w{idx}_b")
+            if a is None or b is None:
+                return None
+            a_arr, b_arr = _as_mx(a), _as_mx(b)
+            if a_arr.ndim != 2 or b_arr.ndim != 2:
+                return None
+            arr = a_arr @ b_arr
+            rank = a_arr.shape[1]
+        if arr.ndim != 2:
+            return None
+        resolved.append(arr)
+    return resolved[0], resolved[1], rank
+
+
+def _lycoris_scale(alpha: float | None, rank: int | None) -> float:
+    """LyCORIS per-module scale: `alpha / rank`, or 1.0 when there is no rank.
+
+    Ported from mlx-gen (`adapters/loader.rs`, `fn scale`), which in turn
+    mirrors LyCORIS `LokrModule.__init__` (`if use_w1 and use_w2: alpha =
+    lora_dim`): a LoKr whose BOTH Kronecker factors are stored full has no
+    low-rank dimension, so its `alpha` is not a scale at all and the module
+    applies at 1.0. A real file here confirms it -- its alpha is a sentinel
+    (9999220736.0) that, used as a multiplier, overflowed every generation to
+    a black image.
+
+    `rank <= 0` or a non-finite alpha raises rather than silently producing
+    `0/0 = NaN` baked into the delta -- mlx-gen documents that exact failure
+    ("NaN-poisoning every subsequent render while the load reports success"),
+    which is the same silent-corruption class as the sentinel above.
+    """
+    if rank is None:
+        return 1.0
+    if rank <= 0:
+        raise RuntimeError(
+            f"LyCORIS adapter: invalid rank {rank} -- must be > 0. A rank of 0 "
+            "would make the scale 0/0 = NaN and poison every weight it touches "
+            "while the load still reported success."
+        )
+    if alpha is None:
+        return 1.0
+    if not math.isfinite(alpha):
+        raise RuntimeError(
+            f"LyCORIS adapter: non-finite alpha {alpha} -- refusing to scale by it."
+        )
+    return alpha / rank
+
+
+def _delta_from_loha(
+    w1a: mx.array, w1b: mx.array, w2a: mx.array, w2b: mx.array, scale: float
+) -> mx.array:
+    """LoHa (Hadamard-product) delta: `scale * ((w1_a @ w1_b) * (w2_a @ w2_b))`.
+
+    Ported from mlx-gen's `reconstruct_loha_delta`, which mirrors LyCORIS
+    `LohaModule.get_weight`. Unlike LoKr this is an ELEMENTWISE product of two
+    low-rank products, so the result is inherently full-size `[out, in]` --
+    there is no structured trick to defer it the way `_kron_matmul` defers a
+    Kronecker product. It is therefore returned as a delta and merged once.
+
+    The tucker/CP variant (`hada_t1`/`hada_t2`, conv-only in LyCORIS) is NOT
+    handled here; callers detect and report it rather than guessing.
+    """
+    return (((w1a @ w1b) * (w2a @ w2b)) * scale)
 
 
 def _delta_from_lokr(w1: mx.array, w2: mx.array) -> mx.array:
@@ -506,6 +635,21 @@ class AdaptableLinear(nn.Linear):
         if "bias" in linear:
             new.bias = linear.bias
         return new
+
+
+def _lookup_lokr(lora: "LoRAAdapter", native_key: str):
+    """LoKr factors for `native_key`, trying the kohya-flat spelling too.
+
+    A real FLUX.1 LoKr on this machine (`lora.TA_trained.safetensors`) ships
+    kohya-flat keys (`lora_unet_double_blocks_0_img_attn_qkv.lokr_w1`), so a
+    dotted-only lookup resolved none of its 304 targets -- the same gap the
+    plain-LoRA path already closes via `_lookup_native_or_kohya`.
+    """
+    hit = lora.lokr_factors.get(native_key)
+    if hit is not None:
+        return hit
+    stem, _, suffix = native_key.rpartition(".")
+    return lora.lokr_factors.get(f"lora_unet_{stem.replace('.', '_')}.{suffix}")
 
 
 def _upsert_lokr_factor(leaf: AdaptableLinear, w1: mx.array, w2: mx.array, scale: float) -> None:
@@ -670,12 +814,22 @@ def _lookup_native_or_kohya(
     delta = lora.deltas.get(native_key)
     if delta is not None:
         return None, delta
+    # LoHa: an elementwise product of two low-rank products -- inherently
+    # full-size, so it can only be consumed as a delta (built here, for this
+    # one target, and merged once).
+    if native_key in lora.loha_factors:
+        return None, _delta_from_loha(*lora.loha_factors[native_key])
     stem, _, suffix = native_key.rpartition(".")
     kohya_key = f"lora_unet_{stem.replace('.', '_')}.{suffix}"
     pair = lora.factors.get(kohya_key)
     if pair is not None:
         return pair, None
-    return None, lora.deltas.get(kohya_key)
+    delta = lora.deltas.get(kohya_key)
+    if delta is not None:
+        return None, delta
+    if kohya_key in lora.loha_factors:
+        return None, _delta_from_loha(*lora.loha_factors[kohya_key])
+    return None, None
 
 
 _KREA2_RESIDUAL_TARGETS: tuple[tuple[tuple[str, ...], str], ...] = (
@@ -871,7 +1025,8 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
     new_blocks = list(transformer.blocks)
     touched_blocks: dict[int, Any] = {}
     applied = 0
-    total = len(lora.factors) + len(lora.deltas) + len(lora.lokr_factors)
+    total = (len(lora.factors) + len(lora.deltas) + len(lora.lokr_factors)
+             + len(lora.loha_factors))
 
     def _lookup(native_key: str):
         """Native-dotted / kohya-flat first, then the HF-diffusers rename.
@@ -886,7 +1041,7 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
     for idx in range(len(new_blocks)):
         for path, leaf_name in _KREA2_RESIDUAL_TARGETS:
             native_key = f"blocks.{idx}." + "".join(f"{p}." for p in path) + f"{leaf_name}.weight"
-            lokr = lora.lokr_factors.get(native_key)
+            lokr = _lookup_lokr(lora, native_key)
             if lokr is not None:
                 leaf = _adapt_leaf(new_blocks, touched_blocks, idx, path, leaf_name)
                 if leaf is None:
@@ -928,7 +1083,7 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
             for path, leaf_name in _KREA2_RESIDUAL_TARGETS:
                 native_key = (f"txtfusion.{sub_list_name}.{idx}."
                               + "".join(f"{p}." for p in path) + f"{leaf_name}.weight")
-                lokr = lora.lokr_factors.get(native_key)
+                lokr = _lookup_lokr(lora, native_key)
                 if lokr is not None:
                     leaf = _adapt_leaf(container, touched_map, idx, path, leaf_name)
                     if leaf is None:
@@ -1146,7 +1301,8 @@ def _apply_lora_residual_to_flux(transformer: Any, lora: "LoRAAdapter", config: 
     touched_double: dict[int, Any] = {}
     touched_single: dict[int, Any] = {}
     applied = 0
-    total = len(lora.factors) + len(lora.deltas) + len(lora.lokr_factors)
+    total = (len(lora.factors) + len(lora.deltas) + len(lora.lokr_factors)
+             + len(lora.loha_factors))
 
     hidden_dim = config.hidden_size if is_flux2 else config.hidden_dim
     mlp_dim = None if is_flux2 else config.mlp_dim
@@ -1416,7 +1572,8 @@ def _apply_lora_residual_to_zimage(transformer: Any, lora: "LoRAAdapter") -> Any
     }
     touched: dict[str, dict[int, Any]] = {name: {} for name in containers}
     applied = 0
-    total = len(lora.factors) + len(lora.deltas) + len(lora.lokr_factors)
+    total = (len(lora.factors) + len(lora.deltas) + len(lora.lokr_factors)
+             + len(lora.loha_factors))
 
     # q/k/v output widths of the native fused `attention.qkv`, needed to
     # assemble a diffusers LoRA's three separate deltas into it. Read off a
@@ -1845,6 +2002,7 @@ class ASDX_LoraLoader(io.ComfyNode):
         lora = LoRAAdapter(name=name)
         deltas: dict[str, tuple[mx.array, mx.array]] = {}  # key -> (A, B) or diff
         unsupported_lokr: list[str] = []
+        unsupported_loha: list[str] = []
         alpha_value: float | None = None
 
         for key, weight in raw.items():
@@ -1927,46 +2085,61 @@ class ASDX_LoraLoader(io.ComfyNode):
                 # computes `diff = lora_up.weight @ lora_down.weight`, i.e. B @ A).
                 deltas[prefix] = (down_arr, weight_arr)
             elif key.endswith(".lokr_w1"):
-                # LoKr (LyCORIS Kronecker factorization): the delta is
-                # `kron(w1, w2)`, NOT a low-rank product -- a different algebra
-                # from LoRA, so it cannot be stored in `factors` and is
-                # materialized here as a full-size delta instead.
+                # LoKr (LyCORIS Kronecker): delta = scale * kron(w1, w2). A
+                # different algebra from LoRA -- it cannot live in `factors`.
+                # Each Kronecker factor is stored either FULL (`lokr_w1`) or as
+                # a low-rank product (`lokr_w1_a @ lokr_w1_b`); rebuilding the
+                # low-rank form yields the same SMALL factor, so both stay
+                # deferrable through `_kron_matmul` and neither materializes
+                # the `[out, in]` delta.
                 #
-                # Math ported from comfy's own reference implementation
-                # (`comfy/weight_adapter/lokr.py::LokrDiff.__call__`), per
-                # CLAUDE.md's "port the exact math from a real reference" rule.
-                # Only the full-w1/full-w2 variant is handled: the low-rank
-                # rebuild (`lokr_w1_a`/`_b`) and Tucker (`lokr_t2`) variants are
-                # skipped rather than guessed, and their presence is reported.
+                # Math ported from mlx-gen's `reconstruct_lokr_delta_scaled`
+                # (which mirrors LyCORIS `LokrModule.get_weight`/`make_kron`)
+                # and cross-checked bit-exact against comfy's
+                # `weight_adapter/lokr.py`.
                 #
-                # `alpha` is deliberately IGNORED: comfy applies it only when
-                # rebuilding factors from `lokr_w*_a/_b`. Confirmed on the real
-                # file that alpha is a sentinel (9999220736.0) -- applying it
-                # would destroy the weights.
+                # Scale follows LyCORIS exactly via `_lycoris_scale`: a rank
+                # only exists when a factor is decomposed, and both-full
+                # therefore applies at 1.0 -- see that helper for why using
+                # this file's `alpha` instead produced black images.
                 stem = key[: -len(".lokr_w1")]
-                w2_key = f"{stem}.lokr_w2"
-                if w2_key not in raw:
-                    continue
-                if any(f"{stem}.{v}" in raw for v in
-                       ("lokr_w1_a", "lokr_w1_b", "lokr_w2_a", "lokr_w2_b", "lokr_t2")):
+                factors = _lokr_factor_pair(stem, raw)
+                if factors is None:
                     unsupported_lokr.append(stem)
                     continue
-                w2_raw = raw[w2_key]
-                w2_arr = w2_raw if isinstance(w2_raw, mx.array) else mx.array(w2_raw)
-                if weight_arr.ndim != 2 or w2_arr.ndim != 2:
-                    unsupported_lokr.append(stem)
-                    continue
-                lokr_key = f"{stem}.weight"
-                for pfx in ("diffusion_model.", "model.", "transformer."):
-                    if lokr_key.startswith(pfx):
-                        lokr_key = lokr_key[len(pfx):]
-                        break
-                # Store the small factors; the full-size kron is built lazily,
-                # one target at a time, by `_materialize_delta`.
-                lora.lokr_factors[_normalize_native_lora_key(lokr_key)] = (weight_arr, w2_arr)
+                w1_arr, w2_arr, rank = factors
+                lora.lokr_factors[_strip_and_normalize_key(f"{stem}.weight")] = (
+                    w1_arr, w2_arr * _lycoris_scale(_alpha_of(stem, raw), rank),
+                )
             elif key.endswith((".lokr_w2", ".lokr_w1_a", ".lokr_w1_b",
                                ".lokr_w2_a", ".lokr_w2_b", ".lokr_t2")):
                 continue  # consumed alongside its `.lokr_w1` sibling above
+            elif key.endswith(".hada_w1_a"):
+                # LoHa (LyCORIS Hadamard): delta = scale * ((w1_a@w1_b) *
+                # (w2_a@w2_b)) -- an ELEMENTWISE product of two low-rank
+                # products, so unlike LoKr the result is inherently full-size
+                # and has no structured deferred form. Materialized lazily,
+                # one target at a time, like any other full delta.
+                stem = key[: -len(".hada_w1_a")]
+                need = ("hada_w1_a", "hada_w1_b", "hada_w2_a", "hada_w2_b")
+                if any(f"{stem}.{n}" not in raw for n in need):
+                    unsupported_loha.append(stem)
+                    continue
+                if f"{stem}.hada_t1" in raw or f"{stem}.hada_t2" in raw:
+                    unsupported_loha.append(stem)   # tucker/CP, conv-only
+                    continue
+                parts = [_as_mx(raw[f"{stem}.{n}"]) for n in need]
+                if any(p.ndim != 2 for p in parts):
+                    unsupported_loha.append(stem)
+                    continue
+                # LyCORIS rank is the inner dim of the low-rank product.
+                rank = parts[0].shape[1]
+                lora.loha_factors[_strip_and_normalize_key(f"{stem}.weight")] = (
+                    *parts, _lycoris_scale(_alpha_of(stem, raw), rank),
+                )
+            elif key.endswith((".hada_w1_b", ".hada_w2_a", ".hada_w2_b",
+                               ".hada_t1", ".hada_t2")):
+                continue  # consumed alongside its `.hada_w1_a` sibling above
             elif ".diff_b" in key:
                 # ComfyUI diff format (bias delta). Real key is "{x}.diff_b" with
                 # NO .weight/.bias suffix on x (comfy/lora.py maps it to
@@ -1990,6 +2163,10 @@ class ASDX_LoraLoader(io.ComfyNode):
                 diff_key = _normalize_native_lora_key(diff_key)
                 lora.deltas[diff_key] = weight_arr
 
+        if unsupported_loha:
+            print(f"[ASDX] LoRA: {len(unsupported_loha)} LoHa target(s) use the "
+                  f"tucker/CP variant or are missing a factor -- those targets are "
+                  f"UNCHANGED (e.g. {unsupported_loha[0]})")
         if unsupported_lokr:
             # Never drop these silently: a LoKr whose factors need rebuilding
             # would otherwise load "successfully" and apply nothing, the exact
@@ -2055,7 +2232,8 @@ class ASDX_LoraLoader(io.ComfyNode):
         """
         from mlx.utils import tree_flatten, tree_unflatten
 
-        if not lora.deltas and not lora.factors and not lora.lokr_factors:
+        if not lora.deltas and not lora.factors and not lora.lokr_factors \
+                and not lora.loha_factors:
             print("[ASDX] LoRA: no matching weights found")
             return transformer
 
