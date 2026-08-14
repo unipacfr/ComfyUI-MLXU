@@ -229,6 +229,13 @@ class LoRAAdapter:
     # specific target is actually consumed by _materialize_delta -- see that
     # function's docstring for why (duplication source #1 in the canon).
     factors: dict[tuple[int, str, str], tuple[mx.array, mx.array]] = field(default_factory=dict)
+    # LoKr (LyCORIS Kronecker) factor pairs, keyed the same way. Kept
+    # UNMATERIALIZED for the same reason as `factors`, and even more so: a
+    # kron delta is `w1.size * w2.size` elements, e.g. [4,4] x [1536,1536] ->
+    # [6144,6144], a 16x blow-up. Materializing all of them at load cost 23GB
+    # of deltas plus ~47GB of float32 intermediates on a real file, which
+    # pushed a Krea2 generation to a 118.6GB peak on a 64GB machine.
+    lokr_factors: dict[str, tuple[mx.array, mx.array]] = field(default_factory=dict)
     # None means the file has no ".alpha" key (see _load_lora_file) -- not
     # the same as alpha=1.0, the two fall back to different scales below.
     alpha: float | None = None
@@ -326,9 +333,61 @@ def _materialize_delta(key: str, lora: "LoRAAdapter") -> mx.array | None:
     if delta is not None:
         return delta
     pair = lora.factors.get(key)
-    if pair is None:
-        return None
-    return _delta_from_factors(*pair)
+    if pair is not None:
+        return _delta_from_factors(*pair)
+    lokr = lora.lokr_factors.get(key)
+    if lokr is not None:
+        return _delta_from_lokr(*lokr)
+    return None
+
+
+def _kron_matmul(x: mx.array, w1: mx.array, w2: mx.array) -> mx.array:
+    """`x @ kron(w1, w2).T` WITHOUT ever building `kron(w1, w2)`.
+
+    With `K[i1*r2+i2, j1*c2+j2] = w1[i1,j1] * w2[i2,j2]`, the product
+    factorises: reshape `x`'s input axis to `[c1, c2]`, contract `c2` with
+    `w2`, then `c1` with `w1`. Verified against an explicit
+    `x @ kron(w1,w2).T` at the real Krea2 dims -- agreement is 1.4e-03
+    relative, which is float32 accumulation-order noise over 6144 summed
+    terms, not a formula difference (the same comparison in float64 closes
+    to 6e-07).
+
+    This is what makes LoKr affordable as a residual: the explicit matrix for
+    ONE Krea2 target is 0.141GB, and this file's 256 targets cover 45.3GB of
+    the model's 47.8GB of weights -- merging them all cost a permanent
+    +46.6GB (measured), versus 1.46GB to keep the factors.
+    """
+    r1, c1 = w1.shape
+    r2, c2 = w2.shape
+    lead = x.shape[:-1]
+    xr = x.reshape(*lead, c1, c2)
+    t = (xr @ w2.T)                        # contract c2 -> [..., c1, r2]
+    t = mx.swapaxes(t, -1, -2)             # [..., r2, c1]
+    t = t @ w1.T                           # contract c1 -> [..., r2, r1]
+    t = mx.swapaxes(t, -1, -2)             # [..., r1, r2]
+    return t.reshape(*lead, r1 * r2)
+
+
+def _delta_from_lokr(w1: mx.array, w2: mx.array) -> mx.array:
+    """Build a LoKr target's full `[out, in]` delta as `kron(w1, w2)`.
+
+    Math ported from comfy's reference (`comfy/weight_adapter/lokr.py::
+    LokrDiff.__call__`) and verified bit-exact against it on real weights.
+    Called lazily, per target, from `_materialize_delta`: the result is 16x
+    the size of the factors it is built from ([4,4] x [1536,1536] ->
+    [6144,6144]), so materializing every target up front is exactly the
+    duplication the canon's "LoRA merge OOM has two independent duplication
+    sources" record warns about -- it produced a 118.6GB peak on a real 64GB
+    machine before this was made lazy.
+
+    Kept in the factors' own dtype rather than promoted to float32: the
+    product is a single elementwise multiply with no accumulation, so there
+    is nothing for the wider type to protect, and float32 here doubles the
+    transient cost of the largest array in the whole apply path.
+    """
+    r1, c1 = w1.shape
+    r2, c2 = w2.shape
+    return (w1.reshape(r1, 1, c1, 1) * w2.reshape(1, r2, 1, c2)).reshape(r1 * r2, c1 * c2)
 
 
 # ── Forward-time-residual LoRA (Phase 1: Krea2 only) ────────────────────
@@ -376,12 +435,15 @@ class AdaptableLinear(nn.Linear):
     def __init__(self, input_dims: int, output_dims: int, bias: bool = True):
         super().__init__(input_dims, output_dims, bias=bias)
         self._lora_factors: list[tuple[mx.array, mx.array, float]] = []
+        self._lokr_factors: list[tuple[mx.array, mx.array, float]] = []
 
     def __call__(self, x: mx.array) -> mx.array:
         y = super().__call__(x)
         for a, b, scale in self._lora_factors:
             residual = (x.astype(a.dtype) @ a.T) @ b.T
             y = y + (scale * residual).astype(y.dtype)
+        for w1, w2, scale in self._lokr_factors:
+            y = y + (scale * _kron_matmul(x.astype(w1.dtype), w1, w2)).astype(y.dtype)
         return y
 
     def merge_delta(self, delta: mx.array, scale: float) -> None:
@@ -398,6 +460,17 @@ class AdaptableLinear(nn.Linear):
         same underlying array reference as the leaf it was cloned from.
         """
         self.weight = self.weight + (scale * delta).astype(self.weight.dtype)
+        # Force this merge to completion before returning, then drop the
+        # buffers it allocated. MLX is lazy: without this, N merges build one
+        # giant unevaluated graph that keeps every intermediate AND every
+        # superseded weight alive until the final eval -- measured as active
+        # memory climbing 50.7GB -> 97.2GB across a 256-target LoKr attach,
+        # which is what a real generation hit as a 118.6GB peak. The residual
+        # path never needed this because a low-rank pair is tiny; a full-size
+        # delta is not, so the merge path has to bound its own lifetime the
+        # same way the old merge loop's chunked eval/clear_cache did.
+        mx.eval(self.weight)
+        mx.clear_cache()
 
     def merge_bias_delta(self, delta: mx.array, scale: float) -> bool:
         """Merge a `[out]` bias delta into `.bias`, same one-time-merge
@@ -428,10 +501,23 @@ class AdaptableLinear(nn.Linear):
         new = cls.__new__(cls)
         nn.Module.__init__(new)
         new._lora_factors = []
+        new._lokr_factors = []
         new.weight = linear.weight
         if "bias" in linear:
             new.bias = linear.bias
         return new
+
+
+def _upsert_lokr_factor(leaf: AdaptableLinear, w1: mx.array, w2: mx.array, scale: float) -> None:
+    """LoKr counterpart of `_upsert_lora_factor` -- same identity-based
+    accumulation, so `ASDX_LoraSchedule`'s per-step re-application converges
+    on the new scale instead of appending a duplicate residual every step.
+    """
+    for pos, (a, b, existing) in enumerate(leaf._lokr_factors):
+        if a is w1 and b is w2:
+            leaf._lokr_factors[pos] = (a, b, existing + scale)
+            return
+    leaf._lokr_factors.append((w1, w2, scale))
 
 
 def _apply_bias_deltas(transformer: Any, lora: "LoRAAdapter", probe: Any) -> int:
@@ -481,18 +567,19 @@ def _rescale_attached_lora(transformer: Any, lora: "LoRAAdapter") -> Any | None:
         rescaling only the low-rank half would silently desynchronise the two.
     Both cases fall back to the existing, known-correct path.
     """
-    if lora.deltas or not lora.factors:
+    if lora.deltas or not (lora.factors or lora.lokr_factors):
         return None
 
     factor_ids = {(id(a), id(b)) for a, b in lora.factors.values()}
+    factor_ids |= {(id(a), id(b)) for a, b in lora.lokr_factors.values()}
     matched = 0
     pending: list[tuple[list, int, float]] = []
     for module in _iter_adaptable_leaves(transformer):
-        entries = module._lora_factors
-        for pos, (a, b, scale) in enumerate(entries):
-            if (id(a), id(b)) in factor_ids:
-                pending.append((entries, pos, scale + lora.scale))
-                matched += 1
+        for entries in (module._lora_factors, module._lokr_factors):
+            for pos, (a, b, scale) in enumerate(entries):
+                if (id(a), id(b)) in factor_ids:
+                    pending.append((entries, pos, scale + lora.scale))
+                    matched += 1
     if not matched:
         return None
     for entries, pos, new_scale in pending:
@@ -777,7 +864,7 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
     new_blocks = list(transformer.blocks)
     touched_blocks: dict[int, Any] = {}
     applied = 0
-    total = len(lora.factors) + len(lora.deltas)
+    total = len(lora.factors) + len(lora.deltas) + len(lora.lokr_factors)
 
     def _lookup(native_key: str):
         """Native-dotted / kohya-flat first, then the HF-diffusers rename.
@@ -792,6 +879,14 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
     for idx in range(len(new_blocks)):
         for path, leaf_name in _KREA2_RESIDUAL_TARGETS:
             native_key = f"blocks.{idx}." + "".join(f"{p}." for p in path) + f"{leaf_name}.weight"
+            lokr = lora.lokr_factors.get(native_key)
+            if lokr is not None:
+                leaf = _adapt_leaf(new_blocks, touched_blocks, idx, path, leaf_name)
+                if leaf is None:
+                    continue
+                _upsert_lokr_factor(leaf, lokr[0], lokr[1], lora.scale)
+                applied += 1
+                continue
             pair, delta = _lookup(native_key)
             if pair is None and delta is None:
                 continue
@@ -826,6 +921,14 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
             for path, leaf_name in _KREA2_RESIDUAL_TARGETS:
                 native_key = (f"txtfusion.{sub_list_name}.{idx}."
                               + "".join(f"{p}." for p in path) + f"{leaf_name}.weight")
+                lokr = lora.lokr_factors.get(native_key)
+                if lokr is not None:
+                    leaf = _adapt_leaf(container, touched_map, idx, path, leaf_name)
+                    if leaf is None:
+                        continue
+                    _upsert_lokr_factor(leaf, lokr[0], lokr[1], lora.scale)
+                    applied += 1
+                    continue
                 pair, delta = _lookup(native_key)
                 if pair is None and delta is None:
                     continue
@@ -1036,7 +1139,7 @@ def _apply_lora_residual_to_flux(transformer: Any, lora: "LoRAAdapter", config: 
     touched_double: dict[int, Any] = {}
     touched_single: dict[int, Any] = {}
     applied = 0
-    total = len(lora.factors) + len(lora.deltas)
+    total = len(lora.factors) + len(lora.deltas) + len(lora.lokr_factors)
 
     hidden_dim = config.hidden_size if is_flux2 else config.hidden_dim
     mlp_dim = None if is_flux2 else config.mlp_dim
@@ -1306,7 +1409,7 @@ def _apply_lora_residual_to_zimage(transformer: Any, lora: "LoRAAdapter") -> Any
     }
     touched: dict[str, dict[int, Any]] = {name: {} for name in containers}
     applied = 0
-    total = len(lora.factors) + len(lora.deltas)
+    total = len(lora.factors) + len(lora.deltas) + len(lora.lokr_factors)
 
     # q/k/v output widths of the native fused `attention.qkv`, needed to
     # assemble a diffusers LoRA's three separate deltas into it. Read off a
@@ -1832,22 +1935,17 @@ class ASDX_LoraLoader(io.ComfyNode):
                     continue
                 w2_raw = raw[w2_key]
                 w2_arr = w2_raw if isinstance(w2_raw, mx.array) else mx.array(w2_raw)
-                w1 = weight_arr.astype(mx.float32)
-                w2 = w2_arr.astype(mx.float32)
-                if w1.ndim != 2 or w2.ndim != 2:
+                if weight_arr.ndim != 2 or w2_arr.ndim != 2:
                     unsupported_lokr.append(stem)
                     continue
-                # kron([a,b], [c,d]) -> [a*c, b*d], matching torch.kron for 2-D.
-                r1, c1 = w1.shape
-                r2, c2 = w2.shape
-                delta = (w1.reshape(r1, 1, c1, 1) * w2.reshape(1, r2, 1, c2)
-                         ).reshape(r1 * r2, c1 * c2).astype(w2_arr.dtype)
                 lokr_key = f"{stem}.weight"
                 for pfx in ("diffusion_model.", "model.", "transformer."):
                     if lokr_key.startswith(pfx):
                         lokr_key = lokr_key[len(pfx):]
                         break
-                lora.deltas[_normalize_native_lora_key(lokr_key)] = delta
+                # Store the small factors; the full-size kron is built lazily,
+                # one target at a time, by `_materialize_delta`.
+                lora.lokr_factors[_normalize_native_lora_key(lokr_key)] = (weight_arr, w2_arr)
             elif key.endswith((".lokr_w2", ".lokr_w1_a", ".lokr_w1_b",
                                ".lokr_w2_a", ".lokr_w2_b", ".lokr_t2")):
                 continue  # consumed alongside its `.lokr_w1` sibling above
@@ -1939,7 +2037,7 @@ class ASDX_LoraLoader(io.ComfyNode):
         """
         from mlx.utils import tree_flatten, tree_unflatten
 
-        if not lora.deltas and not lora.factors:
+        if not lora.deltas and not lora.factors and not lora.lokr_factors:
             print("[ASDX] LoRA: no matching weights found")
             return transformer
 
