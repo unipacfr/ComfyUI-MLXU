@@ -414,6 +414,76 @@ class AdaptableLinear(nn.Linear):
         return new
 
 
+def _rescale_attached_lora(transformer: Any, lora: "LoRAAdapter") -> Any | None:
+    """Fast path for `ASDX_LoraSchedule`: add `lora.scale` onto the adapters
+    this exact LoRA already attached, mutating scales in place.
+
+    `_update_lora_schedule` (`sampler/core.py`) re-invokes the whole attach
+    path EVERY sampling step with `lora.scale` set to the step's incremental
+    `delta_scale`. After the first call, that work is entirely redundant: the
+    object graph is already cloned and private, every target already resolves
+    to the same `AdaptableLinear`, and `_upsert_lora_factor` finds the same
+    `(a, b)` arrays -- the only thing that actually changes is a float. The
+    full path still cost ~81ms/step on a real Z-Image LoRA (measured), which
+    is pure overhead once the LoRA is attached.
+
+    Returns the same transformer with scales updated, or None if the fast
+    path does not apply -- in which case the caller must run the full attach.
+    It deliberately does NOT apply when:
+      - nothing is attached yet (first call), or
+      - the LoRA has any full-size `deltas`, since those were folded into
+        `.weight` by `merge_delta` and leave no `(a, b)` entry to rescale;
+        rescaling only the low-rank half would silently desynchronise the two.
+    Both cases fall back to the existing, known-correct path.
+    """
+    if lora.deltas or not lora.factors:
+        return None
+
+    factor_ids = {(id(a), id(b)) for a, b in lora.factors.values()}
+    matched = 0
+    pending: list[tuple[list, int, float]] = []
+    for module in _iter_adaptable_leaves(transformer):
+        entries = module._lora_factors
+        for pos, (a, b, scale) in enumerate(entries):
+            if (id(a), id(b)) in factor_ids:
+                pending.append((entries, pos, scale + lora.scale))
+                matched += 1
+    if not matched:
+        return None
+    for entries, pos, new_scale in pending:
+        a, b, _ = entries[pos]
+        entries[pos] = (a, b, new_scale)
+    return transformer
+
+
+def _iter_adaptable_leaves(module: Any, _seen: set[int] | None = None):
+    """Yield every `AdaptableLinear` reachable from `module`.
+
+    Walks the module tree generically (MLX `Module` is a dict subclass, and
+    `nn.Sequential` keeps its children in a plain `.layers` list), so this
+    stays correct for all five families without per-family target tables --
+    and, unlike those tables, cannot silently miss a leaf a future family adds.
+    """
+    if _seen is None:
+        _seen = set()
+    if id(module) in _seen:
+        return
+    _seen.add(id(module))
+    if isinstance(module, AdaptableLinear):
+        yield module
+        return
+    children: Any
+    if isinstance(module, dict):
+        children = module.values()
+    elif isinstance(module, (list, tuple)):
+        children = module
+    else:
+        return
+    for child in children:
+        if isinstance(child, (nn.Module, dict, list, tuple)):
+            yield from _iter_adaptable_leaves(child, _seen)
+
+
 def _upsert_lora_factor(leaf: AdaptableLinear, a: mx.array, b: mx.array, scale: float) -> None:
     """Attach `(a, b, scale)` to `leaf`, ADDING `scale` onto an existing
     entry that already uses the exact same `a`/`b` arrays (by identity)
@@ -1734,6 +1804,14 @@ class ASDX_LoraLoader(io.ComfyNode):
         if not lora.deltas and not lora.factors:
             print("[ASDX] LoRA: no matching weights found")
             return transformer
+
+        # ASDX_LoraSchedule re-applies the SAME LoRA every sampling step, where
+        # all that changes is the scale -- rescale the already-attached
+        # adapters in place instead of re-cloning and re-resolving everything.
+        # Returns None (and falls through) whenever that isn't provably safe.
+        rescaled = _rescale_attached_lora(transformer, lora)
+        if rescaled is not None:
+            return rescaled
 
         if isinstance(transformer, SingleStreamDiT):
             # Krea2 -- Phase 1 forward-time residual (see canon and the
