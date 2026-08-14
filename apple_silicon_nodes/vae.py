@@ -23,23 +23,37 @@ import torch
 _VAE_CACHE: dict[str, Any] = {}
 
 
-# ── MPS OOM detection ────────────────────────────────────────────────
+# ── MPS failures a tiled retry can fix ───────────────────────────────
 
-def _is_mps_oom(e: Exception) -> bool:
-    """True for the plain `RuntimeError` a real MPS OOM raises.
+def _needs_tiled_retry(e: Exception) -> bool:
+    """True for the two plain `RuntimeError`s MPS raises that tiling resolves.
 
-    `comfy.sd.VAE.decode()`/`.encode()` already retry via tiled decode when
-    `model_management.is_oom(e)` recognises the exception — but `is_oom()` only
-    matches `torch.cuda.OutOfMemoryError` or `torch.AcceleratorError`
-    (error_code==2 / "out of memory" in message). A real MPS OOM on this machine
-    (torch 2.13) raises a plain `RuntimeError` ("MPS backend out of memory..."),
-    and `AcceleratorError` is a `RuntimeError` SUBCLASS, not the reverse — so
-    `is_oom()` returns False, `raise_non_oom()` re-raises, and the node crashes
-    instead of falling back to tiled decode. Verified directly against the
-    installed torch: `isinstance(plain_mps_runtimeerror, AcceleratorError)` is
-    False.
+    1. **Out of memory.** `comfy.sd.VAE.decode()`/`.encode()` already retry via
+       tiled decode when `model_management.is_oom(e)` recognises the exception —
+       but `is_oom()` only matches `torch.cuda.OutOfMemoryError` or
+       `torch.AcceleratorError` (error_code==2 / "out of memory" in message). A
+       real MPS OOM on this machine (torch 2.13) raises a plain `RuntimeError`
+       ("MPS backend out of memory..."), and `AcceleratorError` is a
+       `RuntimeError` SUBCLASS, not the reverse — so `is_oom()` returns False,
+       `raise_non_oom()` re-raises, and the node crashes instead of falling back
+       to tiled decode. Verified directly against the installed torch:
+       `isinstance(plain_mps_runtimeerror, AcceleratorError)` is False.
+
+    2. **INT_MAX tensor limit.** MPSGraph refuses any tensor with more than
+       INT_MAX (2**31-1) elements, regardless of free memory. The VAE mid-block
+       self-attention materialises a full `(H*W/64)**2`-element matrix, so every
+       image past ~1723x1723 px trips it — and `slice_attention()` only splits
+       that matrix when it does NOT fit in free memory, so the more memory is
+       free the more certainly it hits the limit (steps=1 on an idle 64 GB
+       machine). Neither `is_oom()` nor `slice_attention()`'s own retry loop
+       recognises it ("out of memory" is not in the message), so it also
+       crashes. Reproduced on the Krea2 (Wan21) VAE at 2048x2048 for both encode
+       and decode; tiling to 512px tiles brings the matrix back under the limit.
     """
-    return isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+    if not isinstance(e, RuntimeError):
+        return False
+    msg = str(e).lower()
+    return "out of memory" in msg or "larger than int_max" in msg
 
 
 # ── VAE Loader ───────────────────────────────────────────────────────
@@ -184,24 +198,35 @@ class ASDX_VAEDecode(io.ComfyNode):
         if getattr(vae, "latent_dim", 2) == 3 and latent.dim() == 4:
             latent = latent.unsqueeze(2)
 
-        # comfy's own OOM->tiled retry never fires on MPS (see `_is_mps_oom`),
-        # so do it here. Mirrors `comfy/sd.py::VAE.decode`'s own structure: set a
-        # flag inside `except` and tile OUTSIDE it, because the live exception
-        # keeps every tensor allocated at raise-time referenced until the block
-        # exits — tiling inside it would run against that still-held memory.
+        # comfy's own OOM->tiled retry never fires on MPS (see
+        # `_needs_tiled_retry`), so do it here. Mirrors `comfy/sd.py::VAE.decode`'s
+        # own structure: set a flag inside `except` and tile OUTSIDE it, because
+        # the live exception keeps every tensor allocated at raise-time referenced
+        # until the block exits — tiling inside it would run against that
+        # still-held memory.
         do_tile = False
         try:
             image = vae.decode(latent)
         except Exception as e:
-            if not _is_mps_oom(e):
+            if not _needs_tiled_retry(e):
                 raise
-            print("[ASDX] VAE Decode: MPS out of memory, retrying with tiled decode.")
+            print(f"[ASDX] VAE Decode: MPS limit hit ({e}), retrying with tiled decode.")
             do_tile = True
 
         if do_tile:
             import comfy.model_management
             comfy.model_management.soft_empty_cache()
-            image = vae.decode_tiled(latent)
+            if getattr(vae, "latent_dim", 2) == 3:
+                # `VAE.decode_tiled()`'s dims==3 branch builds `overlap=(1, overlap,
+                # overlap)` WITHOUT defaulting `overlap` first, so calling it with no
+                # arguments passes `(1, None, None)` down to `tiled_scale_multidim`
+                # and dies on `int - None`. Pass the tile/overlap `VAE.decode()`'s own
+                # internal 3D fallback computes. (`encode_tiled()` does default its
+                # overlap, so the encode side below needs no such argument.)
+                tile = 256 // vae.spacial_compression_decode()
+                image = vae.decode_tiled(latent, tile_x=tile, tile_y=tile, overlap=tile // 4)
+            else:
+                image = vae.decode_tiled(latent)
 
         if image.dim() == 5:
             image = image.reshape(-1, image.shape[-3], image.shape[-2], image.shape[-1])
@@ -274,16 +299,16 @@ class ASDX_VAEEncode(io.ComfyNode):
         `[B,C,H,W]` (single image, no temporal axis) -- squeeze that axis back
         out here, the exact inverse of what `_fallback_decode` does before decode.
         """
-        # Same MPS OOM->tiled fallback as `_fallback_decode` above, same
+        # Same MPS OOM/INT_MAX->tiled fallback as `_fallback_decode` above, same
         # flag-outside-except reasoning. `encode_tiled` returns the same layout
         # as `encode`, so the `latent_dim == 3` squeeze below covers both paths.
         do_tile = False
         try:
             latent = vae.encode(pixels)
         except Exception as e:
-            if not _is_mps_oom(e):
+            if not _needs_tiled_retry(e):
                 raise
-            print("[ASDX] VAE Encode: MPS out of memory, retrying with tiled encode.")
+            print(f"[ASDX] VAE Encode: MPS limit hit ({e}), retrying with tiled encode.")
             do_tile = True
 
         if do_tile:
