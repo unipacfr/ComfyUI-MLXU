@@ -89,3 +89,49 @@ them because each looked like a real defect first:
 - Importing `lora.py` under a second package name, so `isinstance` dispatch
   failed and Krea2 silently fell through to the SDXL merge (`0/264`). This is
   the module-identity trap already documented for the ComfyUI symlink.
+
+## Krea2 Identity Edit: an empty prompt field first, then a missing source fit
+
+2026-08-14. A Krea2 Identity Edit run produced an image that did not follow the
+prompt. Two independent causes, found in order.
+
+**Cause 1 — the prompt was never sent.** The log line
+`[ASDX] Text encoded (SD-style): 0 chars, type=clip, grounded on source image`
+prints `len(text)` (`conditioning.py:376`). The instruction had been typed into
+`system_prompt`, which only fills the grounding template's system block; the `{}`
+that receives the user text (`conditioning.py:53-54`) got an empty string. The
+model was asked to describe an image and given no instruction. `system_prompt`
+should stay empty in almost every case -- it steers what the vision tower
+attends to, it is not the prompt.
+
+Ruled out along the way, both benign: `matched 430/686 params` is the expected
+count for a bias-free-trained checkpoint (the 256 missing are all `.bias`,
+zero-filled at `native/krea2/model.py:1030-1039`, not left random), and the
+grounded-encode path is line-for-line identical to the reference's
+`Krea2EditGroundedEncode` -- same `_prep`, `grounding_px=768`, template, and
+`tokenize(prompt, images=…, llama_template=…)` call.
+
+**Cause 2 — the source latent was never fitted to the target grid.** With the
+prompt filled in, the edit still applied only partially, while the same prompt on
+two independent implementations agreed with each other. Both fit every source to
+the output resolution before it reaches the transformer, and ASDX did not:
+`comfyui-krea2edit` calls `_fit_src` from `krea2_edit_forward:192-194` on any
+source whose grid differs, and SceneWorks pre-fits in PIXELS via
+`fit_edit_references` -> `fit_rgb` "crop" (`image_jobs/base.rs:22`).
+
+Measured on the real run: source `[1, 16, 166, 250]` = an 83x125 grid = 10 375
+tokens against a 96x168 target = 48x84 = 4 032 tokens. The source held 72% of the
+image tokens, pulling the result toward reproducing the reference instead of
+following the instruction, on RoPE coordinates that run past anything training
+saw, at ~31 s/step from the quadratic attention cost.
+
+Fixed by `_SamplerCore._fit_source_latent` (`sampler/core.py`), a port of
+`_fit_src` verified bit-identical (max|diff| = 0.0) against the reference on six
+shape cases, with a null check confirming the comparison can actually see a
+difference. Tokens drop 10 375 -> 4 032.
+
+**Transferable lesson.** Two independent references agreeing against ASDX
+localized the fault in one step; that is now canon (`ComfyUI and the SceneWorks
+stack are the reference implementations`). And read the encode log's character
+count before theorizing about conditioning -- a config divergence hunt was
+started on a run where the prompt field was simply empty.

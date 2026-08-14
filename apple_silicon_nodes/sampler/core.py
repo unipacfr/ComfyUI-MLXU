@@ -928,12 +928,67 @@ class _SamplerCore:
             print(f"[ASDX] ControlNet latent prep failed: {e}")
             return None
 
+    @staticmethod
+    def _fit_source_latent(source: np.ndarray, tgt_h: int, tgt_w: int) -> np.ndarray:
+        """Center-crop a source latent to the target's aspect ratio, then resize
+        it onto the target's exact latent grid.
+
+        Ported from comfyui-krea2edit's `_fit_src`, which `krea2_edit_forward`
+        applies to every source whose grid differs from the target's; SceneWorks
+        fits every edit reference the same way (`fit_edit_references` ->
+        `fit_rgb` "crop": scale-to-cover, then center-crop). Training put source
+        and target on the SAME grid, so an unfitted source is wrong twice over:
+        its RoPE coordinates run past the target's, and a source larger than the
+        target dominates the sequence (an 83x125 source against a 48x84 target
+        is 72% of the image tokens), pulling the result back toward the
+        reference and away from the edit instruction.
+
+        Crop before resizing: a plain resize stretches a mixed-aspect source.
+
+        Runs before the Wan21 whitening below, matching the reference, which
+        fits the raw VAE latent. The order is free either way -- whitening is a
+        per-channel affine and bilinear interpolation is a weighted mean with
+        unit weights, so the two commute exactly.
+
+        Deliberately NOT on MLX, as the exception the canon record `Porting from
+        a reference means converting it to Apple Silicon` requires to be stated
+        where it is taken. `mlx.nn.Upsample(mode="linear")` does produce the
+        exact target grid (NHWC layout, fractional scale_factor) but lands
+        2.2e-05 relative away from torch's bilinear -- a real algorithmic
+        difference, measured against a harness checked to be exact at scale=1
+        and bit-identical on `nearest`. This path runs ONCE per generation on
+        ~1.6M elements, milliseconds against minutes of sampling, so converting
+        it buys nothing and costs the property that validates it: bit-exact
+        equality with the reference's own `_fit_src`. Revisit only if this ever
+        moves onto a per-step path.
+        """
+        _, _, src_h, src_w = source.shape
+        if (src_h, src_w) == (tgt_h, tgt_w):
+            return source
+
+        scale = max(tgt_h / src_h, tgt_w / src_w)
+        crop_h = min(src_h, int(round(tgt_h / scale)))
+        crop_w = min(src_w, int(round(tgt_w / scale)))
+        y0, x0 = (src_h - crop_h) // 2, (src_w - crop_w) // 2
+        cropped = source[:, :, y0:y0 + crop_h, x0:x0 + crop_w]
+
+        fitted = torch.nn.functional.interpolate(
+            torch.from_numpy(np.ascontiguousarray(cropped)),
+            size=(tgt_h, tgt_w), mode="bilinear",
+        ).numpy()
+        print(
+            f"[ASDX] Identity Edit: source latent fitted {src_h}x{src_w} -> "
+            f"{tgt_h}x{tgt_w} (center-crop to target aspect, then resize)"
+        )
+        return fitted
+
     def _prepare_krea2_identity_edit(self) -> None:
         """Prepare Identity Edit source latent for Krea2.
 
         Prepends source image tokens (frame=1) to the image latent.
-        The source latent is VAE-encoded and packed in the same format
-        as the noise, then prepended to the image tokens in the transformer.
+        The source latent is VAE-encoded, fitted to the target's latent grid
+        (see `_fit_source_latent`) and packed in the same format as the noise,
+        then prepended to the image tokens in the transformer.
 
         The frame index in RoPE distinguishes source (frame=1) from
         target (frame=0) tokens for identity preservation.
@@ -951,6 +1006,10 @@ class _SamplerCore:
                 source_samples.detach().cpu().float().numpy().astype(np.float32, copy=False)
                 if hasattr(source_samples, "detach")
                 else np.asarray(source_samples, dtype=np.float32)
+            )
+
+            source_np = self._fit_source_latent(
+                source_np, self.height // 8, self.width // 8
             )
 
             # Whiten into the model's internal Wan21 latent space -- matches

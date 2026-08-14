@@ -81,3 +81,11 @@ Two LoRA bugs reached real generations while every existing test passed: both co
 ## MLX float32 matmul carries ~1e-3 relative error on this Metal backend
 kind: gotcha | date: 2026-08-14 | status: canon
 A plain `x @ K.T` in MLX float32 deviates ~7.5e-03 from the same product in numpy float32, while numpy f32-vs-f64 is 6.5e-07. Do not treat a ~1e-3 relative gap between two MLX formulations as a formula error -- it is backend accumulation noise. Compare against a float64 reference computed OUTSIDE MLX before concluding a rewrite is numerically wrong.
+
+## ComfyUI and the SceneWorks stack are the reference implementations
+kind: convention | date: 2026-08-14 | status: canon
+When ASDX diverges from the expected output for a model family, ground truth is ComfyUI's own PyTorch source (plus the relevant custom node) and the SceneWorks Rust stack -- `SceneWorks`, `inference`, `mlx-gen`, `mlx-rs`. Read and port from them, verifying numerically, rather than reasoning from ASDX's own code alone. Because: every silent-divergence bug found so far has been ASDX's own, and two independent references agreeing against ASDX localizes the fault in one step -- that is exactly how Krea2 Identity Edit's missing source-to-target fit was found on 2026-08-14. The single exception is a bug discovered IN a reference: it stops being ground truth on that specific point, and only that point.
+
+## Porting from a reference means converting it to Apple Silicon, not transcribing it
+kind: convention | date: 2026-08-14 | status: canon
+The reference implementations are ground truth for BEHAVIOR (geometry, layout, constants, operation order), never for the execution substrate: ComfyUI is PyTorch/CUDA-shaped and the SceneWorks stack is Rust. Every port must be rebuilt on MLX/Metal and unified memory -- `mlx.core`/`mlx.nn` on the hot path, no needless host round-trips, `mx.eval()` placed deliberately -- because a transcribed reference inherits an execution model this hardware does not have. An exception must be earned by a MEASUREMENT on real shapes, not by convenience: the canon already records two (VAE encode/decode and the text encoders, where PyTorch-MPS wins), and any new one belongs in the code comment that takes it. Keep the reference's numerical result as the acceptance test for the converted version.

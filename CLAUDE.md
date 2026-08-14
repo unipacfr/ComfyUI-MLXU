@@ -47,6 +47,10 @@ Your goal is to build high-performance, robust, and clean custom nodes for Comfy
      reference implementation (e.g. ComfyUI's own `comfy_kitchen`) and verify
      numerically against it on a real checkpoint -- do not trust a formula derived by
      inspection alone.
+   * The reference implementations for ANY divergence, not just quantization, are
+     ComfyUI's own source (plus the relevant custom node) and the SceneWorks Rust
+     stack -- `SceneWorks`, `inference`, `mlx-gen`, `mlx-rs`. See the canon record
+     `ComfyUI and the SceneWorks stack are the reference implementations`.
 
 7. **VAE Encode/Decode Fallbacks**:
    * `MLXVAE()` (`mlx_vae.py`) is an untrained placeholder with no real weight

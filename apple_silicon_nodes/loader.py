@@ -25,6 +25,7 @@ import torch
 from comfy_api.latest import io
 
 from . import bridge
+from . import metadata_extractors
 from .capability import CAPABILITY_PROFILES, CapabilityProfile, _resolve_capability_from_path
 from .memory_calibration import LoadShape, check_fits_or_warn
 from .native import FluxConfig, FluxTransformer, load_transformer
@@ -501,6 +502,7 @@ class ASDX_DiffusionLoader(io.ComfyNode):
         base_model: str | None = None,
         low_memory_mode: bool = False,
     ) -> io.NodeOutput:
+        metadata_extractors.ensure_registered()
         t0 = time.perf_counter()
 
         # Build composite cache key
@@ -608,6 +610,22 @@ class ASDX_DiffusionLoader(io.ComfyNode):
         return Path(name)
 
 
+def _clip_model_options(type: str) -> dict[str, Any]:
+    """Return model_options dict for CLIP loading, to set dtype when needed.
+
+    Used by ASDX_CLIPLoader and ASDX_DualCLIPLoader to select the right dtype
+    for Krea2 (where float16 causes overflow in vision transformer attention).
+    """
+    # Default model_options (empty, let comfy choose)
+    if type != "krea2":
+        return {}
+
+    # Krea2 uses Qwen3-VL text encoder which can overflow float16
+    # in attention layers. Use bfloat16 instead to prevent NaNs.
+    # This matches the fix described in the roadmap.
+    return {"dtype": torch.bfloat16}
+
+
 # ── Checkpoint Loader ────────────────────────────────────────────────────
 
 class ASDX_CheckpointLoader(io.ComfyNode):
@@ -649,6 +667,7 @@ class ASDX_CheckpointLoader(io.ComfyNode):
 
     @classmethod
     def execute(cls, ckpt_name: str, precision: str) -> io.NodeOutput:
+        metadata_extractors.ensure_registered()
         t0 = time.perf_counter()
 
         # Resolve checkpoint path

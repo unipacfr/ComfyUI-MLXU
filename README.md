@@ -97,12 +97,27 @@ sampling.py`, `comfy/samplers.py`) and verified numerically against them.
 TeaCache/SeaCache require `sampler_name` in `euler`/`ddim` (their step-skip
 heuristic assumes a single, stateless model call per step).
 
+Krea2 Identity Edit: wire the VAE-encoded source into `source_latent` (not
+`latent_image`, which only sets the output resolution). The source is fitted
+onto the target's latent grid automatically -- center-crop to the target aspect,
+then resize -- matching comfyui-krea2edit's `_fit_src` and SceneWorks'
+`fit_edit_references`. Training put source and target on the same grid, and an
+oversized source also crowds the sequence, weakening prompt adherence.
+`ref_boost` dials target->source attention (1.0 = off; the reference workflow
+ships 4.0 for strong likeness).
+
 ### Latent / VAE
 | Node | Description |
 |------|-------------|
 | `🍏 ASDX Empty Latent` | Create an empty latent (`flux`/`flux2`/`sdxl` format) |
 | `🍏 ASDX VAE Decode (MLX)` | Decode latents via MLX VAE |
 | `🍏 ASDX VAE Encode (MLX)` | Encode images via MLX VAE |
+
+Both VAE nodes retry automatically with a tiled encode/decode when MPS raises one
+of the two failures tiling fixes: a plain out-of-memory `RuntimeError`, or
+`MPSGraph does not support tensor dims larger than INT_MAX` (the VAE mid-block
+attention matrix is `(H*W/64)**2` elements, so it trips past ~1723x1723 px).
+comfy's own OOM fallback recognises neither on Apple Silicon.
 
 ### LoRA
 | Node | Description |
