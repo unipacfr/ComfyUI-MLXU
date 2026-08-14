@@ -399,6 +399,26 @@ class AdaptableLinear(nn.Linear):
         """
         self.weight = self.weight + (scale * delta).astype(self.weight.dtype)
 
+    def merge_bias_delta(self, delta: mx.array, scale: float) -> bool:
+        """Merge a `[out]` bias delta into `.bias`, same one-time-merge
+        contract as `merge_delta` (a bias delta is inherently full-size --
+        there is no low-rank form to keep as a residual).
+
+        These come from ComfyUI's `.diff_b` entries, which `_load_lora_file`
+        already stored under a `<module>.bias` key -- but every attach loop
+        only ever probed `<module>.weight`, so they were loaded and then
+        silently never applied.
+
+        Returns False when the target Linear has no bias at all, so the
+        caller can count it as unapplied instead of inventing one: adding a
+        bias where the architecture has none would change the module's shape
+        contract, not just its values.
+        """
+        if "bias" not in self:
+            return False
+        self.bias = self.bias + (scale * delta).astype(self.bias.dtype)
+        return True
+
     @classmethod
     def from_linear(cls, linear: nn.Linear) -> "AdaptableLinear":
         """Wrap an existing plain `nn.Linear`'s `.weight`/`.bias` BY
@@ -412,6 +432,31 @@ class AdaptableLinear(nn.Linear):
         if "bias" in linear:
             new.bias = linear.bias
         return new
+
+
+def _apply_bias_deltas(transformer: Any, lora: "LoRAAdapter", probe: Any) -> int:
+    """Apply every `<module>.bias` delta in `lora.deltas` to its target.
+
+    ComfyUI `.diff_b` entries are stored by `_load_lora_file` under a
+    `<module>.bias` key, but every attach loop probes only `<module>.weight`,
+    so these were loaded and then silently never applied.
+
+    `probe(native_weight_key)` is the caller's own resolver -- it returns the
+    already-wrapped `AdaptableLinear` for a native `.weight` key, or None.
+    Reusing it means the bias pass inherits each family's exact target
+    coverage (including its diffusers/kohya fallbacks) instead of duplicating
+    that key logic here. Returns the number of bias deltas actually applied.
+    """
+    applied = 0
+    for key, delta in lora.deltas.items():
+        if not key.endswith(".bias"):
+            continue
+        leaf = probe(key[: -len(".bias")] + ".weight")
+        if leaf is None:
+            continue
+        if leaf.merge_bias_delta(delta, lora.scale):
+            applied += 1
+    return applied
 
 
 def _rescale_attached_lora(transformer: Any, lora: "LoRAAdapter") -> Any | None:
@@ -867,6 +912,44 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
             new_seq = copy.copy(seq)
             new_seq.layers = updated
             new_sequentials[seq_name] = new_seq
+
+    # Bias deltas (`.diff_b`) target the SAME leaves already wrapped above, so
+    # resolve them against those rather than re-walking the key tables.
+    wrapped: dict[str, AdaptableLinear] = {}
+    for idx, block in touched_blocks.items():
+        for path, leaf_name in _KREA2_RESIDUAL_TARGETS:
+            mod = block
+            for p in path:
+                mod = getattr(mod, p, None)
+                if mod is None:
+                    break
+            leaf = getattr(mod, leaf_name, None) if mod is not None else None
+            if isinstance(leaf, AdaptableLinear):
+                wrapped[f"blocks.{idx}." + "".join(f"{p}." for p in path) + f"{leaf_name}.weight"] = leaf
+    for sub_name, touched_map in (("layerwise_blocks", touched_layerwise),
+                                  ("refiner_blocks", touched_refiner)):
+        for idx, block in touched_map.items():
+            for path, leaf_name in _KREA2_RESIDUAL_TARGETS:
+                mod = block
+                for p in path:
+                    mod = getattr(mod, p, None)
+                    if mod is None:
+                        break
+                leaf = getattr(mod, leaf_name, None) if mod is not None else None
+                if isinstance(leaf, AdaptableLinear):
+                    wrapped[f"txtfusion.{sub_name}.{idx}." + "".join(f"{p}." for p in path)
+                            + f"{leaf_name}.weight"] = leaf
+    if new_first is not None:
+        wrapped["first.weight"] = new_first
+    if new_last is not None and isinstance(new_last.linear, AdaptableLinear):
+        wrapped["last.linear.weight"] = new_last.linear
+    if new_projector is not None:
+        wrapped["txtfusion.projector.weight"] = new_projector
+    for seq_name, new_seq in new_sequentials.items():
+        for pos, element in enumerate(new_seq.layers):
+            if isinstance(element, AdaptableLinear):
+                wrapped[f"{seq_name}.{pos}.weight"] = element
+    applied += _apply_bias_deltas(transformer, lora, wrapped.get)
 
     touched_txtfusion = bool(touched_layerwise) or bool(touched_refiner) or new_projector is not None
     if (not touched_blocks and not touched_txtfusion and new_first is None
