@@ -544,6 +544,39 @@ class _SamplerCore:
             print(f"[ASDX] Kontext reference prep failed: {e}")
 
     @staticmethod
+    def _text_lora_state(transformer: Any) -> list[tuple[int, int, float]] | None:
+        """Snapshot of the LoRA scales on Krea2's TEXT-side modules.
+
+        Krea2 precomputes `context = encode_text(...)` once before the
+        sampling loop (it costs ~86ms at seq=256 and grows with sequence
+        length, up to the ~12s/step documented on `encode_text` at seq=4444
+        with the enhancer), so a schedule targeting `txtfusion`/`txtmlp`
+        would otherwise never show after step 0. Re-encoding unconditionally
+        would hand that cost back on every step; comparing two snapshots
+        narrows it to the steps that actually moved a text-side weight.
+
+        Must be captured BEFORE the schedule update and compared with a
+        snapshot taken after: `_rescale_attached_lora`'s fast path mutates
+        scales IN PLACE on the same object, so holding a reference to the
+        pre-update transformer would read the already-updated state and never
+        detect a change. Returns None when the state can't be read, which the
+        caller treats as "changed" -- re-encoding is the safe direction.
+        """
+        try:
+            from ..lora import _iter_adaptable_leaves
+        except ImportError:
+            return None
+        out: list[tuple[int, int, float]] = []
+        for attr in ("txtfusion", "txtmlp"):
+            root = getattr(transformer, attr, None)
+            if root is None:
+                continue
+            for leaf in _iter_adaptable_leaves(root):
+                for a, b, scale in leaf._lora_factors:
+                    out.append((id(a), id(b), scale))
+        return sorted(out)
+
+    @staticmethod
     def _update_lora_schedule(
         transformer: Any, config: Any, schedule: dict, step: int, total_steps: int
     ) -> Any:
@@ -1084,17 +1117,28 @@ class _SamplerCore:
             sigma_t = sigmas[t]
             sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
 
-            # Update LoRA schedule. NOTE: `context` above was precomputed
-            # once via `encode_text()` for performance (see that call's own
-            # comment) -- a schedule targeting only Krea2's txtfusion
-            # sub-transformer will therefore still change `self.transformer`
-            # here, but that change won't be reflected in `context` after
-            # step 0, since it's never re-encoded.
+            # Update LoRA schedule, re-encoding the precomputed `context`
+            # only on steps that actually moved a text-side weight (see below).
             if self.lora_schedule is not None:
                 self.lora_schedule["step"] = t
+                text_state_before = self._text_lora_state(self.transformer)
                 self.transformer = self._update_lora_schedule(
                     self.transformer, self.config, self.lora_schedule, t, steps
                 )
+                # `context` was precomputed once, before this loop. A schedule
+                # that changes a `txtfusion`/`txtmlp` weight therefore has NO
+                # effect after step 0 unless the text conditioning is re-encoded
+                # -- and essentially every real Krea2 LoRA targets txtfusion
+                # (35/35 in this machine's library), so this is the common case,
+                # not an edge case. Re-encode only on steps that actually moved
+                # a text-side weight: a step whose `delta_scale` was 0, or one
+                # touching only image-side blocks, still costs nothing.
+                text_state_after = self._text_lora_state(self.transformer)
+                if text_state_before != text_state_after:
+                    context = self.transformer.encode_text(
+                        txt_fused, self.krea2_enhancer_strength
+                    )
+                    mx.eval(context)
 
             # ── Compute transformer output ──────────────────────────
             if teacache_state is not None:
