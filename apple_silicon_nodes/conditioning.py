@@ -54,6 +54,98 @@ def _krea2_grounding_template(system_prompt: str) -> str:
             "<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n")
 
 
+# llama_detect (comfy/text_encoders/hunyuan_video.py) reads dtype_llama off
+# these two probe keys ALONE, then flux2_te hard-overrides the caller's dtype
+# with it -- there is no model_options path to it.
+_LLAMA_DTYPE_PROBE_KEYS = (
+    "model.norm.weight",
+    "model.layers.0.input_layernorm.weight",
+)
+
+
+def _load_clip_fp8_aware(ckpt_paths: list[str], clip_type: Any, model_options: dict) -> Any:
+    """`comfy.sd.load_clip`, but keeping an FP8 text encoder's weights in FP8.
+
+    Flux.2/Klein's FP8 Qwen3-8B encoder is 7.63GB on disk yet costs 15.35GB
+    live, because comfy upcasts every one of its 254 F8_E4M3 tensors to
+    bfloat16 at load. The cause is narrow and confirmed by reading the file's
+    own header: `llama_detect` takes `dtype_llama` from the dtype of two
+    LayerNorm probe keys, and in this file the 145 norms are BF16 while the
+    252 linears + 2 embeddings are F8_E4M3. comfy sees BF16 and upcasts the
+    lot. `flux2_te` then applies that dtype unconditionally
+    (`if dtype_llama is not None: dtype = dtype_llama`), so neither
+    `model_options["dtype"]` nor `--fp8_e4m3fn-text-enc` can reach it --
+    both were measured to have zero effect here.
+
+    Fix, in two halves, because forcing FP8 alone is NOT correct: cast only
+    the two probe tensors so `llama_detect` reports FP8, then restore all 145
+    norms to their true BF16 values on the built module. The restore matters
+    -- FP8 norms alone (0.3M params) shifted every embedding by 6.4% rel. L2
+    (cosine 0.9996, against 0.998 between two *different* prompts, i.e. the
+    error was a meaningful fraction of real semantic distance). With the
+    norms put back, output is bit-identical to the bfloat16 path (cosine
+    1.000000, max abs diff 0.0) at 7.72GB live instead of 15.35GB.
+
+    Only files that are genuinely FP8-with-BF16-norms take this path; anything
+    else loads exactly as before.
+    """
+    embedding_directory = (
+        comfy.utils.get_t2ia_paths() if hasattr(comfy.utils, "get_t2ia_paths") else []
+    )
+    sd_list = [comfy.utils.load_torch_file(p) for p in ckpt_paths]
+
+    targets = [
+        sd for sd in sd_list
+        if any(k in sd and sd[k].dtype == torch.bfloat16 for k in _LLAMA_DTYPE_PROBE_KEYS)
+        and any(v.dtype == torch.float8_e4m3fn for v in sd.values())
+    ]
+    if not targets:
+        del sd_list
+        return comfy.sd.load_clip(
+            ckpt_paths=ckpt_paths, embedding_directory=embedding_directory,
+            clip_type=clip_type, model_options=model_options,
+        )
+
+    saved_norms: dict[str, torch.Tensor] = {}
+    for sd in targets:
+        for k, v in sd.items():
+            if v.dtype == torch.bfloat16:
+                saved_norms[k] = v.clone()
+        for k in _LLAMA_DTYPE_PROBE_KEYS:
+            if k in sd:
+                sd[k] = sd[k].to(torch.float8_e4m3fn)
+
+    clip = comfy.sd.load_text_encoder_state_dicts(
+        state_dicts=sd_list, embedding_directory=embedding_directory,
+        clip_type=clip_type, model_options=model_options,
+    )
+
+    modules = dict(clip.cond_stage_model.named_modules())
+    restored = 0
+    for file_key, value in saved_norms.items():
+        for prefix in ("qwen3_8b.transformer.", ""):
+            module_name, _, attr = f"{prefix}{file_key}".rpartition(".")
+            module = modules.get(module_name)
+            if module is None:
+                continue
+            current = getattr(module, attr, None)
+            if current is not None and current.shape == value.shape:
+                setattr(module, attr, torch.nn.Parameter(
+                    value.to(current.device), requires_grad=False))
+                restored += 1
+                break
+
+    if restored != len(saved_norms):
+        # Never ship silently-degraded norms: that is the 6.4%-drift case.
+        raise RuntimeError(
+            f"ASDX FP8 text encoder: restored only {restored}/{len(saved_norms)} "
+            "BF16 norms after forcing FP8 -- refusing to run with degraded "
+            "LayerNorm weights. Report this with the checkpoint name."
+        )
+    print(f"[ASDX] FP8 text encoder kept in FP8 ({restored} norms restored to bf16)")
+    return clip
+
+
 def _clip_model_options(type_str: str) -> dict:
     """comfy's default text-encoder dtype is float16 (`model_management.
     text_encoder_dtype`), even on CPU. That's fine for text-only encoding, but
@@ -128,9 +220,8 @@ class ASDX_DualCLIPLoader(io.ComfyNode):
             clip_path2 = cls._find_file("text_encoders", clip_name2)
             clip_type_enum = _clip_type_from_string(type)
 
-            clip = comfy.sd.load_clip(
+            clip = _load_clip_fp8_aware(
                 ckpt_paths=[clip_path1, clip_path2],
-                embedding_directory=comfy.utils.get_t2ia_paths() if hasattr(comfy.utils, 'get_t2ia_paths') else [],
                 clip_type=clip_type_enum,
                 model_options=_clip_model_options(type),
             )
@@ -410,9 +501,8 @@ class ASDX_CLIPLoader(io.ComfyNode):
             clip_path = cls._find_file("text_encoders", clip_name)
             clip_type_enum = _clip_type_from_string(type)
 
-            clip = comfy.sd.load_clip(
+            clip = _load_clip_fp8_aware(
                 ckpt_paths=[clip_path],
-                embedding_directory=comfy.utils.get_t2ia_paths() if hasattr(comfy.utils, 'get_t2ia_paths') else [],
                 clip_type=clip_type_enum,
                 model_options=_clip_model_options(type),
             )
