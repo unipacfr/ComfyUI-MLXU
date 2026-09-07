@@ -683,14 +683,15 @@ class SingleStreamDiT(nn.Module):
         img_w: int,
         txt_len: int = 0,
         src_grids: list[tuple[int, int]] | None = None,
+        src_offsets: list[tuple[int, int]] | None = None,
     ) -> mx.array:
         """Precompute the RoPE rotation table for a proper 2D image grid.
 
-        Matches the ComfyUI reference (`_imgids` / `krea2_edit_forward`): each
-        image token gets its OWN (height, width) grid coordinate, not a flat
-        sequential index reused on both axes. Text tokens sit at position 0 on
-        every axis; source (Identity Edit) tokens use frame=1 with their own
-        grid; target tokens use frame=0.
+        Matches the ComfyUI reference (`_imgids` / `_imgids_offset` /
+        `krea2_edit_forward`): each image token gets its OWN (height, width)
+        grid coordinate, not a flat sequential index reused on both axes. Text
+        tokens sit at position 0 on every axis; source (Identity Edit) tokens
+        use frame=1 with their own grid; target tokens use frame=0.
 
         Args:
             img_h: Target image token grid height (in patches).
@@ -698,16 +699,23 @@ class SingleStreamDiT(nn.Module):
             txt_len: Number of text tokens.
             src_grids: List of (h, w) grid sizes for each source/reference block,
                        in frame order (frame=1, 2, ...). Empty/None for no Identity Edit.
+            src_offsets: Optional per-block (row, col) integer offset, aligned with
+                       src_grids. The pixel fit path yields a content-only ref grid
+                       smaller than the target; the offset centers it in the target
+                       grid (matching the reference `_imgids_offset`). Defaults to
+                       (0, 0) per block.
 
         Returns:
             [txt_len + sum(src_h*src_w) + img_h*img_w, head_dim/2, 2, 2] rotation table.
         """
         src_grids = src_grids or []
+        src_offsets = src_offsets or []
 
         pos_parts = [mx.zeros((txt_len, 3), dtype=mx.float32)] if txt_len > 0 else []
 
         for frame_idx, (sh, sw) in enumerate(src_grids, start=1):
-            pos_parts.append(self._grid_positions(frame_idx, sh, sw))
+            off = src_offsets[frame_idx - 1] if frame_idx - 1 < len(src_offsets) else (0, 0)
+            pos_parts.append(self._grid_positions(frame_idx, sh, sw, off))
 
         pos_parts.append(self._grid_positions(0, img_h, img_w))
 
@@ -715,10 +723,18 @@ class SingleStreamDiT(nn.Module):
         return self.pos_embedder(pos)
 
     @staticmethod
-    def _grid_positions(frame: int, h: int, w: int) -> mx.array:
-        """Build [h*w, 3] position indices (frame, row, col) for a 2D grid."""
-        rows = mx.arange(h, dtype=mx.float32)[:, None]
-        cols = mx.arange(w, dtype=mx.float32)[None, :]
+    def _grid_positions(
+        frame: int, h: int, w: int, offset: tuple[int, int] = (0, 0)
+    ) -> mx.array:
+        """Build [h*w, 3] position indices (frame, row, col) for a 2D grid.
+
+        `offset` (row, col) shifts the grid to a centered position within a
+        larger target grid, matching the reference `_imgids_offset` for fit
+        refs whose content-only grid is smaller than the target.
+        """
+        off_h, off_w = offset
+        rows = (mx.arange(h, dtype=mx.float32) + off_h)[:, None]
+        cols = (mx.arange(w, dtype=mx.float32) + off_w)[None, :]
         rows = mx.broadcast_to(rows, (h, w)).reshape(-1)
         cols = mx.broadcast_to(cols, (h, w)).reshape(-1)
         frames = mx.full((h * w,), float(frame), dtype=mx.float32)

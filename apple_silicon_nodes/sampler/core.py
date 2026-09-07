@@ -78,6 +78,8 @@ class _SamplerCore:
         low_memory_mode: bool = False,
         # Krea2 Identity Edit
         source_latent: dict | None = None,
+        source_image: torch.Tensor | None = None,
+        vae: Any | None = None,
         ref_boost: float = 1.0,
         krea2_enhancer_strength: float = 1.0,
         controlnet: dict | None = None,
@@ -119,6 +121,8 @@ class _SamplerCore:
         self.low_memory_mode = low_memory_mode
         # Krea2 Identity Edit
         self.source_latent = source_latent
+        self.source_image = source_image
+        self.vae = vae
         self.ref_boost = ref_boost
         self.krea2_enhancer_strength = krea2_enhancer_strength
         self.controlnet = controlnet
@@ -961,20 +965,29 @@ class _SamplerCore:
         it buys nothing and costs the property that validates it: bit-exact
         equality with the reference's own `_fit_src`. Revisit only if this ever
         moves onto a per-step path.
+
+        This is the LATENT-space fallback (the reference's "crop (legacy)"
+        geometry): center-crop to the target AR, then resize onto the target's
+        exact grid. It is only used when no source_image + vae are wired. The
+        preferred path fits in PIXEL space (`_prepare_krea2_identity_edit_pixels`),
+        which is what the v1_2 LoRA was trained with and what the reference
+        prefers -- latent-space resizing softens VAE latents and is the source
+        of the face artifacts this fallback is meant to avoid.
         """
         _, _, src_h, src_w = source.shape
         if (src_h, src_w) == (tgt_h, tgt_w):
             return source
 
+        # Center-crop to the target aspect ratio, then resize onto the target's
+        # exact grid. A plain resize would stretch a mixed-AR source.
         scale = max(tgt_h / src_h, tgt_w / src_w)
         crop_h = min(src_h, int(round(tgt_h / scale)))
         crop_w = min(src_w, int(round(tgt_w / scale)))
         y0, x0 = (src_h - crop_h) // 2, (src_w - crop_w) // 2
         cropped = source[:, :, y0:y0 + crop_h, x0:x0 + crop_w]
-
         fitted = torch.nn.functional.interpolate(
             torch.from_numpy(np.ascontiguousarray(cropped)),
-            size=(tgt_h, tgt_w), mode="bilinear",
+            size=(tgt_h, tgt_w), mode="bilinear", align_corners=False,
         ).numpy()
         print(
             f"[ASDX] Identity Edit: source latent fitted {src_h}x{src_w} -> "
@@ -983,16 +996,24 @@ class _SamplerCore:
         return fitted
 
     def _prepare_krea2_identity_edit(self) -> None:
-        """Prepare Identity Edit source latent for Krea2.
+        """Prepare the Identity Edit source for Krea2.
 
-        Prepends source image tokens (frame=1) to the image latent.
-        The source latent is VAE-encoded, fitted to the target's latent grid
-        (see `_fit_source_latent`) and packed in the same format as the noise,
-        then prepended to the image tokens in the transformer.
+        Two paths, matching comfyui-krea2edit:
+        - Pixel path (preferred): fit the source IMAGE in pixel space, VAE-encode,
+          whiten, pack. This is what the v1_2 LoRA was trained with and what the
+          reference prefers ("blur-proof"); it yields a content-only ref grid
+          centered with a RoPE offset. Requires source_image + vae.
+        - Latent path (fallback): fit the source LATENT (center-crop + bilinear),
+          whiten, pack. Yields a full-size ref grid, no offset. Used when only
+          source_latent is wired.
 
-        The frame index in RoPE distinguishes source (frame=1) from
-        target (frame=0) tokens for identity preservation.
+        The frame index in RoPE distinguishes source (frame=1) from target
+        (frame=0) tokens for identity preservation.
         """
+        if self.source_image is not None and self.vae is not None:
+            self._prepare_krea2_identity_edit_pixels()
+            return
+
         if self.source_latent is None:
             return
 
@@ -1001,7 +1022,6 @@ class _SamplerCore:
             if source_samples is None:
                 return
 
-            # Encode source image to latent (same as _encode_image_to_latent)
             source_np = (
                 source_samples.detach().cpu().float().numpy().astype(np.float32, copy=False)
                 if hasattr(source_samples, "detach")
@@ -1019,6 +1039,7 @@ class _SamplerCore:
             # (`_prepare_kontext_reference`), which applies
             # `latent_formats.Flux().process_in(...)` for the same reason.
             from ..native.config import process_wan21_latent_in
+
             source_mlx = mx.array(source_np).astype(mx.float32)
             source_mlx = process_wan21_latent_in(source_mlx)
             mx.eval(source_mlx)
@@ -1038,10 +1059,11 @@ class _SamplerCore:
             source_packed = mx.array(packed).astype(precision)
             mx.eval(source_packed)
 
-            # Store source tokens for prepending in transformer, along with the
-            # source token grid (needed by get_rope_grid to place frame=1 positions)
+            # The latent path fits onto the target's exact grid, so the ref grid
+            # equals the target grid -- no centered offset needed.
             self._identity_edit_source = source_packed
             self._identity_edit_src_grid = (src_h // 2, src_w // 2)
+            self._identity_edit_src_offset = (0, 0)
 
             print(
                 f"[ASDX] Identity Edit: source latent packed "
@@ -1053,6 +1075,94 @@ class _SamplerCore:
             # (multi-minute) sampling pass while quietly ignoring the source
             # image -- a misleading "success" instead of a fast, clear failure.
             raise RuntimeError(f"ASDX: Identity Edit prep failed: {e}") from e
+
+    def _prepare_krea2_identity_edit_pixels(self) -> None:
+        """Pixel-space source prep (the blur-proof path), matching
+        comfyui-krea2edit's `_fit_encode_image` fit mode.
+
+        Fits the source IMAGE in pixel space (contain + /16 floor + bicubic, or a
+        minimal center-crop when the AR nearly matches), VAE-encodes the fitted
+        image, whitens, and packs. The ref grid is content-only (no zero padding)
+        and centered in the target grid with a RoPE offset -- the geometry the
+        v1_2 LoRA was trained with.
+        """
+        try:
+            img = self.source_image  # [B, H, W, C] in [0, 1]
+            if img is None:
+                return
+            px_h, px_w = self.height, self.width  # target pixel dims
+            img4 = img.movedim(-1, 1).float()  # [B, C, H, W]
+            ih, iw = img4.shape[-2:]
+
+            sc = min(px_h / ih, px_w / iw)
+            CROP_TOL = 0.08
+            if ih * sc >= px_h * (1 - CROP_TOL) and iw * sc >= px_w * (1 - CROP_TOL):
+                # Near-matched AR: fill the target grid exactly via a minimal
+                # center-crop (avoids 1-2 token fit-inside margins that the
+                # reference found cause edge-duplication seams).
+                s = max(px_h / ih, px_w / iw)
+                ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
+                y0, x0 = (ih - ch) // 2, (iw - cw) // 2
+                img4 = img4[..., y0:y0 + ch, x0:x0 + cw]
+                nh, nw = px_h, px_w
+            else:
+                # Genuine AR mismatch: snap to /16 (NOT /8) to stay byte-identical
+                # to the trainer's _fit_prep, capped at the target's /16 floor.
+                nh = min(max(16, int(ih * sc) // 16 * 16), max(16, px_h // 16 * 16))
+                nw = min(max(16, int(iw * sc) // 16 * 16), max(16, px_w // 16 * 16))
+
+            fitted = torch.nn.functional.interpolate(
+                img4, size=(nh, nw), mode="bicubic", antialias=True
+            )
+
+            # VAE-encode the fitted image. comfy's VAE.encode takes [B, H, W, C]
+            # in [0, 1]; the reference does exactly this.
+            fitted_hwc = fitted.movedim(1, -1)[..., :3].clamp(0, 1)
+            latent = self.vae.encode(fitted_hwc)
+            if getattr(self.vae, "latent_dim", 2) == 3 and latent.dim() == 5:
+                latent = latent.squeeze(2)
+            latent_np = latent.detach().cpu().float().numpy().astype(np.float32, copy=False)
+
+            # Whiten into the model's internal Wan21 latent space.
+            from ..native.config import process_wan21_latent_in
+            latent_mlx = mx.array(latent_np).astype(mx.float32)
+            latent_mlx = process_wan21_latent_in(latent_mlx)
+            mx.eval(latent_mlx)
+            latent_np = np.array(latent_mlx, dtype=np.float32)
+
+            # [B, C, H, W] -> pack to [B, NH*NW, 64]
+            batch, channels, src_lat_h, src_lat_w = latent_np.shape
+            packed = latent_np.reshape(
+                batch, channels, src_lat_h // 2, 2, src_lat_w // 2, 2
+            )
+            packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
+            packed = packed.reshape(
+                batch, (src_lat_h // 2) * (src_lat_w // 2), channels * 4
+            )
+
+            precision = self.config.mlx_dtype
+            source_packed = mx.array(packed).astype(precision)
+            mx.eval(source_packed)
+
+            src_h = src_lat_h // 2
+            src_w = src_lat_w // 2
+            img_h = (self.height // 8) // 2
+            img_w = (self.width // 8) // 2
+            self._identity_edit_source = source_packed
+            self._identity_edit_src_grid = (src_h, src_w)
+            # Center the content-only ref grid in the target grid (matching the
+            # reference `_imgids_offset`); (0, 0) when it fills the target.
+            self._identity_edit_src_offset = (
+                max(0, (img_h - src_h) // 2),
+                max(0, (img_w - src_w) // 2),
+            )
+            print(
+                f"[ASDX] Identity Edit (pixel path): source {ih}x{iw} -> fitted "
+                f"{nh}x{nw} px, latent {src_lat_h}x{src_lat_w}, grid {src_h}x{src_w} "
+                f"centered offset {self._identity_edit_src_offset}"
+            )
+        except Exception as e:
+            raise RuntimeError(f"ASDX: Identity Edit pixel prep failed: {e}") from e
 
     def _krea2_ref_attn_bias(
         self, txt_len: int, src_h: int, src_w: int, tgt_h: int, tgt_w: int, boost: float
@@ -1142,17 +1252,29 @@ class _SamplerCore:
         t_sampling_start = time.perf_counter()
 
         # Source latent prepending for Identity Edit
-        if self.source_latent is not None and self.source_latent.get("samples") is not None:
+        has_latent = self.source_latent is not None and self.source_latent.get("samples") is not None
+        has_pixels = self.source_image is not None and self.vae is not None
+        if has_latent or has_pixels:
             self._prepare_krea2_identity_edit()
 
         src_tokens = getattr(self, "_identity_edit_source", None)
         src_grid = getattr(self, "_identity_edit_src_grid", None)
+        src_offset = getattr(self, "_identity_edit_src_offset", (0, 0))
         src_h, src_w = src_grid if src_grid is not None else (None, None)
 
         # RoPE is the same at every step (text/source/target positions don't
-        # change across the denoising loop) — precompute once.
-        src_grids = [(src_h, src_w)] if src_tokens is not None else None
-        rope_freqs = self.transformer.get_rope_grid(img_h, img_w, txt_len, src_grids)
+        # change across the denoising loop) — precompute once. The pixel path
+        # yields a content-only ref grid centered in the target (offset != 0);
+        # the latent path fills the target grid (offset == 0).
+        if src_tokens is not None and src_h is not None and src_w is not None:
+            src_grids = [(src_h, src_w)]
+            src_offsets = [src_offset]
+        else:
+            src_grids = None
+            src_offsets = None
+        rope_freqs = self.transformer.get_rope_grid(
+            img_h, img_w, txt_len, src_grids, src_offsets
+        )
 
         # ref_boost: additive attention-logit bias favoring source tokens,
         # only meaningful (and only computable) when Identity Edit is active.

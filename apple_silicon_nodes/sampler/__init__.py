@@ -143,6 +143,13 @@ class ASDX_MLXSampler(io.ComfyNode):
         krea2_enhancer_strength: float = 1.0,
         # Legacy
         lora_schedule: dict | None = None,
+        # Krea2 Identity Edit pixel path: the source IMAGE + the VAE used to
+        # encode it. When both are wired, the sampler fits the image in pixel
+        # space and VAE-encodes it itself (the blur-proof path the reference
+        # and the v1_2 LoRA were trained with), instead of fitting a
+        # pre-encoded latent.
+        source_image: torch.Tensor | None = None,
+        vae: Any | None = None,
     ) -> io.NodeOutput:
         """Execute the MLX-native sampling loop via _SamplerCore."""
         transformer = model["transformer"]
@@ -250,6 +257,8 @@ class ASDX_MLXSampler(io.ComfyNode):
             noise_aug=noise_aug,
             # Krea2 Identity Edit
             source_latent=source_latent,
+            source_image=source_image,
+            vae=vae,
             ref_boost=ref_boost,
             krea2_enhancer_strength=krea2_enhancer_strength,
             controlnet=controlnet,
