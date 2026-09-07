@@ -135,3 +135,42 @@ localized the fault in one step; that is now canon (`ComfyUI and the SceneWorks
 stack are the reference implementations`). And read the encode log's character
 count before theorizing about conditioning -- a config divergence hunt was
 started on a run where the prompt field was simply empty.
+
+## Krea2 Identity Edit face artifacts: the source was fitted in latent space
+
+2026-09-07. A Krea2 Identity Edit run produced wavy, smeared faces (all three
+subjects present but distorted). The 2026-08-14 record had fixed the missing
+source fit, but a later session had "fixed" residual artifacts by switching
+`_fit_source_latent` to a zero-letterbox in LATENT space (bilinear resize of the
+VAE latent + zero padding to the target grid, full ref grid, no RoPE offset).
+
+Root cause: both references fit in PIXEL space, not latent space.
+`comfyui-krea2edit`'s `_fit_encode_image` (fit mode) resamples the IMAGE
+(contain + /16 floor + bicubic), VAE-encodes it, and centers the content-only
+ref grid with a RoPE offset; its docstring is explicit -- "latent-space resizing
+softens VAE latents, this path never resizes latents at all." SceneWorks does a
+direct Lanczos pixel resize. The v1_2 LoRA was trained with the fit geometry.
+The zero padding, after Wan21 whitening, becomes arbitrary values; with
+ref_boost=4 the target is pulled toward that garbage, smearing the faces.
+
+Confirmed identical on both sides (ruled out): ref_boost=4, LoRA
+krea2_identity_edit_v1_2 scale 1.0, guidance, whitening, template. The only
+divergence was the SPACE of the fit.
+
+Fixed by `_prepare_krea2_identity_edit_pixels` (sampler/core.py): fit the image
+in pixel space (contain + /16 floor + bicubic, or a minimal center-crop when the
+AR nearly matches), VAE-encode via the real ComfyUI VAE, whiten, pack; the ref
+grid is content-only and centered with a RoPE offset (`get_rope_grid` now takes
+a per-block offset, matching the reference `_imgids_offset`). Verified: fit
+geometry byte-identical to the reference across 5 aspect cases (incl. the
+portrait case that reproduces the 2026-09-06 log `48x72 centered in 48x86`),
+RoPE offset matches `_imgids_offset`, and a same-seed run yields clean faces
+(3/3). Commit 08fcd27. See canon `Krea2 Identity Edit source is fitted in pixel
+space, never in latent space`.
+
+**Transferable lesson.** When a reference offers two code paths (a preferred one
+and a fallback), port the PREFERRED one and read its docstring for why the
+fallback exists -- the fallback's limitations are the bug you will hit. And a
+"fix" that changes the SPACE of an operation (pixels -> latents) without
+checking which space the reference and the training used is a regression, not a
+fix.
