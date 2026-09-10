@@ -166,3 +166,63 @@ def _nag_block(
     )
 
     return positive[:, :pos_len], negative_text, positive[:, pos_len:]
+
+
+def _nag_edit_block(
+    block: Any,
+    positive_text: mx.array,
+    negative_text: mx.array,
+    image: mx.array,
+    target_offset: int,
+    vec: mx.array,
+    positive_freqs: mx.array | None,
+    negative_freqs: mx.array | None,
+    ref_boost: mx.array | None,
+    phi: float,
+    tau: float,
+    alpha: float,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """Krea2Edit block: preserve source attention, guide target tokens only.
+
+    Port of krea2-nag/krea2_nag.py::_nag_edit_block. ``ref_boost`` (the
+    source-fidelity attention bias) is applied ONLY to the positive pass
+    -- it must never bias the negative/text-only pass.
+    """
+    prescale, preshift, pregate, postscale, postshift, postgate = block.mod(vec)
+    positive_len = positive_text.shape[1]
+    negative_len = negative_text.shape[1]
+
+    positive = mx.concatenate([positive_text, image], axis=1)
+    negative = mx.concatenate([negative_text, image], axis=1)
+    positive_pre = (1 + prescale[:, None]) * block.prenorm(positive) + preshift[:, None]
+    negative_pre = (1 + prescale[:, None]) * block.prenorm(negative) + preshift[:, None]
+    positive_raw, positive_gate = _raw_attention(
+        block.attn, positive_pre, positive_freqs, ref_boost
+    )
+    negative_raw, negative_gate = _raw_attention(
+        block.attn, negative_pre, negative_freqs, None
+    )
+
+    positive_raw = guide_attention_tail(
+        positive_raw,
+        negative_raw,
+        positive_start=positive_len + target_offset,
+        negative_start=negative_len + target_offset,
+        phi=phi,
+        tau=tau,
+        alpha=alpha,
+    )
+    positive_attn = block.attn.wo(positive_raw * positive_gate)
+    negative_text_attn = block.attn.wo(
+        negative_raw[:, :negative_len] * negative_gate[:, :negative_len]
+    )
+
+    positive = positive + pregate[:, None] * positive_attn
+    negative_text = negative_text + pregate[:, None] * negative_text_attn
+    positive = positive + postgate[:, None] * block.mlp(
+        (1 + postscale[:, None]) * block.postnorm(positive) + postshift[:, None]
+    )
+    negative_text = negative_text + postgate[:, None] * block.mlp(
+        (1 + postscale[:, None]) * block.postnorm(negative_text) + postshift[:, None]
+    )
+    return positive[:, :positive_len], negative_text, positive[:, positive_len:]
