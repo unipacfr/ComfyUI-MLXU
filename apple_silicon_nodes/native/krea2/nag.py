@@ -113,3 +113,56 @@ def _raw_attention(
     out = out.transpose(0, 2, 1, 3).reshape(B, L, D)
     gate = mx.sigmoid(attn.gate_proj(x))
     return out, gate
+
+
+def _nag_block(
+    block: Any,
+    positive_text: mx.array,
+    negative_text: mx.array,
+    image: mx.array,
+    vec: mx.array,
+    positive_freqs: mx.array | None,
+    negative_freqs: mx.array | None,
+    phi: float,
+    tau: float,
+    alpha: float,
+) -> tuple[mx.array, mx.array, mx.array]:
+    """One Krea2 block, twin positive/negative text pass, shared image.
+
+    Port of krea2-nag/krea2_nag.py::_nag_block. Both attention calls start
+    with byte-identical image tokens (the `image` argument is shared), so
+    the image Q/K/V match; only the text K/V differ.
+    """
+    prescale, preshift, pregate, postscale, postshift, postgate = block.mod(vec)
+    pos_len = positive_text.shape[1]
+    neg_len = negative_text.shape[1]
+
+    positive = mx.concatenate([positive_text, image], axis=1)
+    negative = mx.concatenate([negative_text, image], axis=1)
+
+    pos_pre = (1 + prescale[:, None]) * block.prenorm(positive) + preshift[:, None]
+    neg_pre = (1 + prescale[:, None]) * block.prenorm(negative) + preshift[:, None]
+    pos_raw, pos_gate = _raw_attention(block.attn, pos_pre, positive_freqs)
+    neg_raw, neg_gate = _raw_attention(block.attn, neg_pre, negative_freqs)
+
+    pos_image_raw = pos_raw[:, pos_len:]
+    neg_image_raw = neg_raw[:, neg_len:]
+    guided_image_raw = normalized_attention_guidance(
+        pos_image_raw, neg_image_raw, phi=phi, tau=tau, alpha=alpha
+    )
+
+    pos_raw = mx.concatenate([pos_raw[:, :pos_len], guided_image_raw], axis=1)
+    pos_attn = block.attn.wo(pos_raw * pos_gate)
+    neg_text_attn = block.attn.wo(neg_raw[:, :neg_len] * neg_gate[:, :neg_len])
+
+    positive = positive + pregate[:, None] * pos_attn
+    negative_text = negative_text + pregate[:, None] * neg_text_attn
+
+    positive = positive + postgate[:, None] * block.mlp(
+        (1 + postscale[:, None]) * block.postnorm(positive) + postshift[:, None]
+    )
+    negative_text = negative_text + postgate[:, None] * block.mlp(
+        (1 + postscale[:, None]) * block.postnorm(negative_text) + postshift[:, None]
+    )
+
+    return positive[:, :pos_len], negative_text, positive[:, pos_len:]
