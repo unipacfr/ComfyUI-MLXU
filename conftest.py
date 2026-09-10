@@ -1,28 +1,40 @@
-"""Root-level pytest configuration.
+"""Pytest configuration to enable test discovery.
 
-This conftest prevents pytest from importing the root __init__.py, which
-has ComfyUI-specific imports that fail outside a running ComfyUI process.
+Temporarily hides the root __init__.py during test collection since it
+contains ComfyUI-specific imports that fail outside a running ComfyUI process.
 """
 from __future__ import annotations
 
+import atexit
+import sys
 from pathlib import Path
 
-_root_dir = Path(__file__).parent
-_init_file = _root_dir / "__init__.py"
-_init_backup = _root_dir / "__init__.py.bak"
+_repo_root = Path(__file__).parent
+_init_file = _repo_root / "__init__.py"
+_init_backup = _repo_root / "__init__.py.bak"
+
+# Ensure repo root is in sys.path so tests can be imported as a package
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
 
 
-def pytest_configure(config):
-    """Temporarily hide the root __init__.py before collection."""
-    if _init_file.exists() and not _init_backup.exists():
-        _init_file.rename(_init_backup)
-
-
-def pytest_sessionfinish(session, exitstatus):
-    """Restore __init__.py after tests finish."""
+def _restore_init_file():
+    """Restore __init__.py if it was backed up. Called on exit."""
     if _init_backup.exists():
         try:
             _init_backup.rename(_init_file)
         except FileExistsError:
-            # Already restored
-            pass
+            pass  # Already restored
+
+
+def pytest_configure(config):
+    """Hide root __init__.py before collection to allow tests to run."""
+    if _init_file.exists() and not _init_backup.exists():
+        _init_file.rename(_init_backup)
+        # Register cleanup handler in case pytest crashes
+        atexit.register(_restore_init_file)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Restore __init__.py after tests complete."""
+    _restore_init_file()
