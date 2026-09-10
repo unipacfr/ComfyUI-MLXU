@@ -30,3 +30,12 @@ Icon = ""
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+# Repo root needs to be on sys.path for `tests/` submodules to import each
+# other as `tests.support....` (tests/ itself has no __init__.py). This used
+# to be done by conftest.py; now that conftest.py is gone (its only other
+# job -- hiding the repo-root __init__.py from pytest collection -- was
+# retired by making that file's ComfyUI import lazy, see __init__.py),
+# pytest's own `pythonpath` option covers this directly.
+pythonpath = ["."]
