@@ -7,6 +7,10 @@ Gives Krea2 a negative prompt without a second sampler eps pass: both a
 positive and a negative forward share the same image query, only the
 text K/V differs, and the two attention outputs are combined here,
 inside attention, before the block's own gate/wo/mlp.
+
+`_raw_attention` duplicates `Attention.__call__` (native/krea2/model.py) up
+to but not including gate/wo, so its math must be kept in sync by hand if
+that method ever changes.
 """
 from __future__ import annotations
 
@@ -83,9 +87,14 @@ def _raw_attention(
 
     NOTE: this must be kept in sync with Attention.__call__ by hand if
     that method's math ever changes -- there is no way to share the
-    implementation without also changing Attention.__call__ itself. See
-    the two call sites listed in nag.py's module docstring.
+    implementation without also changing Attention.__call__ itself.
     """
+    assert not attn.cpu_attention, (
+        "_raw_attention only duplicates Attention.__call__'s fused-kernel "
+        "branch (cpu_attention=False); it must not be called on a "
+        "cpu_attention=True instance (e.g. TextFusionBlock) or it silently "
+        "diverges from Attention.__call__'s CPU-stream branch."
+    )
     from .model import apply_rope  # local import: keeps nag.py importable
     # without model.py in scope until this is actually called.
 
