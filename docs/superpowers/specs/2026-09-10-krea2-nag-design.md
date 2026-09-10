@@ -93,15 +93,18 @@ change per block.
    directly — no new modulation math, `DoubleSharedModulation` output is
    reused as-is). Returns `(pos_text_out, neg_text_out, image_out)`.
 
-5. **`_nag_edit_block(block, pos_text, neg_text, image, target_offset, tvec, pos_freqs, neg_freqs, ref_boost, phi, tau, alpha) -> tuple[mx.array, mx.array, mx.array]`**
+5. **`_nag_edit_block(block, pos_text, neg_text, image, target_offset, tvec, pos_freqs, neg_freqs, ref_boost, negative_ref_boost, phi, tau, alpha) -> tuple[mx.array, mx.array, mx.array]`**
    Port of `krea2_nag.py::_nag_edit_block`: same as above but calls
    `guide_attention_tail` instead of `normalized_attention_guidance`, so
    only tokens from `target_offset` onward (the target image, after
    `source_len` — reuses the existing `self._identity_edit_src_offset`
    concept from the pixel-space fix, see canon `Krea2 Identity Edit source
-   is fitted in pixel space`) are guided. `ref_boost` is applied **only**
-   to the positive pass's raw attention (mirrors the reference: source
-   attention bias must not leak into the negative/text-only pass).
+   is fitted in pixel space`) are guided. `ref_boost`/`negative_ref_boost`
+   are applied to **both** passes' raw attention (mirrors the reference,
+   `krea2_nag.py:303-326`: it builds a `positive_mask` and a `negative_mask`
+   from the same bias math, each sized to its own pass's text length —
+   the source-fidelity bias is not specific to the positive pass, only its
+   text length differs between the two calls).
 
 ### `native/krea2/model.py` changes
 
