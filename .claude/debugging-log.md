@@ -215,3 +215,71 @@ not add up to a correct whole: a bug that requires seeing two tasks' code
 together (what Task 5 built, and what no task's tests ever combined it with)
 needs a review pass that reads the whole diff, not just each task's own slice
 of it.
+
+## Krea2 NAG has no targeted effect on a short negative prompt against a long positive one -- a real, large effect that doesn't correlate with the concept
+
+2026-09-10, first real-world smoke test after merge. Prompt: a ~100-token
+descriptive positive (Korean lifestyle photo, dessert cafe) with negative
+`long hair` (tokenizes to 7-8 fused tokens). Result: hair stayed long at every
+setting tried. At extreme settings (`nag_phi=10`, `nag_alpha=1.0`) the image
+degraded (doubled faces, generic artifacts) but hair was still long and
+unaffected -- the degradation had no relationship to the negative concept.
+
+Two hypotheses tested and REFUTED with real console diagnostics:
+- **Degenerate negative encoding.** `neg_context` for the 8-token negative was
+  finite, comparable scale to the 101-token positive (mean 4.42-4.59, std
+  9.53-9.68 vs positive's mean 4.15, std 6.78) -- not garbage.
+- **`krea2_enhancer_strength` distortion.** Setting it to `0.0` (disabling the
+  ASDX-specific ~x75 txtfusion amplifier entirely) made no difference.
+- **Negative prompt too short/unstructured.** A longer, more descriptive
+  negative ("photograph of a woman with long flowing hair") made no
+  difference either -- though it was still far shorter than the 101-token
+  positive, so this doesn't fully rule out length asymmetry (see below).
+
+A third diagnostic measured the actual magnitude of NAG's effect directly: at
+the FIRST denoising step, `|predict_nag_output - predict_output| / |predict_output|`
+= **69%** at `phi=6, alpha=0.5` -- a large, real perturbation, not a weak or
+negligible one. So NAG is not "too weak here" -- it produces a big effect that
+apparently doesn't point in the direction of "less long hair."
+
+**Leading hypothesis, not yet confirmed on a real model (no live ComfyUI/GPU
+in the investigating session):** `_nag_block`'s `positive_text`/`negative_text`
+each accumulate their OWN independent residual updates across all 28 blocks
+(`positive_text = positive_text + pregate*... ; positive_text = positive_text
++ postgate*mlp(...)`, same for `negative_text` -- see `nag.py`). Krea2's
+residual stream is known to grow to very large magnitude across blocks (see
+`Attention.__call__`'s docstring, `model.py`, "observed up to ~1e4"). A
+101-token stream and an 8-token stream accumulating independently through 28
+blocks can diverge in raw MAGNITUDE/numerical behavior for reasons that have
+nothing to do with the text's semantic content -- the per-token norm
+normalization in `normalized_attention_guidance` corrects for token-level
+scale, not for this kind of cross-block, cross-pass structural drift. If
+correct, the large 69% delta is dominated by this drift, not by "hair"
+semantics, which explains both why it's large AND why it never targets the
+concept.
+
+**This same two-independent-residual-stream structure exists in the reference
+implementation (`krea2_nag.py::_nag_block`, verified line-for-line multiple
+times during the port) -- so if this hypothesis is right, it is not a porting
+bug.** It would be either an inherent limitation of NAG on Krea2's specific
+architecture for asymmetric-length prompt pairs, or a limitation the
+reference's own README examples happen not to expose (its own examples are
+also short negatives against long positives, so this is not fully settled
+either).
+
+**Status: unresolved, documented as a known limitation, not fixed.** The
+investigating session could not access a live ComfyUI/GPU to test further
+(e.g. a truly length-matched negative prompt, or an experimental
+magnitude-normalization step before the NAG combine that would deviate from
+the reference). The user chose to stop at "document and don't fix" rather
+than pursue an unverified, reference-deviating change. All temporary
+diagnostic prints added during this investigation were reverted; the
+permanent "[ASDX] NAG active: ..." activation log (added by the final
+whole-branch review's fix wave) remains.
+
+**Transferable lesson.** A large, confirmed effect on the model's output is
+not the same as a large effect on the specific thing you asked for -- always
+measure both magnitude AND targeting before concluding "it's just too weak"
+or "it's working, just needs tuning." And matching a reference implementation
+line-for-line rules out a PORTING bug, not a DESIGN limitation of the
+technique itself for a case the reference's own examples didn't stress-test.

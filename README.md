@@ -118,6 +118,13 @@ source-fidelity bias, each sized to its own pass's text length) and NAG never
 touches source-reference tokens. `nag_phi`/`nag_alpha` at `0` disables NAG
 even with a negative conditioning merged in.
 
+**Known limitation:** a short negative against a much longer, richly-detailed
+positive prompt has not reliably suppressed the negative concept in testing
+(confirmed a real, large effect on the model's output -- not a weak one --
+that didn't correlate with the negative concept; see `.claude/debugging-log.md`).
+Effect quality may depend on how closely matched the positive/negative
+prompts are in length and structure. Not yet root-caused on a live model.
+
 ### Latent / VAE
 | Node | Description |
 |------|-------------|
