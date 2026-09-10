@@ -86,6 +86,11 @@ class _SamplerCore:
         sampler_name: str = "euler",
         scheduler_name: str = "normal",
         memory_shape: Any | None = None,
+        nag_phi: float = 4.0,
+        nag_tau: float = 2.5,
+        nag_alpha: float = 0.25,
+        nag_sigma_start: float = 1.0,
+        nag_sigma_end: float = 0.0,
     ):
         self.transformer = transformer
         self.config = config
@@ -129,6 +134,16 @@ class _SamplerCore:
         self.sampler_name = sampler_name
         self.scheduler_name = scheduler_name
         self.memory_shape = memory_shape
+        if nag_sigma_start < nag_sigma_end:
+            raise ValueError(
+                f"ASDX: nag_sigma_start ({nag_sigma_start}) must be >= "
+                f"nag_sigma_end ({nag_sigma_end})."
+            )
+        self.nag_phi = nag_phi
+        self.nag_tau = nag_tau
+        self.nag_alpha = nag_alpha
+        self.nag_sigma_start = nag_sigma_start
+        self.nag_sigma_end = nag_sigma_end
         self._is_flow_matching = model_type != "sdxl"
 
     def run(self, steps: int, seed: int) -> dict:
@@ -1182,6 +1197,21 @@ class _SamplerCore:
         bias[:, :, txt_len + src_len:, txt_len:txt_len + src_len] = log_boost
         return bias
 
+    def _nag_is_active(self, sigma_t: float) -> bool:
+        """Mirrors krea2-nag's _nag_is_active: NAG is a no-op if phi/alpha
+        is 0, or if sigma_t falls outside [nag_sigma_end, nag_sigma_start].
+        ASDX's Krea2 sigmas are already normalized (linear 1->0, see
+        calculate_sigmas), unlike the reference's raw 0-1000 scale -- the
+        sampler node's nag_sigma_start/nag_sigma_end defaults (1.0/0.0)
+        are on THIS scale, not the reference's.
+        """
+        negative = self.positive.get("_negative") if isinstance(self.positive, dict) else None
+        if negative is None:
+            return False
+        if self.nag_phi == 0.0 or self.nag_alpha == 0.0:
+            return False
+        return self.nag_sigma_end <= sigma_t <= self.nag_sigma_start
+
     def _run_krea2(
         self,
         steps: int,
@@ -1292,6 +1322,36 @@ class _SamplerCore:
         context = self.transformer.encode_text(txt_fused, self.krea2_enhancer_strength)
         mx.eval(context)
 
+        # NAG: encode the negative conditioning once, same rationale as the
+        # positive `context` precompute above -- it doesn't depend on the
+        # noisy image latent or timestep either.
+        negative = self.positive.get("_negative") if isinstance(self.positive, dict) else None
+        neg_context = None
+        neg_freqs = None
+        if negative is not None:
+            neg_txt_fused = conditioning_krea2_to_mlx(negative, precision)
+            neg_context = self.transformer.encode_text(neg_txt_fused, self.krea2_enhancer_strength)
+            mx.eval(neg_context)
+            neg_txt_len = neg_context.shape[1]
+            neg_freqs = self.transformer.get_rope_grid(
+                img_h, img_w, neg_txt_len, src_grids, src_offsets
+            )
+
+        def _predict(img_at, sigma_at):
+            if neg_context is not None and self._nag_is_active(float(sigma_at)):
+                return self.transformer.predict_nag(
+                    img=img_at, context=context, neg_context=neg_context,
+                    timestep=mx.array([float(sigma_at)], dtype=mx.float32),
+                    img_h=img_h, img_w=img_w,
+                    freqs=rope_freqs, neg_freqs=neg_freqs, ref_boost=ref_boost,
+                    src=src_tokens, src_h=src_h, src_w=src_w,
+                    phi=self.nag_phi, tau=self.nag_tau, alpha=self.nag_alpha,
+                )
+            return self.transformer.predict(
+                img=img_at, context=context, timestep=sigma_at, img_h=img_h, img_w=img_w,
+                freqs=rope_freqs, ref_boost=ref_boost, src=src_tokens, src_h=src_h, src_w=src_w,
+            )
+
         for t in range(steps):
             step_start = time.perf_counter()
 
@@ -1323,18 +1383,7 @@ class _SamplerCore:
 
             # ── Compute transformer output ──────────────────────────
             if teacache_state is not None:
-                current_output = self.transformer.predict(
-                    img=self.noise,
-                    context=context,
-                    timestep=sigma_t,
-                    img_h=img_h,
-                    img_w=img_w,
-                    freqs=rope_freqs,
-                    ref_boost=ref_boost,
-                    src=src_tokens,
-                    src_h=src_h,
-                    src_w=src_w,
-                )
+                current_output = _predict(self.noise, sigma_t)
                 mx.eval(current_output)
 
                 reused, reason = self._teacache_check(
@@ -1352,18 +1401,7 @@ class _SamplerCore:
                     skip_step = False
                     noise_pred = current_output
             else:
-                current_output = self.transformer.predict(
-                    img=self.noise,
-                    context=context,
-                    timestep=sigma_t,
-                    img_h=img_h,
-                    img_w=img_w,
-                    freqs=rope_freqs,
-                    ref_boost=ref_boost,
-                    src=src_tokens,
-                    src_h=src_h,
-                    src_w=src_w,
-                )
+                current_output = _predict(self.noise, sigma_t)
                 mx.eval(current_output)
                 noise_pred = current_output
                 skip_step = False
@@ -1380,10 +1418,7 @@ class _SamplerCore:
             denoised = self.noise - noise_pred * sigma_t
 
             def _model_call(x_at, sigma_at):
-                out = self.transformer.predict(
-                    img=x_at, context=context, timestep=sigma_at, img_h=img_h, img_w=img_w,
-                    freqs=rope_freqs, ref_boost=ref_boost, src=src_tokens, src_h=src_h, src_w=src_w,
-                )
+                out = _predict(x_at, sigma_at)
                 mx.eval(out)
                 return x_at - out * sigma_at
 
