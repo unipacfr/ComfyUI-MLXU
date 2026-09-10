@@ -62,3 +62,53 @@ def test_predict_nag_target_offset_matches_source_token_count():
     # when the target image differs.
     assert out_a.shape == (1, img_h * img_w, dit.channels * dit.patch ** 2)
     assert not np.allclose(np.array(out_a), np.array(out_b))
+
+
+def test_predict_nag_passes_src_len_as_target_offset(monkeypatch):
+    """Strengthens the invariant above: this file's other test would still
+    pass even with a completely wrong `target_offset`, since it only
+    checks output shape and that a different TARGET image changes the
+    output -- it never inspects `target_offset` itself.
+
+    `_nag_edit_block` (tested directly in test_nag_edit_block.py::
+    test_nag_edit_block_preserves_source_tokens_exactly) already proves
+    that a CORRECT target_offset keeps source tokens untouched. What is
+    NOT covered anywhere is that `predict_nag` (native/krea2/model.py)
+    actually calls it with `target_offset=src_len` (the source token
+    COUNT) rather than some other value (0, img_h*img_w, a stale
+    variable, ...). Guard that wiring directly, at the level named in
+    the finding, by capturing the `target_offset` every `_nag_edit_block`
+    call receives and asserting it equals `src_h*src_w`.
+    """
+    from tests.support.krea2_module_loader import load_krea2_module
+
+    nag_module = load_krea2_module("nag")
+
+    dit = _make_tiny_dit()
+    mx.eval(dit.parameters())
+    img_h, img_w = 2, 3
+    src_h, src_w = 2, 2
+    src_len = src_h * src_w
+    img = mx.random.normal((1, img_h * img_w, dit.channels * dit.patch ** 2))
+    src = mx.random.normal((1, src_h * src_w, dit.channels * dit.patch ** 2))
+    context = dit.encode_text(mx.random.normal((1, 4, dit.txtlayers * dit.txtdim)))
+    t = mx.array([0.5])
+    freqs = dit.get_rope_grid(img_h, img_w, context.shape[1], [(src_h, src_w)], [(0, 0)])
+
+    seen_offsets: list[int] = []
+    real_nag_edit_block = nag_module._nag_edit_block
+
+    def _spy(*args, **kwargs):
+        seen_offsets.append(kwargs["target_offset"])
+        return real_nag_edit_block(*args, **kwargs)
+
+    monkeypatch.setattr(nag_module, "_nag_edit_block", _spy)
+
+    dit.predict_nag(
+        img=img, context=context, neg_context=context, timestep=t,
+        img_h=img_h, img_w=img_w, freqs=freqs, neg_freqs=freqs,
+        src=src, src_h=src_h, src_w=src_w, phi=4.0, tau=2.5, alpha=0.25,
+    )
+
+    assert len(seen_offsets) == len(dit.blocks)
+    assert all(offset == src_len for offset in seen_offsets)
