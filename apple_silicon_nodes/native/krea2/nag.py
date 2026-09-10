@@ -10,6 +10,9 @@ inside attention, before the block's own gate/wo/mlp.
 """
 from __future__ import annotations
 
+import math
+from typing import Any
+
 import mlx.core as mx
 
 
@@ -65,3 +68,39 @@ def guide_attention_tail(
         positive_tail, negative_tail, phi=phi, tau=tau, alpha=alpha
     )
     return mx.concatenate([positive[:, :positive_start], guided_tail], axis=1)
+
+
+def _raw_attention(
+    attn: Any,
+    x: mx.array,
+    freqs: mx.array | None,
+    ref_boost: mx.array | None = None,
+) -> tuple[mx.array, mx.array]:
+    """Duplicate of Attention.__call__ (native/krea2/model.py) stopping
+    before ``out = out * gate; return self.wo(out)``. Returns (raw_out,
+    gate) so the caller can slice rows, apply NAG to only some of them,
+    then gate/wo the reassembled tensor itself.
+
+    NOTE: this must be kept in sync with Attention.__call__ by hand if
+    that method's math ever changes -- there is no way to share the
+    implementation without also changing Attention.__call__ itself. See
+    the two call sites listed in nag.py's module docstring.
+    """
+    from .model import apply_rope  # local import: keeps nag.py importable
+    # without model.py in scope until this is actually called.
+
+    B, L, D = x.shape
+    q = attn.wq(x).reshape(B, L, attn.heads, attn.headdim).transpose(0, 2, 1, 3)
+    k = attn.wk(x).reshape(B, L, attn.kvheads, attn.headdim).transpose(0, 2, 1, 3)
+    v = attn.wv(x).reshape(B, L, attn.kvheads, attn.headdim).transpose(0, 2, 1, 3)
+
+    q, k = attn.qknorm(q, k)
+    if freqs is not None:
+        q = apply_rope(q, freqs)
+        k = apply_rope(k, freqs)
+
+    scale = 1.0 / math.sqrt(attn.headdim)
+    out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=ref_boost)
+    out = out.transpose(0, 2, 1, 3).reshape(B, L, D)
+    gate = mx.sigmoid(attn.gate_proj(x))
+    return out, gate
