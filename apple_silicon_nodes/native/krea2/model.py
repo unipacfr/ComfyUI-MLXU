@@ -911,6 +911,73 @@ class SingleStreamDiT(nn.Module):
             t = timestep.astype(mx.float32)
         return self(img, txt, t, img_h, img_w, src=src, src_h=src_h, src_w=src_w, **kwargs)
 
+    def predict_nag(
+        self,
+        img: mx.array,
+        context: mx.array,
+        neg_context: mx.array,
+        timestep: mx.array,
+        img_h: int,
+        img_w: int,
+        freqs: mx.array,
+        neg_freqs: mx.array,
+        ref_boost: mx.array | None = None,
+        src: mx.array | None = None,
+        src_h: int | None = None,
+        src_w: int | None = None,
+        phi: float = 4.0,
+        tau: float = 2.5,
+        alpha: float = 0.25,
+    ) -> mx.array:
+        """NAG variant of __call__/predict: twin positive/negative text
+        pass, shared image tokens, combined inside attention. Leaves
+        __call__/predict completely untouched -- callers without a
+        negative conditioning keep today's exact code path.
+
+        `context`/`neg_context` must already be pre-fused (see
+        `encode_text`) -- unlike `__call__`, this method does not accept
+        raw `txt`, since it is only ever called from the denoising loop
+        where both are hoisted out already.
+        """
+        from .nag import _nag_block, _nag_edit_block
+
+        img_proj = self.first(img.astype(self.dtype))
+        if img_proj.shape[1] != img_h * img_w:
+            raise ValueError(
+                f"img_h*img_w ({img_h}*{img_w}={img_h * img_w}) does not match "
+                f"img token count ({img_proj.shape[1]})"
+            )
+        txt_len = context.shape[1]
+        neg_txt_len = neg_context.shape[1]
+
+        t_embed, tvec = self.time_embed(timestep)
+
+        if src is not None:
+            if src_h is None or src_w is None:
+                raise ValueError("src_h and src_w are required when src is given")
+            src_proj = self.first(src.astype(self.dtype))
+            src_len = src_proj.shape[1]
+            image = mx.concatenate([src_proj, img_proj], axis=1)
+            positive_text, negative_text = context, neg_context
+            for block in self.blocks:
+                positive_text, negative_text, image = _nag_edit_block(
+                    block, positive_text, negative_text, image,
+                    target_offset=src_len, vec=tvec,
+                    positive_freqs=freqs, negative_freqs=neg_freqs,
+                    ref_boost=ref_boost, phi=phi, tau=tau, alpha=alpha,
+                )
+            img_out = image[:, src_len:]
+        else:
+            positive_text, negative_text, image = context, neg_context, img_proj
+            for block in self.blocks:
+                positive_text, negative_text, image = _nag_block(
+                    block, positive_text, negative_text, image, tvec,
+                    freqs, neg_freqs, phi, tau, alpha,
+                )
+            img_out = image
+
+        return self.last(img_out, t_embed)
+
 
 # ── EmbedND (3-axis RoPE, paired-interleave convention) ─────────────────
 #
