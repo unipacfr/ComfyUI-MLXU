@@ -99,6 +99,30 @@ class ASDX_MLXSampler(io.ComfyNode):
                             "the full effect at strength=1.0. No effect on "
                             "non-Krea2 models.",
                 ),
+                io.Float.Input(
+                    "nag_phi", default=4.0, min=0.0, max=20.0, step=0.1, optional=True,
+                    tooltip="Krea2 NAG (negative-prompt guidance) strength. 0 disables "
+                            "NAG. Only takes effect when a negative conditioning is "
+                            "merged into 'positive' via ASDX_ConditioningMerger.",
+                ),
+                io.Float.Input(
+                    "nag_tau", default=2.5, min=0.01, max=20.0, step=0.05, optional=True,
+                    tooltip="Krea2 NAG normalization clamp (paper eq. 9).",
+                ),
+                io.Float.Input(
+                    "nag_alpha", default=0.25, min=0.0, max=1.0, step=0.01, optional=True,
+                    tooltip="Krea2 NAG blend factor between guided and unguided "
+                            "attention output. 0 disables NAG.",
+                ),
+                io.Float.Input(
+                    "nag_sigma_start", default=1.0, min=0.0, max=1.0, step=0.01, optional=True,
+                    tooltip="Krea2 NAG active while sigma_t <= this (ASDX's Krea2 "
+                            "sigmas are normalized 1->0, not the reference's 0-1000 scale).",
+                ),
+                io.Float.Input(
+                    "nag_sigma_end", default=0.0, min=0.0, max=1.0, step=0.01, optional=True,
+                    tooltip="Krea2 NAG active while sigma_t >= this.",
+                ),
                 # Legacy
                 io.Custom("ASDX_LORA_SCHEDULE").Input("lora_schedule", optional=True),
             ],
@@ -150,6 +174,11 @@ class ASDX_MLXSampler(io.ComfyNode):
         # pre-encoded latent.
         source_image: torch.Tensor | None = None,
         vae: Any | None = None,
+        nag_phi: float = 4.0,
+        nag_tau: float = 2.5,
+        nag_alpha: float = 0.25,
+        nag_sigma_start: float = 1.0,
+        nag_sigma_end: float = 0.0,
     ) -> io.NodeOutput:
         """Execute the MLX-native sampling loop via _SamplerCore."""
         transformer = model["transformer"]
@@ -261,6 +290,11 @@ class ASDX_MLXSampler(io.ComfyNode):
             vae=vae,
             ref_boost=ref_boost,
             krea2_enhancer_strength=krea2_enhancer_strength,
+            nag_phi=nag_phi,
+            nag_tau=nag_tau,
+            nag_alpha=nag_alpha,
+            nag_sigma_start=nag_sigma_start,
+            nag_sigma_end=nag_sigma_end,
             controlnet=controlnet,
             memory_shape=memory_shape,
         )
