@@ -25,3 +25,8 @@ include = ["apple_silicon_nodes*"]
 PublisherId = ""
 DisplayName = "ASDX — Apple Silicon Diffusion Nodes"
 Icon = ""
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
