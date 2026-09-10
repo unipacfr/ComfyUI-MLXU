@@ -551,11 +551,9 @@ class ASDX_ConditioningMerger(io.ComfyNode):
 
     @classmethod
     def execute(cls, positive: Any, negative: Any) -> io.NodeOutput:
-        """Merge conditioning - for most FLUX-family models negative is ignored, but Krea2
-        now consumes it via NAG (Normalized Attention Guidance) when this merged
-        conditioning reaches a Krea2 sampler."""
-        # Stored as `_negative` regardless of model family so a single merger node
-        # works everywhere; the Krea2 sampler is the one consumer that reads it.
+        """Merge conditioning - for FLUX, negative is typically ignored but accepted for compatibility."""
+        # FLUX doesn't use negative conditioning in the traditional sense
+        # Store both for compatibility but sampler will use positive
         result = dict(positive) if isinstance(positive, dict) else {
             "type": "flux1",
             "conditioning": positive,

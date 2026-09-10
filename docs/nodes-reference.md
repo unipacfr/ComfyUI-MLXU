@@ -236,16 +236,6 @@
 | noise_aug | FLOAT | 0.0 | Augmentation bruit (0-1) |
 | lora_schedule | ASDX_LORA_SCHEDULE | null | Schedule LoRA per-step |
 
-### Optionnels (Krea2 NAG)
-
-| Parametre | Type | Defaut | Description |
-|-----------|------|--------|-------------|
-| nag_phi | FLOAT | 4.0 | Force du NAG (negative-prompt guidance) Krea2 (0-20). 0 desactive NAG. Actif seulement si un conditioning negatif est merge dans `positive` via ASDX_ConditioningMerger |
-| nag_tau | FLOAT | 2.5 | Clamp de normalisation NAG (eq. 9 du papier) (0.01-20) |
-| nag_alpha | FLOAT | 0.25 | Facteur de blend NAG entre attention guidee et non guidee (0-1). 0 desactive NAG |
-| nag_sigma_start | FLOAT | 1.0 | NAG actif tant que sigma_t <= cette valeur (0-1, sigmas Krea2 normalises 1->0) |
-| nag_sigma_end | FLOAT | 0.0 | NAG actif tant que sigma_t >= cette valeur (0-1) |
-
 ---
 
 ## Capability Profiles
