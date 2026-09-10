@@ -1337,6 +1337,33 @@ class _SamplerCore:
                 img_h, img_w, neg_txt_len, src_grids, src_offsets
             )
 
+        # Same source-fidelity bias as `ref_boost` above, sized to the
+        # negative text length -- the reference's `_nag_edit_block` builds
+        # this for both passes (krea2_nag.py:303-326), it never omits it
+        # on the negative side.
+        neg_ref_boost = None
+        if ref_boost is not None and negative is not None:
+            neg_ref_boost = self._krea2_ref_attn_bias(
+                neg_txt_len, src_h, src_w, img_h, img_w, self.ref_boost
+            )
+
+        # NAG activation is a silent behavior change for existing
+        # ConditioningMerger users (negative conditioning used to be a no-op
+        # for Krea2) -- log once per run, not per step (`_nag_is_active` is
+        # called every step and is the wrong place for this).
+        if negative is not None:
+            if self.nag_phi == 0.0 or self.nag_alpha == 0.0:
+                print(
+                    "[ASDX] NAG: negative conditioning present but nag_phi/nag_alpha "
+                    "is 0.0, falling back to predict() (no negative guidance)"
+                )
+            else:
+                print(
+                    f"[ASDX] NAG active: model=krea2, phi={self.nag_phi}, tau={self.nag_tau}, "
+                    f"alpha={self.nag_alpha}, sigma window=[{self.nag_sigma_end}, "
+                    f"{self.nag_sigma_start}]"
+                )
+
         def _predict(img_at, sigma_at):
             if neg_context is not None and self._nag_is_active(float(sigma_at)):
                 return self.transformer.predict_nag(
@@ -1344,6 +1371,7 @@ class _SamplerCore:
                     timestep=mx.array([float(sigma_at)], dtype=mx.float32),
                     img_h=img_h, img_w=img_w,
                     freqs=rope_freqs, neg_freqs=neg_freqs, ref_boost=ref_boost,
+                    neg_ref_boost=neg_ref_boost,
                     src=src_tokens, src_h=src_h, src_w=src_w,
                     phi=self.nag_phi, tau=self.nag_tau, alpha=self.nag_alpha,
                 )

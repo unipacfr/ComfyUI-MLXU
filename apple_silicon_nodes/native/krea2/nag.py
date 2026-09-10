@@ -178,15 +178,17 @@ def _nag_edit_block(
     positive_freqs: mx.array | None,
     negative_freqs: mx.array | None,
     ref_boost: mx.array | None,
+    negative_ref_boost: mx.array | None,
     phi: float,
     tau: float,
     alpha: float,
 ) -> tuple[mx.array, mx.array, mx.array]:
     """Krea2Edit block: preserve source attention, guide target tokens only.
 
-    Port of krea2-nag/krea2_nag.py::_nag_edit_block. ``ref_boost`` (the
-    source-fidelity attention bias) is applied ONLY to the positive pass
-    -- it must never bias the negative/text-only pass.
+    Port of krea2-nag/krea2_nag.py::_nag_edit_block. ``ref_boost``/
+    ``negative_ref_boost`` (the source-fidelity attention bias) are applied
+    to their respective passes -- same bias math, each sized to its own
+    text length (positive_len vs negative_len).
     """
     prescale, preshift, pregate, postscale, postshift, postgate = block.mod(vec)
     positive_len = positive_text.shape[1]
@@ -200,7 +202,7 @@ def _nag_edit_block(
         block.attn, positive_pre, positive_freqs, ref_boost
     )
     negative_raw, negative_gate = _raw_attention(
-        block.attn, negative_pre, negative_freqs, None
+        block.attn, negative_pre, negative_freqs, negative_ref_boost
     )
 
     positive_raw = guide_attention_tail(

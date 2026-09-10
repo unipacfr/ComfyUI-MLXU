@@ -922,6 +922,7 @@ class SingleStreamDiT(nn.Module):
         freqs: mx.array,
         neg_freqs: mx.array,
         ref_boost: mx.array | None = None,
+        neg_ref_boost: mx.array | None = None,
         src: mx.array | None = None,
         src_h: int | None = None,
         src_w: int | None = None,
@@ -964,7 +965,8 @@ class SingleStreamDiT(nn.Module):
                     block, positive_text, negative_text, image,
                     target_offset=src_len, vec=tvec,
                     positive_freqs=freqs, negative_freqs=neg_freqs,
-                    ref_boost=ref_boost, phi=phi, tau=tau, alpha=alpha,
+                    ref_boost=ref_boost, negative_ref_boost=neg_ref_boost,
+                    phi=phi, tau=tau, alpha=alpha,
                 )
             img_out = image[:, src_len:]
         else:

@@ -28,7 +28,7 @@ def test_nag_edit_block_null_case_matches_plain_block_forward():
 
     _, _, image_out = nag._nag_edit_block(
         block, text, text, image, target_offset=4, vec=vec,
-        positive_freqs=None, negative_freqs=None, ref_boost=None,
+        positive_freqs=None, negative_freqs=None, ref_boost=None, negative_ref_boost=None,
         phi=4.0, tau=2.5, alpha=0.25,
     )
 
@@ -50,7 +50,7 @@ def test_nag_edit_block_preserves_source_tokens_exactly():
 
     _, _, image_out = nag._nag_edit_block(
         block, pos_text, neg_text, image, target_offset=4, vec=vec,
-        positive_freqs=None, negative_freqs=None, ref_boost=None,
+        positive_freqs=None, negative_freqs=None, ref_boost=None, negative_ref_boost=None,
         phi=4.0, tau=2.5, alpha=0.25,
     )
     plain_combined = block(mx.concatenate([pos_text, image], axis=1), vec, None)
