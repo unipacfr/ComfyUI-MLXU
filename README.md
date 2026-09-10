@@ -106,6 +106,18 @@ oversized source also crowds the sequence, weakening prompt adherence.
 `ref_boost` dials target->source attention (1.0 = off; the reference workflow
 ships 4.0 for strong likeness).
 
+Krea2 negative prompts (NAG): merge a negative `🍏 ASDX CLIP Text Encode` into
+`positive` via `🍏 ASDX Conditioning Merger`, then tune `nag_phi`/`nag_tau`/
+`nag_alpha`/`nag_sigma_start`/`nag_sigma_end` on the sampler. This is
+Normalized Attention Guidance (arxiv.org/abs/2505.21179), not classifier-free
+guidance -- both a positive and negative pass share one image query and are
+combined inside attention, so it costs roughly 2x step time rather than a
+second full sampler pass. Works for both Krea2 text-to-image and Identity
+Edit; for Identity Edit, `ref_boost` applies to both passes (same
+source-fidelity bias, each sized to its own pass's text length) and NAG never
+touches source-reference tokens. `nag_phi`/`nag_alpha` at `0` disables NAG
+even with a negative conditioning merged in.
+
 ### Latent / VAE
 | Node | Description |
 |------|-------------|

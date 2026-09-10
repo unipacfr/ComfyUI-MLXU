@@ -174,3 +174,44 @@ fallback exists -- the fallback's limitations are the bug you will hit. And a
 "fix" that changes the SPACE of an operation (pixels -> latents) without
 checking which space the reference and the training used is a regression, not a
 fix.
+
+## Krea2 NAG's negative pass silently dropped the ref_boost mask -- caught only by a whole-branch review, not any of 10 per-task reviews
+
+2026-09-10. Porting NAG (Normalized Attention Guidance) for Krea2/Krea2 Identity
+Edit, `_nag_edit_block` (`native/krea2/nag.py`) passed `ref_boost` to the
+positive pass's raw attention but `None` to the negative pass. The design spec
+asserted this "mirrors the reference: source attention bias must not leak into
+the negative/text-only pass" -- that claim was wrong. The real reference
+(`krea2_nag.py:303-326`) builds a SECOND mask, `negative_mask`, from the same
+`_ref_attn_bias` call sized to the negative text length, and passes it into the
+negative pass too (`krea2_nag.py:146-152`). Both passes get the source-fidelity
+bias; only the text length differs between them.
+
+Every one of the 10 task-level reviews approved the code that shipped this bug,
+because each review saw only its own task's diff: the task that wrote
+`_nag_edit_block` (Task 5) tested it with `ref_boost=None`; the task that wired
+`predict_nag` into the sampler (Task 7) never touched `ref_boost` math at all;
+no single task's brief asked "does Identity Edit + NAG + ref_boost != 1.0 ever
+get exercised end to end." Only the FINAL whole-branch review -- reading the
+whole diff against the real reference file, not just each task's own brief --
+caught it, and confirmed it numerically: with `ref_boost=4.0` and a null-case
+negative (`neg_context == context`, which must reproduce `predict()` bit-for-bit
+like every other null case in this feature), the bug produced a 0.0174-0.0253
+max abs diff instead of 0.0 (three independent reproductions, unseeded random
+inits, all agreeing it should be exactly 0.0 and wasn't).
+
+Fixed by threading a `neg_ref_boost` mask (built the same way as the positive
+one, via the same `_krea2_ref_attn_bias` helper called again with the negative
+text's length) through `sampler/core.py` -> `SingleStreamDiT.predict_nag` ->
+`_nag_edit_block`'s negative `_raw_attention` call. A regression test was added
+that fails on the old code and passes on the fix.
+
+**Transferable lesson.** A design spec's own stated rationale for a divergence
+from the reference ("this mirrors the reference") is a claim, not a fact --
+verify it by reading the actual reference file line by line, the way this
+project's own canon record (`ComfyUI and the SceneWorks stack are the reference
+implementations`) already says to. And a chain of correct per-task reviews does
+not add up to a correct whole: a bug that requires seeing two tasks' code
+together (what Task 5 built, and what no task's tests ever combined it with)
+needs a review pass that reads the whole diff, not just each task's own slice
+of it.
