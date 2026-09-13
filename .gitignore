@@ -23,3 +23,12 @@ disabled_nodes/
 
 # Build artifact from local `uv`/pip builds
 *.egg-info/
+
+# speckit / spec-driven-development tooling -- per-machine, not part of ASDX
+.claude/rules/
+.claude/skills/speckit-*/
+.specify/
+
+# graphify / mempalace working data -- regenerated locally, not published
+entities.json
+mempalace.yaml
