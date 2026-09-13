@@ -25,6 +25,7 @@ import comfy.utils
 from comfy_api.latest import io
 
 from . import bridge
+from . import metadata_extractors
 
 
 # ── Globals ───────────────────────────────────────────────────────────
@@ -310,6 +311,7 @@ class ASDX_CLIPTextEncode(io.ComfyNode):
         grounding_px: int = 768,
         system_prompt: str = "",
     ) -> io.NodeOutput:
+        metadata_extractors.ensure_registered()
         if not isinstance(mlx_clip, comfy.sd.CLIP):
             raise RuntimeError("ASDX: mlx_clip must be a Comfy CLIP object.")
 
