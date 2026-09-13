@@ -82,6 +82,12 @@ class ASDX_MLXSampler(io.ComfyNode):
                 io.Float.Input("noise_aug", default=0.0, min=0.0, max=1.0, step=0.01, optional=True),
                 # Krea2 Identity Edit
                 io.Latent.Input("source_latent", optional=True),
+                # Pixel-space Identity Edit path (preferred over source_latent
+                # -- see core.py::_prepare_krea2_identity_edit): only used
+                # when a Krea2 Identity Edit LoRA is actually loaded, so it
+                # must stay optional and not force a link on every graph.
+                io.Image.Input("source_image", optional=True),
+                io.Vae.Input("vae", optional=True),
                 io.Float.Input(
                     "ref_boost", default=1.0, min=0.0, max=1000.0, step=0.01, optional=True,
                     tooltip="reference-fidelity dial: multiplies target->source attention. "
