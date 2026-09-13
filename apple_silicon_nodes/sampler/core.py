@@ -705,63 +705,20 @@ class _SamplerCore:
             return SamplerMode.IMAGE_TO_IMAGE
         return SamplerMode.TEXT_TO_IMAGE
 
-    def _encode_image_to_latent(self, image: torch.Tensor) -> mx.array:
-        """VAE-encode an image to FLUX latent packed format.
-
-        Returns MLX packed latent [B, NH*NW, 64].
-        """
-        import comfy.latent_formats
-
-        # Transpose [B, H, W, C] -> [B, C, H, W]
-        img = image.permute(0, 3, 1, 2) if image.ndim == 4 else image
-        # Normalize [0, 1] -> [-1, 1] for VAE
-        img = (img - 0.5) / 0.5
-
-        # Use MLX VAE encoder
-        from .mlx_vae import MLXVAE
-
-        vae = MLXVAE()
-        latent_mlx = vae.encode(img)
-
-        # Convert to numpy and pack
-        latent_np = (
-            latent_mlx.detach().cpu().numpy()
-            if hasattr(latent_mlx, "detach")
-            else np.array(latent_mlx, dtype=np.float32)
-        )
-
-        # Pack: [B, C, H, W] -> [B, H/2, W/2, C*4] -> flatten spatial
-        batch, channels, latent_h, latent_w = latent_np.shape
-        packed = latent_np.reshape(
-            batch, channels, latent_h // 2, 2, latent_w // 2, 2
-        )
-        packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
-        packed = packed.reshape(
-            batch, (latent_h // 2) * (latent_w // 2), channels * 4
-        )
-
-        precision = self.config.mlx_dtype
-        packed_mlx = mx.array(packed).astype(precision)
-        mx.eval(packed_mlx)
-        return packed_mlx
-
     def _prepare_img2img_noise(self) -> mx.array:
         """Blend the real encoded `latent_image` with noise at the requested strength.
 
         Previously this re-derived latent content from raw `image` pixels via
-        `_encode_image_to_latent()`, which routes through `MLXVAE()` -- an
-        untrained placeholder with no real weights (same class of bug fixed in
-        `vae.py`'s `ASDX_VAEEncode`) that silently produced garbage, and also
-        skipped the model-space scale/shift (`process_in`) that the noise/
-        Kontext-reference/ControlNet paths all apply. `latent_image` is a
-        required node input and is always a real VAE-encoded latent (e.g. via
-        the now-fixed `ASDX_VAEEncode`), and `_detect_mode()` only calls this
-        method when img2img was actually requested (image connected or
+        an MLX VAE placeholder with no real weights (same class of bug fixed
+        in `vae.py`'s `ASDX_VAEEncode`, and in `_prepare_inpainting_noise`),
+        and also skipped the model-space scale/shift (`process_in`) that the
+        noise/Kontext-reference/ControlNet paths all apply. `latent_image` is
+        a required node input and is always a real VAE-encoded latent (e.g.
+        via the now-fixed `ASDX_VAEEncode`), and `_detect_mode()` only calls
+        this method when img2img was actually requested (image connected or
         mode="img2img" set) -- so using it here, the same way
         `_prepare_kontext_reference` already does, is correct and free of the
-        placeholder-VAE dependency. `image`/`_encode_image_to_latent` remain
-        for `_prepare_inpainting_noise`, which still has the same placeholder
-        issue (not fixed here -- see ROADMAP.md).
+        placeholder-VAE dependency.
 
         Returns MLX packed noise for the denoising loop.
         """
@@ -801,16 +758,48 @@ class _SamplerCore:
         return mx.array(blended).astype(precision)
 
     def _prepare_inpainting_noise(self) -> mx.array:
-        """Prepare inpainting noise: encode image, apply mask, add noise.
+        """Prepare inpainting noise: blend the real encoded `latent_image`,
+        mask, and noise.
 
-        The masked region retains the original image (no noise), while
-        the unmasked region receives noise. This allows in-painting.
+        Previously this re-derived latent content from raw `image` pixels
+        via `_encode_image_to_latent()`, which routed through `MLXVAE()` --
+        an untrained placeholder with no real weights that silently produced
+        garbage (same bug already fixed for img2img in
+        `_prepare_img2img_noise`, see its docstring). `latent_image` is a
+        required node input and is always a real VAE-encoded latent;
+        `_detect_mode()` only calls this method when inpainting was actually
+        requested (image + mask connected, or mode="inpaint" set), so `image`
+        still gates the call but its pixels are no longer used.
+
+        The masked region retains the original latent content (no noise),
+        while the unmasked region receives noise. This allows in-painting.
         """
-        if self.image is None:
+        if self.image is None or self.latent_image is None:
             return self.noise
 
-        # Encode input image to latent
-        input_latent = self._encode_image_to_latent(self.image)
+        import comfy.latent_formats
+
+        samples = self.latent_image.get("samples", self.latent_image)
+        latent_np = (
+            samples.detach().cpu().float().numpy().astype(np.float32, copy=False)
+            if hasattr(samples, "detach")
+            else np.asarray(samples, dtype=np.float32)
+        )
+
+        # Model-space scale/shift, matching how the noise/Kontext-reference/
+        # ControlNet/img2img paths all enter the transformer.
+        model_space = comfy.latent_formats.Flux().process_in(torch.from_numpy(latent_np))
+        latent_np = model_space.numpy().astype(np.float32, copy=False)
+
+        # Pack: [B, C, H, W] -> [B, H/2, W/2, C*4] -> flatten spatial
+        batch, channels, latent_h, latent_w = latent_np.shape
+        packed = latent_np.reshape(
+            batch, channels, latent_h // 2, 2, latent_w // 2, 2
+        )
+        packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
+        input_latent = packed.reshape(
+            batch, (latent_h // 2) * (latent_w // 2), channels * 4
+        )
 
         # Prepare mask in packed latent space
         mask_latent = self._prepare_mask_latent()
