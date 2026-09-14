@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .dequant import dequantize_tensor
 from .reader import (
     GGML_QUANT_SIZES,
     GGMLQuantizationType,
@@ -18,4 +19,5 @@ __all__ = [
     "GGUFTensorInfo",
     "GGUFValueType",
     "read_gguf_header",
+    "dequantize_tensor",
 ]
