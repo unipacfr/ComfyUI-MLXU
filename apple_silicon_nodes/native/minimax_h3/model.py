@@ -167,3 +167,36 @@ def mod_gate(x: mx.array, gate: mx.array, other: mx.array, segments: list[tuple[
     for a, b, row in segments:
         pieces.append(x[a:b] + other[a:b] * gate[row])
     return mx.concatenate(pieces, axis=0)
+
+
+class RefinerBlock(nn.Module):
+    """Plain (unmodulated) residual attention + MLP block: pre-norm attention
+    (no rope -- `Attention` called with `cos=sin=None`, see its docstring),
+    pre-norm SwiGLU MLP. Used only by `TokenRefiner`, to refine text
+    embeddings before they enter the packed multi-modal sequence."""
+
+    def __init__(self, hidden: int, heads: int, head_dim: int, ffn: int, eps: float, qk_eps: float):
+        super().__init__()
+        self.norm1 = RMSNorm(hidden, eps=eps)
+        self.norm2 = RMSNorm(hidden, eps=eps)
+        self.attn = Attention(hidden, heads, head_dim, qk_eps)
+        self.mlp = MLP(hidden, ffn)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = x + self.attn(self.norm1(x))
+        return x + self.mlp(self.norm2(x))
+
+
+class TokenRefiner(nn.Module):
+    """Stack of `RefinerBlock`s + a final RMSNorm -- 2 layers on the real
+    checkpoint (`config.token_refiner_num_layers`)."""
+
+    def __init__(self, num_layers: int, hidden: int, heads: int, head_dim: int, ffn: int, eps: float, qk_eps: float, final_eps: float):
+        super().__init__()
+        self.blocks = [RefinerBlock(hidden, heads, head_dim, ffn, eps, qk_eps) for _ in range(num_layers)]
+        self.final_norm = RMSNorm(hidden, eps=final_eps)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        for block in self.blocks:
+            x = block(x)
+        return self.final_norm(x)
