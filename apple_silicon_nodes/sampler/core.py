@@ -332,7 +332,7 @@ class _SamplerCore:
             # --- Compute transformer output ---
             if teacache_state is not None:
                 current_output = self.transformer.predict(
-                    img=self.noise,
+                    img=self._img_tokens(self.noise),
                     txt=prompt_embeds,
                     timestep=sigma_t,
                     guidance=effective_guidance,
@@ -353,7 +353,7 @@ class _SamplerCore:
                     noise_pred = current_output
             else:
                 current_output = self.transformer.predict(
-                    img=self.noise,
+                    img=self._img_tokens(self.noise),
                     txt=prompt_embeds,
                     timestep=sigma_t,
                     guidance=effective_guidance,
@@ -391,7 +391,7 @@ class _SamplerCore:
                 # dpmpp_2s_ancestral). Reuses this step's ControlNet residuals
                 # rather than recomputing them at the intermediate point.
                 out = self.transformer.predict(
-                    img=x_at, txt=prompt_embeds, timestep=sigma_at,
+                    img=self._img_tokens(x_at), txt=prompt_embeds, timestep=sigma_at,
                     guidance=effective_guidance, pooled=pooled_embeds, rope=rope,
                     control=control, ref_img=kontext_ref_packed,
                 )
@@ -873,16 +873,51 @@ class _SamplerCore:
         return packed
 
     def _prepare_depth_noise(self) -> mx.array:
-        """Prepare depth-controlled noise.
+        """VAE-encode and pack the depth map into a channel-concat partner.
 
-        For depth control, the initial noise is the same as text2img,
-        but depth conditioning is injected during the transformer forward
-        pass (handled by the transformer's depth conditioning path).
-        Returns the original noise.
+        Matches comfy/model_base.py::Flux.concat_cond: the depth latent is
+        concatenated onto the noise along the channel axis, before img_in,
+        once per generation -- it does NOT modify the noise itself (unlike
+        ControlNet, there is no per-step signal to recompute; only the
+        transformer's own (depth-trained) weights make the result
+        depth-aware). Sets `self._depth_concat`, consumed by `_img_tokens()`
+        on every `predict()` call this run.
         """
-        # Depth conditioning will be handled in the transformer loop
-        # via the depth_image passed through the model dict
+        self._depth_concat = None
+        if self.depth_image is None or self.vae is None:
+            return self.noise
+        try:
+            samples = self.vae.encode(self.depth_image)
+            depth_np = (
+                samples.detach().cpu().float().numpy().astype(np.float32, copy=False)
+                if hasattr(samples, "detach")
+                else np.asarray(samples, dtype=np.float32)
+            )
+            depth_np = (depth_np - FLUX_LATENT_SHIFT) * FLUX_LATENT_SCALE
+
+            batch, channels, depth_h, depth_w = depth_np.shape
+            packed = depth_np.reshape(batch, channels, depth_h // 2, 2, depth_w // 2, 2)
+            packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
+            packed = packed.reshape(batch, (depth_h // 2) * (depth_w // 2), channels * 4)
+            packed = packed * self.depth_strength
+
+            depth_mlx = mx.array(packed).astype(self.config.mlx_dtype)
+            mx.eval(depth_mlx)
+            self._depth_concat = depth_mlx
+        except Exception as e:
+            print(f"[ASDX] Depth latent prep failed: {e}")
+            self._depth_concat = None
         return self.noise
+
+    def _img_tokens(self, x: mx.array) -> mx.array:
+        """Concat the depth-latent partner (if any) onto image tokens for a
+        `predict()` call -- the wider `img_in` input expects it on every
+        forward pass, even though the concat channels themselves are frozen
+        for the whole run (see `_prepare_depth_noise`).
+        """
+        if getattr(self, "_depth_concat", None) is not None:
+            return mx.concatenate([x, self._depth_concat], axis=-1)
+        return x
 
     def _prepare_controlnet_latent(self, precision: mx.Dtype) -> mx.array | None:
         """VAE-encode and pack the ControlNet control image into FLUX tokens.
