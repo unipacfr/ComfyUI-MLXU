@@ -200,6 +200,25 @@ class ASDX_MLXSampler(io.ComfyNode):
             kontext_reference_latent = kontext_cfg["reference_latent"]
             kontext_reference_strength = kontext_cfg["strength"]
 
+        # ASDX_LatentNoisePrep (Phase E) validates and mode-tags the raw
+        # img2img/inpaint/fill ingredients. Read it in priority over the
+        # sampler's own mode/image/mask/image_strength/mask_blur/mask_padding
+        # inputs, which stay as a documented fallback so saved workflows keep
+        # working. The actual noise blend still happens in _SamplerCore (it
+        # needs the seeded noise tensor built below, not available here).
+        latent_prep = model.get("latent_prep")
+        if latent_prep is not None:
+            if image is not None or mask is not None:
+                print("[ASDX] Latent prep: both ASDX_LatentNoisePrep and the "
+                      "sampler's own mode/image/mask inputs are wired -- "
+                      "ASDX_LatentNoisePrep wins.")
+            mode = latent_prep["mode"]
+            image = latent_prep["image"]
+            mask = latent_prep["mask"]
+            image_strength = latent_prep["image_strength"]
+            mask_blur = latent_prep["mask_blur"]
+            mask_padding = latent_prep["mask_padding"]
+
         # Diagnostic: snapshot memory at the very start of every generation
         # (this node always re-executes, unlike loader/LoRA nodes which may
         # be cache-hit) -- lets us see whether the floor left over from the
