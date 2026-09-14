@@ -49,6 +49,7 @@ _DISPLAY = {
     "ASDX_CacheManager": "🍏 ASDX Cache Manager",
     # Conditioning
     "ASDX_ConditioningMerger": "🍏 ASDX Conditioning Merger",
+    "ASDX_Krea2Edit": "🍏 ASDX Krea2 Identity Edit",
     # LoRA
     "ASDX_LoraLoader": "🍏 ASDX LoRA Loader",
     "ASDX_MultiLoraLoader": "🍏 ASDX Multi LoRA Loader",
@@ -74,6 +75,7 @@ try:
     from .latent import NODE_LIST as _latent_nodes
     from .memory import NODE_LIST as _mem_nodes
     from .lora import NODE_LIST as _lora_nodes
+    from .krea2_edit import NODE_LIST as _krea2_edit_nodes
 
     # Optional: image chain, depth map, live preview
     try:
@@ -99,6 +101,7 @@ try:
         *_latent_nodes,
         *_mem_nodes,
         *_lora_nodes,
+        *_krea2_edit_nodes,
         *_chain_nodes,
         *_depth_nodes,
         *_preview_nodes,

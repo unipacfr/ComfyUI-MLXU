@@ -1223,6 +1223,17 @@ def _apply_lora_residual_to_krea2(transformer: Any, lora: "LoRAAdapter") -> Any:
         return transformer
 
     new_transformer = copy.copy(transformer)
+    # Record which LoRA file(s) this transformer carries, so a downstream node
+    # (ASDX_Krea2Edit) can detect an already-attached Identity Edit LoRA and
+    # refuse to stack a second copy instead of silently doubling it. The base
+    # transformer in the loader cache is never LoRA-applied (non-destructive
+    # apply), so this attribute only ever appears on per-generation copies and
+    # is always fresh; `copy.copy` shares the input's list by reference, so
+    # rebind to a new list to leave the input (and the cached base) untouched.
+    prev_names = list(getattr(transformer, "_applied_lora_names", []))
+    if lora.name not in prev_names:
+        prev_names.append(lora.name)
+    new_transformer._applied_lora_names = prev_names
     if touched_blocks:
         new_transformer.blocks = new_blocks
     if touched_txtfusion:
