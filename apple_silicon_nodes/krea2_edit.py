@@ -259,7 +259,15 @@ class ASDX_Krea2Edit(io.ComfyNode):
             ch, cw = min(ih, int(round(px_h / s))), min(iw, int(round(px_w / s)))
             y0, x0 = (ih - ch) // 2, (iw - cw) // 2
             img4 = img4[..., y0:y0 + ch, x0:x0 + cw]
-            nh, nw = px_h, px_w
+            # `px_h`/`px_w` are only guaranteed divisible by 8 (the target
+            # latent's own grid, e.g. from a Resolution node's
+            # divisible_by=8) -- not by 16. The 2x2 patchify pack below needs
+            # an EVEN latent grid, i.e. a /16 pixel grid; snap down like the
+            # AR-mismatch branch does, or an odd target latent dimension
+            # (e.g. width 153) crashes the reshape below. `src_offset`
+            # (computed further down) already centers a smaller-than-target
+            # grid, so this is safe.
+            nh, nw = max(16, px_h // 16 * 16), max(16, px_w // 16 * 16)
         else:
             # Genuine AR mismatch: snap to /16 (NOT /8) to stay byte-identical
             # to the trainer's _fit_prep, capped at the target's /16 floor.

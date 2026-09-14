@@ -1106,7 +1106,7 @@ class _SamplerCore:
         src_np = (
             src.detach().cpu().float().numpy().astype(np.float32, copy=False)
             if hasattr(src, "detach")
-            else np.asarray(src, dtype=np.float32)
+            else np.array(src.astype(mx.float32), dtype=np.float32)
         )
         self._fit_whiten_pack_latent(src_np)
 
