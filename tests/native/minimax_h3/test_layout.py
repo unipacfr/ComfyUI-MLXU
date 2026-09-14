@@ -14,27 +14,12 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
-import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from support.comfyui_reference_loader import load_real_comfy_minimax_model as _load_reference_minimax_model
 from support.minimax_h3_module_loader import load_native_module
 
 layout_mod = load_native_module("minimax_h3.layout")
-
-_COMFYUI_ROOT = Path("/Volumes/X10Pro/ComfyUI/MBP2026/ComfyUI")
-_COMFYUI_VENV_SITE_PACKAGES = _COMFYUI_ROOT / ".venv" / "lib" / "python3.13" / "site-packages"
-
-
-def _load_reference_minimax_model():
-    if not _COMFYUI_ROOT.exists() or not _COMFYUI_VENV_SITE_PACKAGES.exists():
-        pytest.skip("ComfyUI install (with MiniMax H3 source + venv) not present on this machine")
-    sys.path.insert(0, str(_COMFYUI_ROOT))
-    sys.path.insert(0, str(_COMFYUI_VENV_SITE_PACKAGES))
-    try:
-        import comfy.ldm.minimax.model as mm
-    except ImportError as e:
-        pytest.skip(f"comfy.ldm.minimax.model not importable: {e}")
-    return mm
 
 
 def test_frame_grid_matches_reference():
