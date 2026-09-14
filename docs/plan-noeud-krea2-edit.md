@@ -1,7 +1,10 @@
 # Plan : nœud dédié `ASDX_Krea2Edit` (Krea2 Identity Edit)
 
 **Date de création :** 2026-08-14
-**Statut :** Planifié, non implémenté
+**Statut :** ✅ Réalisé (2026-09-14) — voir `apple_silicon_nodes/krea2_edit.py` et
+`docs/superpowers/plans/2026-09-13-node-extraction-and-depth-control.md` Phase A.
+Confirmé sans artefact visage par l'utilisateur. Ce document reste comme spec de
+référence pour le nœud tel qu'implémenté.
 **Objectif :** sortir l'Identity Edit du sampler et en faire un nœud composable, qui
 porte aussi le chargement du LoRA Krea2 Identity Edit et débloque le fit en espace
 pixel.

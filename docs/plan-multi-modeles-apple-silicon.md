@@ -1,8 +1,43 @@
 # Plan : Multi-modeles Apple Silicon
 
 **Date de creation :** 2026-08-02
-**Status :** Planification — reference architecturale
+**Dernier elagage :** 2026-09-14 (verifie contre le code, pas contre les cases a cocher)
+**Status :** Partiellement realise — ce document ne conserve que le travail restant.
 **Objectif :** Transformer le projet en plateforme multi-modeles optimisee Apple Silicon, au-dela de FLUX.1.
+
+---
+
+## 0. Etat des lieux (2026-09-14)
+
+Verifie en lisant le code, pas les checklists (qui n'ont jamais ete tenues a jour).
+
+| Phase | Etat | Preuve |
+|-------|------|--------|
+| **0 — Fondations** | ✅ Fait, mais **pas sous la forme prevue** (voir §4) | `loader.py::_detect_model_type` / `_load_transformer_weights`, `capability.py::CapabilityProfile`, `sampler/scheduling.py` + `sampler/solvers.py` |
+| **1 — SDXL** | ✅ Fait (txt2img) — commit `7046a5e` | `native/sdxl/` (config/model/weight_map), `sampler/core.py::_run_sdxl` |
+| **2 — FLUX.2 Klein** | ✅ Fait — commit `7046a5e` | `native/flux2/`, `sampler/core.py::_run_flux2` |
+| **3 — Wan 2.1** | ❌ Rien | pas de `native/wan/`, aucun `wan_video`/`umt5` dans le code (les occurrences `Wan21` concernent le *format de latent* du VAE Krea2, pas le modele video) |
+| **4 — Hunyuan** | ❌ Rien | pas de `native/hunyuan/`, aucun `hunyuan_dit`/`bert_encoder` (les mentions dans `conditioning.py` sont la liste des `CLIPType` de ComfyUI, pas une implementation) |
+| **5 — Krea2** | ✅ Fait — commit `7046a5e` | `native/krea2/` (model, rope, text_encoder, nag), `sampler/core.py::_run_krea2` |
+| **5 — PixArt / Ideogram / SVD** | ❌ Rien | aucun fichier correspondant |
+| **6 — MiniMax H3** | ❌ Rien | pas de `native/minimax_h3/` ; l'installation locale a des packs tiers (`ComfyUI-MiniMax-H3-Turbo`, `ComfyUI-Spectrum-MiniMax-H3`, `ComfyUI-MiniMaxH3-Cache`, `ComfyUI-MiniMaxH3-FirstBlockCache`) qui tournent en PyTorch/comfy standard, aucun port MLX |
+| **Bonus hors plan** | ✅ **Z-Image** (base + turbo), absent du plan d'origine | `native/zimage/`, `sampler/core.py::_run_zimage`, profils `zimage_base`/`zimage_turbo` dans `capability.py` |
+
+### Limites connues des familles deja livrees
+
+- **SDXL : txt2img uniquement.** `sampler/core.py::_run_sdxl` le documente explicitement :
+  img2img / inpainting / depth / ControlNet ne sont pas cables (le dispatch de `run()`
+  route vers `_run_sdxl` *avant* `_detect_mode()`, qui est specifique FLUX).
+- **ControlNet : indisponible hors FLUX.1.** Le package ControlNet est deplace dans
+  `disabled_nodes/controlnet/`, et `capability.py` declare `supports_controlnet=False`
+  pour `sdxl_base`, `zimage_base`, `zimage_turbo`.
+- **LoRA SDXL : fonctionnel.** Detection de famille par cles (`lora.py:100`,
+  signature `input_blocks.`) + `native/sdxl/weight_map.py::native_key_to_checkpoint_stem`
+  (`lora.py:2299`). SDXL passe par la boucle de merge, pas par le chemin residuel FLUX.
+- **Text encoders et VAE restent ceux de ComfyUI.** Aucun encodeur MLX natif generique
+  n'a ete ecrit : SDXL consomme le `comfy.sd.CLIP` dual (`bridge.py::conditioning_sdxl_to_mlx`)
+  et `vae.py` instancie `comfy.sd.VAE`. Seul Krea2 a un encodeur natif
+  (`native/krea2/text_encoder.py`).
 
 ---
 
@@ -18,317 +53,210 @@ Passer de **FLUX.1-only** a **tous les modeles de diffusion** sur infrastructure
 4. **Retrocompatibilite** — workflows existants continuent de fonctionner
 5. **Extensibilite** — ajouter un modele = ajouter un module, pas modifier le noyau
 
+> Note 2026-09-14 : les principes 2 a 5 sont tenus. Le principe 1 (interfaces
+> abstraites communes) n'a **pas** ete retenu a l'implementation — voir §4.
+
 ---
 
 ## 2. Modeles cibles
 
-| Famille | Modeles | VAE | Latent | Encoder | Scheduler | Priorite |
-|---------|---------|-----|--------|---------|-----------|----------|
-| **FLUX.1** | dev, schnell, fill, depth | 16 can. | 16 | T5-XXL + CLIP-L | Euler | ✅ Deja supporte |
-| **FLUX.2** | Klein | 16 can. | 16 | T5-XXL + CLIP-L | A definir | ⭐ Haute |
-| **SD1.5** | v1.5, v1.4, v2.1 | 4 can. | 4 | CLIP-L | DDIM, Euler, DPM++ | ⭐ Haute |
-| **SDXL** | base, refiner | 4 can. | 4 | CLIP-L + OpenCLIP | DDIM, Euler, DPM++ | ⭐ Haute |
-| **Wan 2.1** | 480p, 720p, 14B | 4 can. | 4 | UMT5-XXL | Euler | Moyenne |
-| **Hunyuan** | DiT XL/2 | 4 can. | 4 | CLIP + BERT | DDIM | Moyenne |
-| **PixArt** | Sigma 2B | 4 can. | 4 | T5-XXL + CLIP-L | Euler | Basse |
-| **Krea2** | Base, Turbo | ? | ? | Krea2 CLIP | A definir | Basse |
-| **SVD** | SVD, SV3D | 4 can. | 4 | CLIP-L | Euler | Basse |
+| Famille | Modeles | VAE | Latent | Encoder | Scheduler | Etat |
+|---------|---------|-----|--------|---------|-----------|------|
+| **FLUX.1** | dev, schnell, fill, depth | 16 can. | 16 | T5-XXL + CLIP-L | Euler | ✅ Supporte (anterieur au plan) |
+| **FLUX.2** | Klein | 16 can. | 16 | T5-XXL + CLIP-L | Euler | ✅ Fait (`native/flux2/`) |
+| **Krea2** | Base, Turbo | Wan21 | 16 | Krea2 CLIP | Euler | ✅ Fait (`native/krea2/`) |
+| **SDXL** | base (+ Illustrious/Pony/NoobAI) | 4 can. | 4 | CLIP-L + OpenCLIP | Euler, DDIM, DPM++ | ✅ Fait, txt2img seul (`native/sdxl/`) |
+| **Z-Image** | base, turbo | 16 can. | 16 | — | Euler | ✅ Fait, hors plan initial (`native/zimage/`) |
+| **Wan 2.1** | 480p, 720p, 14B | 4 can. | 4 | UMT5-XXL | Euler | A faire — Phase 3 |
+| **Hunyuan** | DiT XL/2 | 4 can. | 4 | CLIP + BERT | DDIM | A faire — Phase 4 |
+| **PixArt** | Sigma 2B | 4 can. | 4 | T5-XXL + CLIP-L | Euler | A faire — Phase 5 |
+| **SVD** | SVD, SV3D | 4 can. | 4 | CLIP-L | Euler | A faire — Phase 5 |
+| **MiniMax H3** | H3 (+ Turbo) | ? | ? | ? | ? | A faire — Phase 6 (architecture a determiner, voir §5) |
 
 ---
 
-## 3. Architecture cible
+## 3. Architecture — reelle vs cible
+
+L'arborescence cible d'origine (`native/transformer/`, `native/vae/`, `native/text_encoder/`,
+`native/rope/`) **n'a pas ete construite**. Le decoupage retenu est **un sous-package par
+famille de modele**, chacun portant son propre `config.py` / `model.py` / `weight_map.py` :
 
 ```
-apple_silicon_nodes/
-├── __init__.py                    # Registration unifiee
-├── bridge.py                      # PyTorch ↔ MLX (existe, a etendre)
-├── capability.py                  # Profiles (existe, a etendre)
-│
-├── loader.py                      # Dispatcher unifie (a refondre)
-│
-├── conditioning.py                # CLIP conditioning (existe, a etendre)
-│
-├── sampler/
-│   ├── __init__.py                # Node MLX Sampler
-│   ├── core.py                    # Boucle denoising (a refondre)
-│   ├── cache.py                   # TeaCache, Kontext (existe)
-│   └── scheduler.py               # NOUVEAU — schedulers par modele
-│
-├── native/
-│   ├── __init__.py                # Export commun
-│   ├── config.py                  # FluxConfig (existe → TransformerConfig)
-│   ├── transformer/               # NOUVEAU — transformers par famille
-│   │   ├── base.py                # Interface DiffusionTransformer
-│   │   ├── flux.py                # FLUX.1 (deplace de native/__init__.py)
-│   │   ├── flux2.py               # FLUX.2-Klein
-│   │   ├── sd_unet.py             # SD1.5/SDXL UNet
-│   │   ├── hunyuan_dit.py         # Hunyuan DiT
-│   │   ├── wan_video.py           # Wan 2.1
-│   │   ├── pixart_sigma.py        # PixArt Sigma
-│   │   ├── krea2.py               # Krea2
-│   │   └── svd.py                 # Stable Video Diffusion
-│   ├── vae/                       # NOUVEAU — VAE par famille
-│   │   ├── base.py                # Interface DiffusionVAE
-│   │   ├── flux_vae.py            # FLUX VAE (deplace de mlx_vae.py)
-│   │   ├── sd_vae.py              # SD VAE 4 canaux
-│   │   ├── wan_vae.py             # Wan VAE
-│   │   └── hunyuan_vae.py         # Hunyuan VAE
-│   ├── text_encoder/              # NOUVEAU — encodeurs de texte
-│   │   ├── base.py                # Interface TextEncoder
-│   │   ├── t5_encoder.py          # T5-XXL MLX
-│   │   ├── clip_encoder.py        # CLIP-L/G MLX
-│   │   ├── umt5_encoder.py        # UMT5-XXL (Wan)
-│   │   ├── bert_encoder.py        # BERT-Large (Hunyuan)
-│   │   └── qwen_encoder.py        # Qwen (Qwen Image)
-│   └── rope/                      # NOUVEAU — embeddings positionnels
-│       ├── base.py                # Interface RoPE
-│       ├── flux_rope.py           # FLUX 2D spatial rope
-│       ├── sd_rope.py             # SD 1D sinusoidal
-│       └── wan_rope.py            # Wan 3D temporal rope
-│
-├── lora.py                        # LoRA (a etendre)
-├── controlnet/                    # ControlNet (a etendre)
-│   ├── __init__.py
-│   ├── types.py
-│   ├── blocks.py
-│   ├── model.py
-│   └── sd_controlnet.py           # NOUVEAU — ControlNet SD
-├── ip_adapter.py                  # IP-Adapter (assez generique)
-├── image_chain.py                 # Image chain (generique)
-├── depth_map.py                   # Depth map (generique)
-├── live_preview.py                # Live preview (a adapter)
-├── memory.py                      # Memory profiler (generique)
-├── latent.py                      # Empty latent (a etendre)
-└── vae.py                         # VAE nodes (a etendre)
+apple_silicon_nodes/native/
+├── config.py            # config FLUX.1 + helpers de latent (process_wan21_latent_*)
+├── weight_format.py     # classification des conventions de quantification
+├── weight_map.py        # mapping de cles FLUX.1
+├── flux2/               # FLUX.2-Klein
+├── krea2/               # Krea2 (+ rope.py, text_encoder.py, nag.py)
+├── sdxl/                # SDXL UNet
+└── zimage/              # Z-Image (NextDiT)
 ```
+
+Les VAE et les text encoders restent ceux de ComfyUI (`comfy.sd.VAE`, `comfy.sd.CLIP`),
+relayes via `bridge.py`. **Toute nouvelle famille (Wan, Hunyuan, PixArt, SVD) doit suivre
+ce patron `native/<famille>/`**, pas l'arborescence par couche du plan d'origine.
+
+Points d'extension a modifier pour chaque nouvelle famille :
+
+| Fichier | Ce qu'il faut y ajouter |
+|---------|-------------------------|
+| `native/<famille>/` | `config.py`, `model.py`, `weight_map.py` |
+| `native/__init__.py::_load_safetensors` | chargement + dequantification (point d'entree unique) |
+| `loader.py::_detect_model_type` + `_load_transformer_weights` | detection par nom puis par cles, puis construction |
+| `capability.py` | un `CapabilityProfile` + les alias de nom |
+| `sampler/core.py` | une boucle `_run_<famille>()` + le dispatch dans `run()` |
+| `sampler/scheduling.py` / `solvers.py` | sigma schedule et preconditionnement si le modele n'est pas flow-matching |
+| `latent.py::_LATENT_FORMATS` | `(channels, downscale)` de la famille |
+| `lora.py` | signature de cles de la famille + `native_key_to_checkpoint_stem` |
 
 ---
 
-## 4. Interfaces cibles
+## 4. Interfaces generiques — abandonnees
 
-### 4.1 DiffusionTransformer (interface generique)
+**✅ Tranche : non retenu.** Les ABC prevues a l'origine (`DiffusionTransformer`,
+`DiffusionVAE`, `TextEncoder`, `DiffusionScheduler`) n'existent pas — un
+`grep abstractmethod apple_silicon_nodes/` ne retourne rien, et `TransformerConfig`
+non plus (`native/config.py` n'a jamais ete renomme).
 
-```python
-# apple_silicon_nodes/native/transformer/base.py
+Ce qui a ete construit a la place, et qui fait office de contrat :
 
-@dataclass(frozen=True)
-class TransformerConfig:
-    """Configuration generique pour tous les transformers."""
-    family: str                      # "flux1", "sd1", "sdxl", "hunyuan", "wan"
-    name: str                        # "FLUX.1-dev", "SD1.5", etc.
-    latent_channels: int             # 16 (FLUX) ou 4 (SD/Wan/Hunyuan)
-    hidden_dim: int
-    num_heads: int
-    dtype: str = "float16"
-    supports_guidance: bool = True
-    supports_img2img: bool = False
-    supports_inpainting: bool = False
-    supports_video: bool = False
-    supports_controlnet: bool = False
+- **Dispatch par chaine `model_type`** : `loader.py::_detect_model_type` (nom de fichier,
+  puis detection par cles du header safetensors) renvoie `"dev"` / `"flux2"` / `"krea2"` /
+  `"sdxl"` / `"zimage"`..., consommee par `sampler/core.py::run()` qui route vers une des
+  cinq boucles de denoising dediees.
+- **`capability.py::CapabilityProfile`** : declaratif par famille (`generate_params`,
+  `requires`, `hard_block`, `latent_channels`, `supports_controlnet`) — c'est le seul
+  "contrat" formel qu'une famille doit remplir.
+- **Schedulers** : `sampler/scheduling.py` (`generate_sigmas`, `generate_sigmas_sdxl`,
+  `SDXLSampling`, schedulers karras/simple/sgm_uniform/beta) + `sampler/solvers.py`
+  (`euler`, `euler_a`, `ddim`, `dpmpp_2m`, `dpmpp_2m_sde`, `dpmpp_2s_ancestral`, `deis`),
+  selectionnes par chaine, sans hierarchie de classes.
 
-
-class DiffusionTransformer(ABC):
-    """Interface generique pour tous les transformers de diffusion."""
-    
-    @abstractmethod
-    def predict(
-        self,
-        latent: mx.array,     # [B, C_latent, H_lat, W_lat]
-        t: mx.array,          # [B] timestep
-        cond: mx.array,       # [B, T, D] conditioning texte
-        cond_pooled: mx.array | None,  # [B, D_pooled] pooling
-        guidance: float | None = None,
-        **kwargs,
-    ) -> mx.array:
-        """Predict noise/residual."""
-        ...
-    
-    @abstractmethod
-    def get_config(self) -> TransformerConfig: ...
-    @abstractmethod
-    def get_latent_channels(self) -> int: ...
-    @abstractmethod
-    def unpack_latent(self, packed: mx.array, h: int, w: int) -> mx.array: ...
-    @abstractmethod
-    def pack_latent(self, latent: mx.array) -> mx.array: ...
-```
-
-### 4.2 DiffusionVAE (interface generique)
-
-```python
-# apple_silicon_nodes/native/vae/base.py
-
-class DiffusionVAE(ABC):
-    """Interface generique pour tous les VAE."""
-    
-    @abstractmethod
-    def encode(self, image: mx.array) -> mx.array:
-        """Encode image [B, 3, H, W] → latent [B, C, H/8, W/8]."""
-        ...
-    
-    @abstractmethod
-    def decode(self, latent: mx.array) -> mx.array:
-        """Decode latent [B, C, H, W] → image [B, 3, H, W]."""
-        ...
-    
-    @abstractmethod
-    def get_latent_channels(self) -> int: ...
-```
-
-### 4.3 TextEncoder (interface generique)
-
-```python
-# apple_silicon_nodes/native/text_encoder/base.py
-
-class TextEncoder(ABC):
-    """Interface generique pour les encodeurs de texte."""
-    
-    @abstractmethod
-    def tokenize(self, texts: list[str], max_tokens: int = 256) -> dict: ...
-    @abstractmethod
-    def encode(self, tokens: dict) -> tuple[mx.array, mx.array | None]:
-        """Returns (embeddings [B,T,D], pooled [B,D_pooled] or None)."""
-        ...
-    @abstractmethod
-    def get_embedding_dim(self) -> int: ...
-    @abstractmethod
-    def is_pooled(self) -> bool: ...
-```
-
-### 4.4 Scheduler (interface generique)
-
-```python
-# apple_silicon_nodes/sampler/scheduler.py
-
-class DiffusionScheduler(ABC):
-    """Interface generique pour les schedulers."""
-    
-    @abstractmethod
-    def set_timesteps(self, num_steps: int, model_type: str) -> None: ...
-    @abstractmethod
-    def timesteps(self) -> list[float]: ...
-    @abstractmethod
-    def step(
-        self,
-        model_output: mx.array,
-        timestep: float,
-        sample: mx.array,
-        **kwargs,
-    ) -> mx.array:
-        """Compute previous sample."""
-        ...
-```
+**Consequence pour les phases 3-5** : ne pas commencer par ecrire des interfaces.
+Ajouter une famille = ajouter un sous-package + une boucle + un profil, selon le tableau
+de §3.
 
 ---
 
-## 5. Phases d'implementation
+## 5. Phases restantes
 
-### Phase 0 — Fondations (refactoring)
+### Phase 0 — Fondations
 
-**Objectif :** Creer les interfaces abstraites sans casser le code existant.
+✅ **Fait**, sous une forme differente de celle planifiee — voir §4 et §0.
+Rien a reprendre ici.
 
-| Fichier | Contenu | Lignes | Effort |
-|---------|---------|--------|--------|
-| `native/transformer/base.py` | Interface DiffusionTransformer | 80 | 2h |
-| `native/vae/base.py` | Interface DiffusionVAE | 30 | 30min |
-| `native/text_encoder/base.py` | Interface TextEncoder | 40 | 30min |
-| `sampler/scheduler.py` | Schedulers generiques | 200 | 3h |
-| `loader.py` | Dispatcher unifie | ~150 | 1j |
-| `sampler/core.py` | Abstraction transformer | ~100 | 1j |
-| `capability.py` | Profils nouveaux modeles | ~100 | 3h |
-| `bridge.py` | Support multi-canaux | ~50 | 2h |
-| `native/config.py` | Renommer → TransformerConfig | 20 | 30min |
-| `native/__init__.py` | Re-export transformers | 30 | 30min |
-| `__init__.py` | Registration nouveaux nodes | 20 | 1h |
+### Phase 1 — SDXL
 
-**Total phase 0 : 5-6 jours**
+✅ **Fait pour SDXL** (commit `7046a5e` "feat(native): add SDXL, Flux2/Klein, Krea2,
+Z-Image native MLX architectures", puis `a093e82` et `94559cd` pour le LoRA).
+Livre : `native/sdxl/`, `_run_sdxl`, LoRA SDXL, `latent.py` multi-canaux
+(`"sdxl": (4, 8)`), sigmas discrets EPS/DDPM.
 
----
+**Reste ouvert sur cette phase :**
 
-### Phase 1 — SD1.5 / SDXL (priorite haute)
+| Item | Etat | Detail |
+|------|------|--------|
+| img2img / inpainting SDXL | ❌ | `_run_sdxl` court-circuite `_detect_mode()`. Effort : 1-2j |
+| ControlNet SD | ❌ | `disabled_nodes/controlnet/` a reactiver puis porter. Effort : 2-3j |
 
-**Objectif :** Supporter SD1.5 et SDXL — demande la plus courante apres FLUX.
+### Phase 2 — FLUX.2 Klein
 
-| Fichier | Contenu | Lignes | Effort |
-|---------|---------|--------|--------|
-| `native/transformer/sd_unet.py` | SD1.5/SDXL UNet MLX | 700 | 2-3j |
-| `native/vae/sd_vae.py` | SD VAE 4 canaux MLX | 250 | 1j |
-| `controlnet/sd_controlnet.py` | ControlNet SD MLX | 400 | 2-3j |
-| `lora.py` | Mapping cles LoRA SD | 50 | 2h |
-| `latent.py` | Support multi-canaux | 30 | 1h |
-| `vae.py` | Dispatch VAE | 50 | 2h |
-| `conditioning.py` | Support multi-encoder | 50 | 2h |
-
-**Total phase 1 : 8-11 jours**
-
----
-
-### Phase 2 — FLUX.2 Klein (priorite haute)
-
-**Objectif :** Supporter FLUX.2-Klein — evolution directe de FLUX.1.
-
-| Fichier | Contenu | Lignes | Effort |
-|---------|---------|--------|--------|
-| `native/transformer/flux2.py` | FLUX.2-Klein MLX | 500 | 2-3j |
-
-**Total phase 2 : 2-3 jours**
+✅ **Fait** (commit `7046a5e`, puis `335f586`) — `native/flux2/`, `_run_flux2`,
+signature LoRA `double_stream_modulation_img/_txt` (`lora.py`).
 
 ---
 
 ### Phase 3 — Wan 2.1 (priorite moyenne)
 
-**Objectif :** Supporter Wan 2.1 — modele video.
+**Objectif :** Supporter Wan 2.1 — modele video. **Rien n'existe a ce jour.**
 
 | Fichier | Contenu | Lignes | Effort |
 |---------|---------|--------|--------|
-| `native/transformer/wan_video.py` | Wan 2.1 video MLX | 1000 | 3-5j |
-| `native/vae/wan_vae.py` | Wan VAE MLX | 250 | 1-2j |
-| `native/text_encoder/umt5_encoder.py` | UMT5-XXL MLX | 300 | 1-2j |
+| `native/wan/model.py` | Wan 2.1 video MLX | 1000 | 3-5j |
+| `native/wan/config.py` + `weight_map.py` | Config + mapping de cles | 200 | 1j |
+| VAE Wan | Via `comfy.sd.VAE` d'abord ; port MLX seulement si le bridge est le goulot | 250 | 1-2j |
+| Encodeur UMT5-XXL | Via le `CLIPType "wan"` de ComfyUI d'abord (deja expose dans `conditioning.py`) ; port MLX optionnel | 300 | 1-2j |
+| `sampler/core.py::_run_wan` | Boucle de denoising + rope temporel 3D | 150 | 1-2j |
 
-**Total phase 3 : 5-8 jours**
+**Total phase 3 : 6-10 jours**
+
+Attention : le format de latent `Wan21` existe deja dans `native/config.py`
+(`process_wan21_latent_in/out`) — il est utilise par le **VAE de Krea2**, pas par le
+modele video. Le reutiliser, ne pas le redefinir.
 
 ---
 
 ### Phase 4 — Hunyuan (priorite moyenne)
 
-**Objectif :** Supporter Hunyuan DiT.
+**Objectif :** Supporter Hunyuan DiT. **Rien n'existe a ce jour.**
 
 | Fichier | Contenu | Lignes | Effort |
 |---------|---------|--------|--------|
-| `native/transformer/hunyuan_dit.py` | Hunyuan DiT MLX | 600 | 2-3j |
-| `native/vae/hunyuan_vae.py` | Hunyuan VAE MLX | 250 | 1-2j |
-| `native/text_encoder/bert_encoder.py` | BERT-Large MLX | 250 | 1-2j |
+| `native/hunyuan/model.py` | Hunyuan DiT MLX | 600 | 2-3j |
+| `native/hunyuan/config.py` + `weight_map.py` | Config + mapping de cles | 200 | 1j |
+| VAE Hunyuan | Via `comfy.sd.VAE` d'abord | 250 | 1-2j |
+| Encodeur BERT-Large | Via le `CLIPType "hunyuan_dit"` de ComfyUI d'abord | 250 | 1-2j |
+| `sampler/core.py::_run_hunyuan` | Boucle DDIM + CFG deux passes | 150 | 1j |
 
-**Total phase 4 : 4-6 jours**
+**Total phase 4 : 5-8 jours**
 
 ---
 
 ### Phase 5 — Modeles avances (priorite basse)
 
+Krea2 est **✅ fait** (`native/krea2/`, commit `7046a5e`) et sort de cette phase.
+Z-Image, absent du plan d'origine, est **✅ fait** egalement (`native/zimage/`).
+
 | Fichier | Modele | Lignes | Effort |
 |---------|--------|--------|--------|
-| `native/transformer/pixart_sigma.py` | PixArt Sigma | 400 | 2j |
-| `native/transformer/krea2.py` | Krea2 | 400 | 2j |
-| `native/transformer/ideogram.py` | Ideogram | 400 | 2j |
-| `native/transformer/svd.py` | SVD | 500 | 2-3j |
+| `native/pixart/` | PixArt Sigma | 400 | 2j |
+| `native/ideogram/` | Ideogram | 400 | 2j |
+| `native/svd/` | SVD | 500 | 2-3j |
 
-**Total phase 5 : 8-10 jours**
+**Total phase 5 : 6-7 jours**
 
 ---
 
-## 6. Resume des efforts
+### Phase 6 — MiniMax H3 (priorite a determiner)
 
-| Phase | Fichiers nouveaux | Fichiers modifies | Effort |
-|-------|-------------------|-------------------|--------|
-| **0 — Fondations** | 5 | 8 | **5-6j** |
-| **1 — SD1.5/SDXL** | 3 | 5 | **8-11j** |
-| **2 — FLUX.2** | 1 | 0 | **2-3j** |
-| **3 — Wan 2.1** | 3 | 0 | **5-8j** |
-| **4 — Hunyuan** | 3 | 0 | **4-6j** |
-| **5 — Autres** | 4 | 0 | **8-10j** |
-| **TOTAL** | **22** | **13** | **~32-46j** |
+**Objectif :** Supporter MiniMax H3. **Rien n'existe a ce jour — architecture non
+investiguee.** Des packs tiers PyTorch/comfy existent deja dans l'installation locale
+(`ComfyUI-MiniMax-H3-Turbo`, `ComfyUI-Spectrum-MiniMax-H3`, `ComfyUI-MiniMaxH3-Cache`,
+`ComfyUI-MiniMaxH3-FirstBlockCache`, cf. "TJ NODE STUDIO ONE" dans les logs ComfyUI) —
+utiles comme reference d'implementation PyTorch, mais aucun n'est un port MLX.
 
-**Avec 2 developpeurs :** ~16-23 jours
+Avant d'estimer un effort : suivre la regle du §10 ("Architecture modele inconnue —
+analyser les poids AVANT d'ecrire le weight_map") — inspecter le header safetensors
+d'un checkpoint H3 reel pour determiner nombre de canaux VAE, dimension latente,
+text encoder(s), et si c'est un modele image ou video (comme Wan, ce dernier cas
+impliquerait un rope temporel et gonflerait fortement l'effort).
+
+| Fichier | Contenu | Lignes | Effort |
+|---------|---------|--------|--------|
+| Investigation architecture (header safetensors, poids reels) | Prealable obligatoire | — | 0.5-1j |
+| `native/minimax_h3/model.py` | MiniMax H3 MLX | ? | ? |
+| `native/minimax_h3/config.py` + `weight_map.py` | Config + mapping de cles | ? | ? |
+| VAE MiniMax H3 | Via `comfy.sd.VAE` d'abord | ? | ? |
+| Encodeur texte | Via le `CLIPType` ComfyUI correspondant d'abord, si expose | ? | ? |
+| `sampler/core.py::_run_minimax_h3` | Boucle de denoising | ? | ? |
+
+**Total phase 6 : a chiffrer apres investigation**
+
+---
+
+## 6. Resume des efforts restants
+
+| Phase | Etat | Effort restant |
+|-------|------|----------------|
+| **0 — Fondations** | ✅ Fait (forme differente) | — |
+| **1 — SDXL** | ✅ Fait (txt2img) | — |
+| **1bis — img2img/inpaint SDXL + ControlNet SD** | Ouvert | **3-5j** |
+| **2 — FLUX.2** | ✅ Fait | — |
+| **3 — Wan 2.1** | Ouvert | **6-10j** |
+| **4 — Hunyuan** | Ouvert | **5-8j** |
+| **5 — PixArt / Ideogram / SVD** | Ouvert (Krea2 fait) | **6-7j** |
+| **6 — MiniMax H3** | Ouvert, a chiffrer | **a determiner** |
+| **TOTAL RESTANT** | | **~20-30j + Phase 6** |
 
 ---
 
@@ -356,43 +284,44 @@ Regles:
   - Utiliser des buffers numpy reutilisables quand possible
 ```
 
-### Memoire par modele (FP16)
+### Memoire par modele (FP16) — estimations pour les familles restantes
 
 | Modele | RAM min. recommandee | Poids + Etat | Avec TeaCache |
 |--------|---------------------|--------------|---------------|
-| SD1.5 | 8GB | ~3GB | ~2GB |
-| SDXL | 16GB | ~5GB | ~3GB |
-| FLUX.1 | 16GB | ~8GB | ~5GB |
-| FLUX.2 | 24GB | ~12GB | ~7GB |
 | Wan 2.1 | 36GB | ~18GB | ~10GB |
 | Hunyuan | 16GB | ~6GB | ~4GB |
+| MiniMax H3 | ? (a mesurer apres investigation architecture) | ? | ? |
 
 ---
 
-## 8. Tests de validation
+## 8. Tests de validation (par nouveau modele)
 
-### Tests numeriques (par modele)
+Pour SDXL / FLUX.2 / Krea2 / Z-Image, la recette de verification etablie du projet
+(skill `verify-checkpoint`) fait foi et a deja tourne. Les listes ci-dessous ne
+concernent plus que les familles a livrer (Wan, Hunyuan, PixArt, Ideogram, SVD, MiniMax H3).
+
+### Tests numeriques
 
 - [ ] Predictions stables (pas de NaN/Inf)
 - [ ] Similarite cosinus > 0.99 vs PyTorch reference
-- [ ] Embeddings textuels coherents
+- [ ] Chargement d'un vrai checkpoint : N/M cles appariees, std vs init aleatoire
 
-### Tests fonctionnels (par modele)
+### Tests fonctionnels
 
 - [ ] Workflow complet : charge → encode → sample → decode → image
 - [ ] img2img fonctionne
 - [ ] inpainting fonctionne (si supporte)
 - [ ] LoRA fonctionne
-- [ ] ControlNet fonctionne (si supporte)
-- [ ] IP-Adapter fonctionne (si supporte)
+- [ ] ControlNet fonctionne (si supporte — actuellement FLUX.1 uniquement)
+- [ ] IP-Adapter fonctionne (si supporte — actuellement dans `disabled_nodes/`)
 
-### Tests de performance (par modele)
+### Tests de performance
 
 - [ ] Temps de generation mesure et documente
 - [ ] Memoire maximale mesuree
 - [ ] Comparaison avec implementation PyTorch reference
 
-### Tests de compatibilite (par modele)
+### Tests de compatibilite
 
 - [ ] Resolutions supportees documentees
 - [ ] Batch size 1 garanti
@@ -401,32 +330,25 @@ Regles:
 
 ---
 
-## 9. Ordre d'execution
+## 9. Ordre d'execution restant
 
 ```
-Phase 0 (fondations) ───────────────────────────────────── 5-6j
+Phase 1bis (img2img/inpaint SDXL + ControlNet SD) ──────── 3-5j
     │
-    ├──→ Phase 1 (SD1.5/SDXL) ──────────────────────────── 8-11j
-    │       │
-    │       ├──→ Tests SD
-    │       └──→ Documentation SD
-    │
-    ├──→ Phase 2 (FLUX.2) ───────────────────────────────── 2-3j
-    │       │
-    │       └──→ Tests FLUX.2
-    │
-    ├──→ Phase 3 (Wan 2.1) ──────────────────────────────── 5-8j
-    │       │
+    ├──→ Phase 3 (Wan 2.1) ──────────────────────────────── 6-10j
     │       └──→ Tests Wan
     │
-    ├──→ Phase 4 (Hunyuan) ──────────────────────────────── 4-6j
-    │       │
+    ├──→ Phase 4 (Hunyuan) ──────────────────────────────── 5-8j
     │       └──→ Tests Hunyuan
     │
-    └──→ Phase 5 (Autres) ───────────────────────────────── 8-10j
-            │
-            └──→ Tests PixArt, Krea2, Ideogram, SVD
+    ├──→ Phase 5 (PixArt, Ideogram, SVD) ────────────────── 6-7j
+    │
+    └──→ Phase 6 (MiniMax H3) ───────────────────────────── a chiffrer
+            └──→ Investigation architecture d'abord
 ```
+
+Les quatre branches sont independantes : les fondations (§4) sont en place, chacune
+ajoute un sous-package `native/<famille>/` sans toucher au noyau.
 
 ---
 
@@ -434,66 +356,47 @@ Phase 0 (fondations) ───────────────────�
 
 | Risque | Probabilite | Impact | Mitigation |
 |--------|-------------|--------|------------|
-| Architecture modele inconnue (pas de specs) | Moyenne | Eleve | Analyser les poids pour deduire l'architecture |
+| Architecture modele inconnue (pas de specs) | Moyenne | Eleve | Analyser les poids pour deduire l'architecture (inspecter le header safetensors AVANT d'ecrire le weight_map) |
 | Memoire insuffisante (Wan 14B) | Moyenne | Eleve | Quantification MLX (int8, fp8), streaming |
-| Incompatibilite numerique MLX vs PyTorch | Haute | Moyen | Tests de validation rigoureux |
-| Schedulers complexes (DPM++ SDE) | Moyenne | Moyen | Utiliser schedulers ComfyUI via bridge |
-| Temps > estime | Haute | Eleve | Prioriser SD1.5/SDXL (demande la plus forte) |
-| ControlNet non disponible pour certains modeles | Basse | Moyen | ControlNet Union couvre FLUX/SD |
+| Incompatibilite numerique MLX vs PyTorch | Haute | Moyen | Recette `verify-checkpoint` avant toute annonce de support |
+| ControlNet non disponible hors FLUX.1 | Confirme | Moyen | `disabled_nodes/controlnet/` a reactiver et porter par famille |
+| Modele video (Wan/SVD) : rope temporel + VAE 3D | Haute | Eleve | Aucun precedent dans le repo — prevoir une marge sur la phase 3 |
 
 ---
 
 ## 11. Migration progressive
 
-### Backward compatibility
+✅ **Resolu autrement.** Ni le dispatcher a flag (`ASDX_MULTI_MODEL`, absent du code)
+ni `load_diffusion_model()` generique n'ont ete necessaires : `loader.py::_detect_model_type`
+detecte la famille depuis le nom puis depuis les cles du checkpoint, et retombe sur
+`"dev"` (FLUX.1) si la detection echoue — la retrocompatibilite est donc le comportement
+par defaut, sans variable d'environnement.
 
-```python
-# loader.py — compatibilite arriere
-
-def load_diffusion_model(path: str | Path, dtype: str = "float16"):
-    """Charge le bon transformer selon le modele detecte.
-    
-    Retourne un objet implementant DiffusionTransformer.
-    Pour FLUX.1, retourne FluxTransformer (compatible arriere).
-    """
-    family = _detect_model_family(path)
-    
-    if family == "flux1":
-        return _load_existing_flux(path, dtype)  # code existant
-    
-    loader = _get_loader(family)
-    return loader(path, dtype)
-```
-
-### Flag de commutation
-
-```python
-# Variable d'environnement pour activer le dispatcher multi-modeles
-_USE_DISPATCHER = os.environ.get("ASDX_MULTI_MODEL", "0") == "1"
-# Par defaut: comportement actuel (FLUX.1 only)
-```
+Pour les phases 3-5, ajouter une branche dans `_detect_model_type_from_keys` avec un
+marqueur de cle propre a la famille (voir `weight_format.py::classify_quant_format` pour
+la meme discipline cote quantification : jamais de devinette plausible, une erreur plutot
+qu'un faux positif).
 
 ---
 
-## 12. Checklist de livraison
+## 12. Checklist de livraison (restante)
 
-### Phase 0
-- [ ] Interfaces creees et testeess
-- [ ] Dispatcher fonctionne pour FLUX.1 (backward compat)
-- [ ] Tests unitaires passes
-
-### Phase 1 (SD1.5/SDXL)
-- [ ] UNet SD charge et genere sans erreur
-- [ ] VAE SD encode/decode correctement
-- [ ] Schedulers SD testes (Euler, Euler-A, DDIM, DPM++2M)
-- [ ] LoRA SD fonctionne
-- [ ] ControlNet SD fonctionne
-- [ ] Workflow complet teste
+### Phase 1bis (completion SDXL)
+- [ ] img2img / inpainting cables pour SDXL
+- [ ] ControlNet SD fonctionne (reactivation de `disabled_nodes/controlnet/`)
 - [ ] Memoire et performances mesurees
 
-### Phase 2-5
-- [ ] Chaque modele passe les memes tests que SD
+### Phases 3-5
+- [ ] Chaque modele passe la recette `verify-checkpoint` sur un vrai checkpoint
+- [ ] Chaque modele passe les tests de §8
+- [ ] README.md mis a jour (tableau des familles supportees)
 - [ ] Documentation a jour
+
+### Phase 6 (MiniMax H3)
+- [ ] Architecture investiguee (header safetensors d'un vrai checkpoint)
+- [ ] Effort re-estime une fois l'architecture connue
+- [ ] Profil `capability.py` + `native/minimax_h3/` crees
+- [ ] Passe la recette `verify-checkpoint`
 
 ### General
 - [ ] Tous les tests passes
@@ -504,12 +407,14 @@ _USE_DISPATCHER = os.environ.get("ASDX_MULTI_MODEL", "0") == "1"
 
 ## 13. References
 
-- FLUX.1: https://github.com/black-forest-labs/flux
-- SD1.5: https://huggingface.co/runwayml/stable-diffusion-v1-5
-- SDXL: https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0
-- FLUX.2: https://github.com/black-forest-labs/flux
 - Wan 2.1: https://github.com/Wan-Video/Wan2.1
 - Hunyuan DiT: https://github.com/Tencent/HunyuanDiT
 - PixArt Sigma: https://github.com/PixArt-alpha/PixArt-sigma
+- MiniMax H3: pas de source officielle verifiee dans cette session — reference
+  d'implementation la plus proche disponible localement : les packs tiers PyTorch/comfy
+  de "TJ NODE STUDIO ONE" (`ComfyUI-MiniMax-H3-Turbo`, `ComfyUI-Spectrum-MiniMax-H3`,
+  `ComfyUI-MiniMaxH3-Cache`, `ComfyUI-MiniMaxH3-FirstBlockCache`), a localiser sur la
+  machine avant de commencer l'investigation architecture (§5, Phase 6)
 - MLX: https://ml-explore.github.io/mlx/
-- ComfyUI: https://github.com/comfyanonymous/ComfyUI
+- ComfyUI: https://github.com/comfyanonymous/ComfyUI (implementation de reference — voir le
+  record de canon `ComfyUI and the SceneWorks stack are the reference implementations`)
