@@ -230,3 +230,26 @@ class DiTBlock(nn.Module):
         x = mod_gate(x, gate_msa, self.attn(h, cos=cos, sin=sin), mod_segments)
         h = mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
         return mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
+
+
+def curve_time_embedding(table: mx.array, t_vals: mx.array) -> mx.array:
+    """Curve-form timestep embedding: linearly interpolate `adaln_t_table`
+    (`[grid, time_embed_dim]`) at fractional row `t * (grid - 1)` for each
+    `t` in `t_vals` (`[M]`, values in `[0, 1]`). Ported from
+    `MiniMaxH3Model.forward`'s `use_adaln_curves` branch:
+
+        pos = t.clamp(0, 1) * (grid - 1)
+        i0 = pos.floor().clamp(max=grid - 2)   # keeps t=1.0 on the last interval
+        t_emb = lerp(table[i0], table[i0 + 1], pos - i0)
+
+    replaces the sinusoidal `TimeEmbedder` for this checkpoint variant (see
+    config.py's module docstring) -- there is no separate embedder module to
+    call, the table IS the embedder."""
+    grid = table.shape[0]
+    t_clamped = mx.clip(t_vals, 0.0, 1.0)
+    pos = t_clamped * (grid - 1)
+    i0 = mx.clip(mx.floor(pos), 0, grid - 2).astype(mx.int32)
+    frac = (pos - i0.astype(pos.dtype))[:, None]
+    row0 = table[i0]
+    row1 = table[i0 + 1]
+    return row0 + frac * (row1 - row0)
