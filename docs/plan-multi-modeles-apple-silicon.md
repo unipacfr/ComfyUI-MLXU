@@ -549,7 +549,8 @@ qu'un faux positif).
 - [x] Architecture investiguee (headers safetensors des checkpoints reels + reference `comfy/ldm/minimax/`, 2026-09-14)
 - [x] Effort re-estime (25-42j : 18-30j t2va/fl2va+LoRA + 6.5-11.5j GGUF text encoder+DiT ; REF2VA/AddGuide/ControlNet en sus)
 - [x] `native/minimax_h3/config.py` : detection d'architecture (`detect_minimax_h3_config`) verifiee sur les headers reels des deux formats (safetensors + GGUF), config identique des deux cotes
-- [ ] Profil `capability.py` + le reste de `native/minimax_h3/` (model.py, weight_map.py, text_encoder.py) crees
+- [x] `native/minimax_h3/model.py` : DiT complet pour le chemin minimal t2va (rope.py, layout.py, patchify.py, model.py — RMSNorm/Attention/MLP/AdalnProj/TokenRefiner/DiTBlock/FinalLayer/MiniMaxH3Model), chaque brique verifiee numeriquement contre la vraie reference (comfy_kitchen eager backend pour le rope fusionne, `comfy.ldm.minimax.model` importe directement pour layout/patchify/curve embedding). Hors scope : REF2VA, AddGuide, gate_compress/VSA, PDD head bank, pad/crop non-aligne — voir le docstring de module de `model.py`.
+- [ ] Profil `capability.py` + `native/minimax_h3/weight_map.py` (chargement des vrais poids safetensors/GGUF dans `MiniMaxH3Model`) + `text_encoder.py` (Qwen3-VL)
 - [ ] Encodeur Qwen3-VL natif (`native/minimax_h3/text_encoder.py`)
 - [ ] Sortie audio (`AUDIO`) cablee — premiere fois dans ce projet
 - [ ] Chargement sequentiel encodeur → DiT → VAE verifie (pic RAM mesure < 64GB sur M5 Max, aucun etage resident en meme temps qu'un autre)
