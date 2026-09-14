@@ -23,8 +23,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import MiniMaxH3Config
+from .layout import PackedLayout
+from .patchify import pack_audio, patchify_video, unpack_audio, unpatchify_video
 from .rope import rms_norm as _rope_rms_norm
-from .rope import rms_norm_rope_split_half
+from .rope import rms_norm_rope_split_half, rope_cos_sin
+from .rope import rope_freqs as _rope_freqs
 
 
 class RMSNorm(nn.Module):
@@ -307,3 +310,145 @@ def build_mod_segments(
     t_row = {t: i for i, t in enumerate(unique_t)}
     mod_segments = [(a, b, t_row[seg_t[kind]] * 3 + seg_tag[kind]) for a, b, kind in segments]
     return mod_segments, unique_t
+
+
+def time_shift_sigma(sigma: float, from_shift: float, to_shift: float) -> float:
+    """Converts a flow-matching sigma from one shift's grid to another's --
+    ported verbatim from `comfy/ldm/minimax/model.py::time_shift_sigma`
+    (inverts `sigma = s*b/(1+(s-1)*b)` to the base grid, re-applies the other
+    shift). Used to derive the audio stream's own sigma from the video sigma
+    the sampler drives (`sigma_shift_video=12.0` -> `sigma_shift_audio=3.0`
+    on the real checkpoint)."""
+    base = sigma / (from_shift + sigma * (1.0 - from_shift))
+    return to_shift * base / (1.0 + (to_shift - 1.0) * base)
+
+
+class RopeBuffer(nn.Module):
+    """Holds `rope.inv_freq` under its own submodule, matching the
+    checkpoint's key path exactly (`rope.inv_freq`, not a bare top-level
+    `inv_freq`) -- the reference does the same with a bare `nn.Module()`
+    plus a registered buffer, for the same key-path reason."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.inv_freq = mx.zeros(dim)
+
+
+class MiniMaxH3Model(nn.Module):
+    """MiniMax H3 audio-video DiT -- minimal t2va path (see module
+    docstring for the full scope restriction list).
+
+    Precondition on `video_latent`'s spatial/temporal dims: already a
+    multiple of `patch_size` in every axis. The reference pads via
+    `comfy.ldm.common_dit.pad_to_patch_size` before patchifying and crops
+    the output back to the original size after -- omitted here because
+    every real caller (the VAE's own downscale ratio combined with
+    `EmptyMiniMaxH3LatentAV`'s `width`/`height` rounding, see
+    `comfy_extras/nodes_minimax_h3.py`) already guarantees alignment, so
+    the pad/crop is a no-op in practice; not silently dropped functionality,
+    a documented precondition instead.
+
+    `__call__`'s return is negated (`-video_out, -audio_out`), matching the
+    reference's OUTER `forward()` (not just the `_forward` this class's
+    `__call__` otherwise mirrors) -- that sign flip is part of the model's
+    real output contract, not an implementation detail internal to
+    `_forward`.
+    """
+
+    def __init__(self, config: MiniMaxH3Config):
+        super().__init__()
+        self.config = config
+        hidden = config.hidden_size
+
+        self.video_patch_proj = nn.Linear(config.video_patch_dim, hidden, bias=True)
+        self.audio_patch_proj = nn.Linear(config.audio_latents_dim, hidden, bias=True)
+        self.condition_proj = nn.Linear(config.text_dim, hidden, bias=True)
+        if config.adaln_curve_grid is None:
+            raise NotImplementedError(
+                "ASDX: MiniMaxH3Model only implements the curve-form adaln variant "
+                "(adaln_curve_grid set) -- see config.py's module docstring."
+            )
+        self.adaln_t_table = mx.zeros((config.adaln_curve_grid, config.time_embed_dim))
+        self.rope = RopeBuffer(config.rope_inv_freq_len)
+        self.token_refiner = TokenRefiner(
+            config.token_refiner_num_layers, hidden, config.num_attention_heads,
+            config.attention_head_dim, config.ffn_hidden_size, config.norm_eps,
+            config.qk_norm_eps, config.final_norm_eps,
+        )
+        rot_dim = config.rope_inv_freq_len * 3 * 2  # 3 axes, cos/sin pair each -- see rope.py
+        if rot_dim > config.attention_head_dim:
+            raise ValueError(
+                f"ASDX: MiniMaxH3Config's rope_inv_freq_len={config.rope_inv_freq_len} implies "
+                f"rot_dim={rot_dim}, larger than attention_head_dim={config.attention_head_dim} "
+                f"-- partial rope requires rot_dim <= head_dim."
+            )
+        self.blocks = [
+            DiTBlock(
+                hidden, config.num_attention_heads, config.attention_head_dim,
+                config.ffn_hidden_size, config.time_embed_dim, config.norm_eps,
+                config.qk_norm_eps, rot_dim=rot_dim,
+            )
+            for _ in range(config.num_layers)
+        ]
+        self.final_layer = FinalLayer(
+            hidden, config.time_embed_dim, config.video_patch_dim, config.audio_latents_dim, config.final_norm_eps
+        )
+
+    def __call__(
+        self,
+        video_latent: mx.array,
+        audio_latent: mx.array,
+        context: mx.array,
+        sigma_v: float,
+    ) -> tuple[mx.array, mx.array]:
+        """`video_latent`: `[1, latents_dim, T, H, W]`. `audio_latent`:
+        `[1, audio_latents_dim, 2, T_audio]`. `context`: `[L, text_dim]`
+        (Qwen3-VL text states, batch already squeezed -- this port's
+        convention throughout, see `Attention`/`DiTBlock`). `sigma_v`: the
+        video stream's flow-matching sigma in `[0, 1]` (this port's
+        interface takes it directly rather than the reference's
+        `timestep = sigma * 1000` ComfyUI convention, which is pure
+        sampler-plumbing with no effect on the math below)."""
+        cfg = self.config
+        shift_v, shift_a = cfg.sigma_shift_video, cfg.sigma_shift_audio
+        t_v = 1.0 - sigma_v
+        t_a = 1.0 - time_shift_sigma(sigma_v, shift_v, shift_a)
+
+        text_len = context.shape[0]
+        latent_t, lat_h, lat_w = video_latent.shape[2], video_latent.shape[3], video_latent.shape[4]
+        audio_t = audio_latent.shape[-1]
+
+        layout = PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t)
+        mod_segments, unique_t = build_mod_segments(layout.segments, t_v, t_a)
+        t_emb = curve_time_embedding(self.adaln_t_table, mx.array(unique_t, dtype=mx.float32))
+
+        video_rows = patchify_video(video_latent, cfg.patch_size)
+        audio_rows = pack_audio(audio_latent)
+        video_embed = self.video_patch_proj(video_rows)
+        audio_embed = self.audio_patch_proj(audio_rows)
+
+        text_states = context
+        if text_states.shape[-1] != cfg.hidden_size:
+            text_states = self.token_refiner(self.condition_proj(text_states))
+
+        # segments are (text, audio, video) in that fixed order for this
+        # minimal layout, matching the embed pieces below exactly -- no
+        # per-segment gather needed (unlike the reference's general case,
+        # which also handles cond/ref segments interleaved with these).
+        h = mx.concatenate([text_states, audio_embed, video_embed], axis=0)
+
+        angles = _rope_freqs(layout.position_ids, self.rope.inv_freq)
+        cos, sin = rope_cos_sin(angles)
+
+        for block in self.blocks:
+            h = block(h, t_emb, mod_segments, cos, sin)
+
+        va, vb, _ = next(s for s in layout.segments if s[2] == "video")
+        aa, ab, _ = next(s for s in layout.segments if s[2] == "audio")
+        video_row = unique_t.index(t_v)
+        audio_row = unique_t.index(t_a)
+        v, a = self.final_layer(h, t_emb, (va, vb, video_row), (aa, ab, audio_row))
+
+        video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, cfg.latents_dim, cfg.patch_size)
+        audio_out = unpack_audio(a)
+        return -video_out, -audio_out

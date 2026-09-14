@@ -41,8 +41,15 @@ def rope_freqs(position_ids: mx.array, inv_freq: mx.array) -> mx.array:
     mirror the reference 1:1 for anyone diffing against it). `position_ids`
     is cast to float32 here even if given as float64 (`PackedLayout` builds
     it at float64 for precision, matching the reference), mirroring
-    `MiniMaxH3Model.rope_freqs`'s own `pos = position_ids.to(torch.float32)`."""
-    position_ids = position_ids.astype(mx.float32)
+    `MiniMaxH3Model.rope_freqs`'s own `pos = position_ids.to(torch.float32)`.
+    The cast itself must run on the CPU stream: MLX rejects float64 (even
+    just reading it to cast away) on the GPU/Metal stream entirely (see
+    layout.py's module docstring for where this was first found)."""
+    if position_ids.dtype == mx.float64:
+        with mx.stream(mx.cpu):
+            position_ids = position_ids.astype(mx.float32)
+    else:
+        position_ids = position_ids.astype(mx.float32)
     per_axis = position_ids[:, :, None] * inv_freq[None, None, :]  # [S, 3, F]
     half = mx.concatenate([per_axis[:, 0], per_axis[:, 1], per_axis[:, 2]], axis=-1)  # [S, 3F]
     return mx.concatenate([half, half], axis=-1)  # [S, 6F]
