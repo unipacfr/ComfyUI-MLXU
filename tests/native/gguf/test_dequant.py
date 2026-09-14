@@ -28,13 +28,17 @@ dequantize_tensor = _dequant.dequantize_tensor
 _REFERENCE_GGUF_NODE = Path("/Volumes/X10Pro/ComfyUI/MBP2026/ComfyUI/custom_nodes/gguf")
 
 
-def _load_reference_q5_0():
+def _load_reference_quant_class(name: str):
     if not _REFERENCE_GGUF_NODE.exists():
         pytest.skip("calcuis/gguf reference node pack not present on this machine")
     sys.path.insert(0, str(_REFERENCE_GGUF_NODE))
-    from gguf_connector.quant import Q5_0
+    import gguf_connector.quant as quant_mod
 
-    return Q5_0
+    return getattr(quant_mod, name)
+
+
+def _load_reference_q5_0():
+    return _load_reference_quant_class("Q5_0")
 
 
 def test_q5_0_matches_reference_implementation():
@@ -45,6 +49,39 @@ def test_q5_0_matches_reference_implementation():
     reference = Q5_0.dequantize_rows(blocks)
 
     mine = _dequant._dequantize_q5_0(blocks.tobytes(), data.size).reshape(8, 32)
+
+    assert np.array_equal(mine, reference)
+
+
+def test_q4_k_matches_reference_implementation():
+    # The reference Q4_K class only implements dequantize_blocks (llama.cpp
+    # quantizes K-quants in C, not via this Python port), so there is no
+    # quantize_rows to round-trip through. Instead, feed the same random raw
+    # block bytes to both dequantizers directly -- this still exercises the
+    # bit-unpacking against the reference on arbitrary bit patterns, which is
+    # what needs verifying (the block layout/packing math), not the
+    # quantization step.
+    Q4_K = _load_reference_quant_class("Q4_K")
+    rng = np.random.default_rng(7)
+    n_blocks = 4
+    block_bytes = 2 + 2 + 12 + 128  # 144
+    raw = rng.integers(0, 256, size=(n_blocks, block_bytes), dtype=np.uint8)
+
+    reference = Q4_K.dequantize_rows(raw)
+    mine = _dequant._dequantize_q4_k(raw.tobytes(), n_blocks * 256).reshape(n_blocks, 256)
+
+    assert np.array_equal(mine, reference)
+
+
+def test_q6_k_matches_reference_implementation():
+    Q6_K = _load_reference_quant_class("Q6_K")
+    rng = np.random.default_rng(11)
+    n_blocks = 4
+    block_bytes = 128 + 64 + 16 + 2  # 210
+    raw = rng.integers(0, 256, size=(n_blocks, block_bytes), dtype=np.uint8)
+
+    reference = Q6_K.dequantize_rows(raw)
+    mine = _dequant._dequantize_q6_k(raw.tobytes(), n_blocks * 256).reshape(n_blocks, 256)
 
     assert np.array_equal(mine, reference)
 
@@ -107,15 +144,15 @@ def test_unsupported_dtype_raises(tmp_path):
     data += u64(0)  # metadata_kv_count
     data += gguf_string("w")
     data += u32(1)  # n_dims
-    data += u64(256)  # dims[0], a valid Q4_K block count
-    data += u32(int(GGMLQuantizationType.Q4_K))
+    data += u64(256)  # dims[0], a valid Q5_K block count
+    data += u32(int(GGMLQuantizationType.Q5_K))
     data += u64(0)  # offset
 
     path = tmp_path / "k.gguf"
     path.write_bytes(bytes(data))
 
     header = read_gguf_header(path)
-    with pytest.raises(NotImplementedError, match="Q4_K"):
+    with pytest.raises(NotImplementedError, match="Q5_K"):
         dequantize_tensor(path, header, "w")
 
 
@@ -125,6 +162,9 @@ def test_unsupported_dtype_raises(tmp_path):
 
 _MINIMAX_H3_DIT_GGUF = Path(
     "/Volumes/X10Pro/Images/models/unet/MiniMax H3/minimax_h3_fl2va_pruned-Q5_0.gguf"
+)
+_MINIMAX_H3_TEXT_ENCODER_GGUF = Path(
+    "/Volumes/X10Pro/Images/models/text_encoders/qwen3vl_32b_minimax_h3-Q4_K_M.gguf"
 )
 
 _real_gguf_gate = pytest.mark.skipif(
@@ -152,3 +192,24 @@ def test_real_dit_small_tensor_dequantizes_to_finite_values():
     # weight matrix should not be all-zero or absurdly large.
     max_abs = float(mx.max(mx.abs(qkv)).item())
     assert 0.0 < max_abs < 100.0
+
+
+@_real_gguf_gate
+def test_real_text_encoder_q4_k_and_q6_k_tensors_dequantize_to_finite_values():
+    if not _MINIMAX_H3_TEXT_ENCODER_GGUF.exists():
+        pytest.skip("no local MiniMax H3 text encoder GGUF")
+    import mlx.core as mx
+
+    header = read_gguf_header(_MINIMAX_H3_TEXT_ENCODER_GGUF)
+
+    q4k = dequantize_tensor(_MINIMAX_H3_TEXT_ENCODER_GGUF, header, "model.layers.0.self_attn.q_proj.weight")
+    assert header.tensors["model.layers.0.self_attn.q_proj.weight"].dtype == GGMLQuantizationType.Q4_K
+    assert q4k.shape == (8192, 5120)
+    assert bool(mx.all(mx.isfinite(q4k)).item())
+    assert 0.0 < float(mx.max(mx.abs(q4k)).item()) < 100.0
+
+    q6k = dequantize_tensor(_MINIMAX_H3_TEXT_ENCODER_GGUF, header, "model.layers.0.mlp.down_proj.weight")
+    assert header.tensors["model.layers.0.mlp.down_proj.weight"].dtype == GGMLQuantizationType.Q6_K
+    assert q6k.shape == (5120, 25600)
+    assert bool(mx.all(mx.isfinite(q6k)).item())
+    assert 0.0 < float(mx.max(mx.abs(q6k)).item()) < 100.0
