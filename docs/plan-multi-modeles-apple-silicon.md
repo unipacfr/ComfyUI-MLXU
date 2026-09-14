@@ -20,7 +20,7 @@ Verifie en lisant le code, pas les checklists (qui n'ont jamais ete tenues a jou
 | **4 — Hunyuan** | ❌ Rien | pas de `native/hunyuan/`, aucun `hunyuan_dit`/`bert_encoder` (les mentions dans `conditioning.py` sont la liste des `CLIPType` de ComfyUI, pas une implementation) |
 | **5 — Krea2** | ✅ Fait — commit `7046a5e` | `native/krea2/` (model, rope, text_encoder, nag), `sampler/core.py::_run_krea2` |
 | **5 — PixArt / Ideogram / SVD** | ❌ Rien | aucun fichier correspondant |
-| **6 — MiniMax H3** | ❌ Rien | pas de `native/minimax_h3/` ; l'installation locale a des packs tiers (`ComfyUI-MiniMax-H3-Turbo`, `ComfyUI-Spectrum-MiniMax-H3`, `ComfyUI-MiniMaxH3-Cache`, `ComfyUI-MiniMaxH3-FirstBlockCache`) qui tournent en PyTorch/comfy standard, aucun port MLX |
+| **6 — MiniMax H3** | ❌ Rien | pas de `native/minimax_h3/` ; ComfyUI a un port natif complet a partir duquel travailler : `comfy/ldm/minimax/model.py` (784 lignes), `comfy/text_encoders/minimax.py` + `qwen3vl.py`, `comfy_extras/nodes_minimax_h3.py` (626 lignes) — voir Phase 6 |
 | **Bonus hors plan** | ✅ **Z-Image** (base + turbo), absent du plan d'origine | `native/zimage/`, `sampler/core.py::_run_zimage`, profils `zimage_base`/`zimage_turbo` dans `capability.py` |
 
 ### Limites connues des familles deja livrees
@@ -71,7 +71,7 @@ Passer de **FLUX.1-only** a **tous les modeles de diffusion** sur infrastructure
 | **Hunyuan** | DiT XL/2 | 4 can. | 4 | CLIP + BERT | DDIM | A faire — Phase 4 |
 | **PixArt** | Sigma 2B | 4 can. | 4 | T5-XXL + CLIP-L | Euler | A faire — Phase 5 |
 | **SVD** | SVD, SV3D | 4 can. | 4 | CLIP-L | Euler | A faire — Phase 5 |
-| **MiniMax H3** | H3 (+ Turbo) | ? | ? | ? | ? | A faire — Phase 6 (architecture a determiner, voir §5) |
+| **MiniMax H3** | H3 (FL2VA / REF2VA) | video 24 can. (ratio 16, ratio_t 4) + audio 32 can. (BigVGAN, 32kHz) | video 24 (patch 1x2x2) + audio 32, paquetes en un seul flux `[text\|cond\|audio\|video]` | Qwen3-VL-32B (couche 50) | flow-matching sigma-shift double (video 12.0 / audio 3.0) | A faire — Phase 6, architecture connue (voir §5) |
 
 ---
 
@@ -217,30 +217,183 @@ Z-Image, absent du plan d'origine, est **✅ fait** egalement (`native/zimage/`)
 
 ---
 
-### Phase 6 — MiniMax H3 (priorite a determiner)
+### Phase 6 — MiniMax H3 (investigation faite, effort re-estime a la hausse)
 
-**Objectif :** Supporter MiniMax H3. **Rien n'existe a ce jour — architecture non
-investiguee.** Des packs tiers PyTorch/comfy existent deja dans l'installation locale
-(`ComfyUI-MiniMax-H3-Turbo`, `ComfyUI-Spectrum-MiniMax-H3`, `ComfyUI-MiniMaxH3-Cache`,
-`ComfyUI-MiniMaxH3-FirstBlockCache`, cf. "TJ NODE STUDIO ONE" dans les logs ComfyUI) —
-utiles comme reference d'implementation PyTorch, mais aucun n'est un port MLX.
+**Objectif :** Supporter MiniMax H3. **Rien n'existe a ce jour cote MLX**, mais
+contrairement a l'hypothese initiale, **ComfyUI a deja un port PyTorch complet et
+maintenu** qui sert de reference directe (meme statut que Wan/Hunyuan/FLUX.2/Krea2,
+pas un cas "architecture a deviner") :
 
-Avant d'estimer un effort : suivre la regle du §10 ("Architecture modele inconnue —
-analyser les poids AVANT d'ecrire le weight_map") — inspecter le header safetensors
-d'un checkpoint H3 reel pour determiner nombre de canaux VAE, dimension latente,
-text encoder(s), et si c'est un modele image ou video (comme Wan, ce dernier cas
-impliquerait un rope temporel et gonflerait fortement l'effort).
+- `comfy/ldm/minimax/model.py` (784 lignes) — le DiT
+- `comfy/ldm/minimax/controlnet.py` (85 lignes)
+- `comfy/text_encoders/minimax.py` (217 lignes) + `comfy/text_encoders/qwen3vl.py` (215 lignes)
+- `comfy_extras/nodes_minimax_h3.py` (626 lignes) — nodes de sampling/latent
+- `comfy/supported_models.py::MiniMaxH3`, `comfy/model_base.py::MiniMaxH3`,
+  `comfy/latent_formats.py::MiniMaxH3AV`
 
-| Fichier | Contenu | Lignes | Effort |
-|---------|---------|--------|--------|
-| Investigation architecture (header safetensors, poids reels) | Prealable obligatoire | — | 0.5-1j |
-| `native/minimax_h3/model.py` | MiniMax H3 MLX | ? | ? |
-| `native/minimax_h3/config.py` + `weight_map.py` | Config + mapping de cles | ? | ? |
-| VAE MiniMax H3 | Via `comfy.sd.VAE` d'abord | ? | ? |
-| Encodeur texte | Via le `CLIPType` ComfyUI correspondant d'abord, si expose | ? | ? |
-| `sampler/core.py::_run_minimax_h3` | Boucle de denoising | ? | ? |
+**Investigation menee sur les checkpoints reels de l'utilisateur** (headers
+safetensors, `/Volumes/X10Pro/Images/models/`) :
 
-**Total phase 6 : a chiffrer apres investigation**
+- `diffusion_models/.../minimax_h3_fl2va_pruned_int8_convrot.safetensors` (21 Go,
+  variante `h3ErosMax_beta5_fp8.safetensors` en FP8, 14 Go) : DiT **single-stream**
+  de 50 blocs, hidden 5376, 56 tetes (head_dim 128), MLP SwiGLU (fc1 5376→28672
+  split en 2×14336, fc2 14336→5376). Quantifie en **INT8 tensorwise** (marqueur
+  `.comfy_quant` par tenseur + `.weight_scale`) — format deja reconnu par
+  `native/weight_format.py::classify_quant_format` (meme convention que les
+  checkpoints Flux.2/Krea2 deja portes), pas un nouveau format a gerer.
+  `token_refiner` (2 blocs, non quantifies) affine les tokens texte avant injection.
+  `adaln_t_table` [1025, 8] + `adaln_proj` par bloc (18 groupes de modulation/bloc)
+  pour un timestep discret. Tetes de sortie separees `video_out` (5376→96) et
+  `audio_out` (5376→32).
+- `vae/minimax_h3_video_vae_fp16.safetensors` : encodeur causal 3D-conv (`ch_mult`
+  jusqu'a 8, `use_3d_conv`), **decodeur ViT** (36 blocs, rope propre `rope_theta=100`,
+  `rope_dim_ratio=0.75`) — pas un decodeur convolutif classique. Latent 24 canaux,
+  ratio spatial 16, ratio temporel 4.
+- `vae/minimax_h3_audio_vae_fp32.safetensors` : encodeur/decodeur **BigVGAN**,
+  32kHz, latent 32 canaux.
+- `text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors` (27 Go) : Qwen3
+  standard (50 couches, GQA q/k/v 8192/1024/1024, MLP gate/up/down 5120↔25600) +
+  tour visuelle Qwen3-VL (naViT, deepstack merger). Meme quantification INT8
+  tensorwise. `condition_proj` du DiT projette 5120 (hidden Qwen3VL) → 5376.
+
+**Ce que ca change par rapport a l'estimation initiale :** l'architecture n'est
+pas un DiT image/video classique a la Wan — c'est un **flux unique text+audio+video
+packe** (`[text | cond | audio | video]`), avec deux schedules de sigma distincts
+(shift video 12.0 / shift audio 3.0, reconvertis en forme close dans `model.py`),
+un `ModelType.FLOW_AV` et un latent "nested" (`NestedTensor`, deux tenseurs de
+forme differente portes ensemble) cote ComfyUI. Rien de comparable n'existe dans
+`sampler/core.py` ou `sampler/scheduling.py` aujourd'hui — c'est un nouveau
+paradigme de sampling a ajouter, pas juste un nouveau `_run_xxx`.
+
+**Nodes ComfyUI reels, verifies sur le workflow de l'utilisateur**
+(`user/default/workflows/video_minimax_h3_t2v.json`, sous-graphe "Image to Video
+(MiniMax H3)", 21 nodes). Ca confirme precisement la surface a couvrir cote UI,
+en plus du moteur :
+
+- `comfy_extras/nodes_minimax_h3.py` expose 6 nodes `io.ComfyNode` (meme base
+  class que ce projet utilise deja) : `EmptyMiniMaxH3LatentAV` (23 lignes, latent
+  packe vide, calage sur la grille 17k+5 images a 24fps), `MiniMaxH3ImageToVideo`
+  (51 lignes — le node utilise dans le workflow reel : prompt + first/last frame
+  optionnels → conditioning + latent, logique fine mais courte, reutilise
+  `clip.tokenize`/`encode_from_tokens_scheduled` et `vae.encode` standard),
+  `MiniMaxH3SigmaShift` (45 lignes, patch de modele pour le double schedule).
+  **`MiniMaxH3AddGuide`, `MiniMaxH3ReferenceToVideo` (REF2VA) et les 3 nodes
+  `FunControlPatch`/`BlockPatch`/`FunControlNetApply` (ControlNet-style) sont
+  hors scope du premier port** — pas utilises dans le workflow t2v/i2v de base,
+  a traiter en increment separe (ControlNet est deja limite a FLUX.1 dans ce
+  projet, §0).
+- Le reste du workflow (`VAELoader`, `VAEDecode`, `VAEDecodeAudio`, `UNETLoader`,
+  `CLIPLoader`, `KSamplerSelect` (`res_multistep`), `BasicScheduler` (`simple`,
+  4 steps), `SamplerCustomAdvanced`, `RandomNoise`, `BasicGuider`, `CreateVideo`,
+  `SaveVideo`) sont des nodes ComfyUI core deja couverts par le pattern de bridge
+  existant, a l'exception de **`VAEDecodeAudio` et de la sortie audio en general
+  (`AUDIO`)** : premiere fois que ce projet doit emettre ce type. `CreateVideo`
+  (assemblage frames + audio en fichier video) est egalement nouveau.
+- Le `LoraLoaderModelOnly` du workflow pointe vers
+  `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors` (LoRA turbo deja
+  present dans `models/loras/`) — mapping de cles LoRA specifique a prevoir,
+  pas couvert par `lora.py` actuel (aucune famille MiniMax H3 dedans).
+- **Divergence relevee, non bloquante :** le `CLIPLoader` du workflow sauvegarde
+  reference `qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` (variante NVFP4+AWQ) —
+  **ce fichier n'existe pas sur le disque de l'utilisateur** (seuls l'INT8 25GB
+  et le GGUF Q4_K_M 17GB sont presents). A ignorer pour le dimensionnement tant
+  qu'il n'est pas obtenu ; NVFP4 n'est pas un format gere par
+  `native/weight_format.py` aujourd'hui si jamais il devient pertinent.
+
+| Fichier | Contenu | Lignes (ref. Comfy) | Effort |
+|---------|---------|---------------------|--------|
+| `native/minimax_h3/model.py` | DiT single-stream MLX, port fidele de `comfy/ldm/minimax/model.py` | 784 | 5-8j |
+| `native/minimax_h3/config.py` + `weight_map.py` | Config + mapping INT8 tensorwise (reutilise `weight_format.py`) | 250 | 1-2j |
+| `native/minimax_h3/text_encoder.py` | Qwen3 (+ tour visuelle Qwen3-VL) MLX ; aucun encodeur Qwen n'existe encore dans le projet (seul Krea2 a un encodeur natif) | 400-600 | 3-5j |
+| VAE video MiniMax H3 | Decodeur ViT + rope propre — `comfy.sd.VAE` d'abord, port MLX seulement si goulot | 300 | 1-2j |
+| VAE audio MiniMax H3 (BigVGAN) + sortie `AUDIO`/`CreateVideo` | Via `comfy.sd.VAE` d'abord ; premiere fois que ce projet emet de l'audio et assemble un fichier video | 200 | 1-2j |
+| `sampler/scheduling.py` | Double schedule sigma (video/audio) + conversion closed-form (port `MiniMaxH3SigmaShift`) | 150 | 1-2j |
+| `sampler/core.py::_run_minimax_h3` | Boucle de denoising sur flux packe text+audio+video (pas de precedent dans le projet) | 300-400 | 3-5j |
+| Nodes ASDX dedies (equivalents `EmptyMiniMaxH3LatentAV`, `MiniMaxH3ImageToVideo`) | Logique courte, reutilise le bridge CLIP/VAE existant | ~120 | 1-2j |
+| LoRA MiniMax H3 (mapping de cles, cf. `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`) | Nouvelle famille dans `lora.py` | — | 1-2j |
+| Verification numerique vs `comfy/ldm/minimax/model.py` (skill `verify-checkpoint` + `comfy-reference-diff`) | — | — | 1-2j |
+
+**Total phase 6 (t2va/fl2va + LoRA turbo, sans REF2VA/AddGuide/ControlNet) :
+18-30 jours** — plus lourd que Wan (6-10j) et Hunyuan (5-8j) reunis, a cause du
+flux audio+video joint et du nouvel encodeur Qwen3-VL. REF2VA, AddGuide et le
+ControlNet-style MiniMax H3 : effort supplementaire non chiffre, a evaluer une
+fois le t2va/fl2va de base valide.
+
+**Contrainte materielle cible : MacBook Pro M5 Max, 64GB de memoire unifiee.**
+Les checkpoints DiT de l'utilisateur pesent tous environ **20GB** (variante
+retenue : `..._pruned_int8_convrot`, INT8 tensorwise — `h3ErosMax_beta5_fp8`
+existe aussi en 13GB mais n'est pas la reference a dimensionner). Avec le texte
+encoder Qwen3-VL-32B a 25GB (INT8) et les VAE (4.9GB video + 0.6GB audio),
+**charger les trois etages en meme temps est exclu** (deja ~50GB de poids seuls,
+avant KV cache Qwen3-VL et activations DiT — pas de marge sur 64GB partages avec
+l'OS et ComfyUI). Consequence directe sur le design de `_run_minimax_h3` : le
+chargement sequentiel etage par etage (`loader.py` charge l'encodeur → encode →
+**libere** avant de charger le DiT → denoise → **libere** avant de charger le
+VAE → decode) n'est pas une optimisation facultative ici, c'est une condition
+de faisabilite. Chaque etage pris isolement (25GB encodeur, 20GB DiT, 5.5GB VAE)
+tient confortablement dans 64GB.
+
+**GGUF — requis a la fois pour le text encoder et le DiT (diffusion_models),
+et verifiable de bout en bout des maintenant.** Contrairement a ce qui avait ete
+dit precedemment dans cette session, **un GGUF MiniMax H3 pour le DiT existe
+bien en local** : `models/unet/MiniMax H3/minimax_h3_fl2va_pruned-Q5_0.gguf`
+(13Go). Header verifie directement avec le lecteur reel (voir ci-dessous) :
+532 tenseurs, **exactement la meme architecture que le safetensors** — 50 blocs
+principaux + 2 blocs `token_refiner`, memes noms/formes de tenseurs
+(`blocks.N.attn.qkv_proj.weight` etc.), les poids lineaires en **Q5_0** (`210`
+tenseurs) et les normes/adaLN en F16/BF16/F32 non quantifies. Q5_0 est un quant
+"legacy" simple (bloc de 32 valeurs, 5 bits + une seule echelle F16) — **pas un
+K-quant a superblocs**, plus simple a dequantifier que le Q4_K_M du text
+encoder. Avec le Qwen3-VL-32B Q4_K_M (17GB) deja present aussi, **les deux
+chemins (text encoder ET DiT) sont verifiables contre un vrai checkpoint des
+la premiere implementation** — plus de verification differee.
+
+**Reference d'implementation confirmee en local :**
+`/Volumes/X10Pro/ComfyUI/MBP2026/ComfyUI/custom_nodes/gguf` (paquet `calcuis/gguf`,
+PyPI `gguf-node`, ComfyUI Registry — pas le plus connu `city96/ComfyUI-GGUF`,
+mais un vrai node communautaire maintenu, 12800 lignes). Le lecteur de cette
+reference (`gguf_connector.reader.GGUFReader`) a ete utilise directement en
+session pour parser le fichier DiT reel et confirmer les 532 tenseurs ci-dessus
+— pas une lecture de code a l'aveugle, un test reel. Points utiles pour le
+portage MLX :
+
+- `gguf_connector/reader.py` + `gguf_connector/const.py` : lecteur de header GGUF
+  standard (magique, version, `GGMLQuantizationType`) — reprend le format du
+  paquet `gguf` officiel llama.cpp.
+- `gguf_connector/quant.py` (832 lignes) : dequantiseurs complets — legacy
+  `Q4_0`/`Q5_0`/`Q8_0` (blocs simples, **couvrent le DiT MiniMax H3 reel**) et
+  K-quant `Q4_K`/`Q5_K`/`Q6_K` (blocs a superblocs, **couvrent le text encoder
+  Q4_K_M reel**). Les deux familles de dequant sont necessaires — le DiT et le
+  text encoder n'utilisent pas le meme schema de quantification.
+- `pig.py::load_gguf_sd(path, handle_prefix='model.diffusion_model.')` : loader
+  dedie aux **diffusion_models** GGUF (le node `LoaderGGUF`), distinct du chemin
+  `ClipLoaderGGUF` utilise pour le text encoder. Confirme sur le fichier reel :
+  les noms de tenseurs GGUF du DiT correspondent tels quels a ceux du safetensors
+  (`blocks.N....`), donc `handle_prefix` s'applique proprement.
+  La reference charge les tenseurs quantifies en `GGMLTensor` (lazy, dequantifie
+  a la volee dans le forward via `lazy.py`) plutot que de tout dequantifier au
+  chargement — a evaluer si ce choix vaut la peine en MLX (memoire unifiee =
+  dequantifier une fois au chargement dans un `mx.array` est probablement plus
+  simple et suffisant vu la marge RAM calculee plus haut) ou si le lazy dequant
+  reste preferable pour limiter le pic memoire pendant le chargement lui-meme.
+
+**Etat du classifieur existant :** `native/weight_format.py::classify_quant_format`
+ne couvre que le safetensors (FP8_SCALED/FP4_PACKED/INT8_TENSORWISE) — GGUF est
+un conteneur binaire completement different (header llama.cpp, blocs a quant
+legacy ou K-quant) et demande un lecteur + un dequantizer dedies, branches a
+cote du classifieur existant plutot que dedans.
+
+| Fichier | Contenu | Effort |
+|---------|---------|--------|
+| Lecteur GGUF (header + tensor info) | Port MLX de `gguf_connector/reader.py` + `const.py` | 1-2j |
+| Dequantizer legacy (Q4_0/Q5_0/Q8_0) — cible DiT | Port MLX de `gguf_connector/quant.py`, verifie contre `minimax_h3_fl2va_pruned-Q5_0.gguf` reel | 1-2j |
+| Dequantizer K-quant (Q4_K/Q5_K/Q6_K) — cible text encoder | Port MLX, verifie contre `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` reel | 2-3j |
+| `native/minimax_h3/text_encoder.py` — chemin de chargement GGUF | Equivalent MLX de `ClipLoaderGGUF` ; verifie sur fichier reel | 1j |
+| `native/minimax_h3/model.py` — chemin de chargement GGUF (diffusion_models) | Equivalent MLX de `LoaderGGUF`/`load_gguf_sd(handle_prefix='model.diffusion_model.')` ; verifie sur fichier reel | 1-2j |
+| Branchement `loader.py` (routage GGUF vs safetensors par extension de fichier) | — | 0.5-1j |
+
+**Total support GGUF (text encoder + DiT, verifie de bout en bout) : 6.5-11.5
+jours supplementaires**, a ajouter au total Phase 6.
 
 ---
 
@@ -255,8 +408,8 @@ impliquerait un rope temporel et gonflerait fortement l'effort).
 | **3 — Wan 2.1** | Ouvert | **6-10j** |
 | **4 — Hunyuan** | Ouvert | **5-8j** |
 | **5 — PixArt / Ideogram / SVD** | Ouvert (Krea2 fait) | **6-7j** |
-| **6 — MiniMax H3** | Ouvert, a chiffrer | **a determiner** |
-| **TOTAL RESTANT** | | **~20-30j + Phase 6** |
+| **6 — MiniMax H3** | Ouvert, architecture investiguee | **25-42j** (18-30j t2va/fl2va+LoRA + 6.5-11.5j GGUF text encoder+DiT ; REF2VA/AddGuide/ControlNet en sus, non chiffre) |
+| **TOTAL RESTANT** | | **~45-72j** |
 
 ---
 
@@ -290,7 +443,7 @@ Regles:
 |--------|---------------------|--------------|---------------|
 | Wan 2.1 | 36GB | ~18GB | ~10GB |
 | Hunyuan | 16GB | ~6GB | ~4GB |
-| MiniMax H3 | ? (a mesurer apres investigation architecture) | ? | ? |
+| MiniMax H3 | **64GB (M5 Max de l'utilisateur), a condition de charger sequentiellement** | Poids sur disque : text encoder Qwen3-VL-32B INT8 25GB (ou GGUF Q4_K_M 17GB, a supporter — voir Phase 6), DiT INT8 `..._pruned_int8_convrot` ~20GB (variante de reference cote utilisateur), VAE video 4.9GB, VAE audio 0.6GB. **Chaque etage charge/libere a son tour** (encode texte → `mx.clear_cache()` → denoise → `mx.clear_cache()` → decode) — jamais les trois residents en meme temps. Pic reel ≈ encodeur texte + activations (~25-30GB en safetensors, ~17-22GB en GGUF), largement sous 64GB. Charger DiT+encodeur+VAE simultanement (chemin naif) depasserait le budget avec l'encodeur seul deja a 25GB. | non evalue |
 
 ---
 
@@ -393,10 +546,18 @@ qu'un faux positif).
 - [ ] Documentation a jour
 
 ### Phase 6 (MiniMax H3)
-- [ ] Architecture investiguee (header safetensors d'un vrai checkpoint)
-- [ ] Effort re-estime une fois l'architecture connue
+- [x] Architecture investiguee (headers safetensors des checkpoints reels + reference `comfy/ldm/minimax/`, 2026-09-14)
+- [x] Effort re-estime (25-42j : 18-30j t2va/fl2va+LoRA + 6.5-11.5j GGUF text encoder+DiT ; REF2VA/AddGuide/ControlNet en sus)
 - [ ] Profil `capability.py` + `native/minimax_h3/` crees
-- [ ] Passe la recette `verify-checkpoint`
+- [ ] Encodeur Qwen3-VL natif (`native/minimax_h3/text_encoder.py`)
+- [ ] Sortie audio (`AUDIO`) cablee — premiere fois dans ce projet
+- [ ] Chargement sequentiel encodeur → DiT → VAE verifie (pic RAM mesure < 64GB sur M5 Max, aucun etage resident en meme temps qu'un autre)
+- [x] Lecteur GGUF (header-only, `native/gguf/reader.py` + tests dans `tests/native/gguf/test_reader.py`) — verifie contre les deux fichiers reels (2026-09-15) : DiT `minimax_h3_fl2va_pruned-Q5_0.gguf` (532 tenseurs, 50+2 blocs, torch_shape identique au safetensors, 210 tenseurs Q5_0) et text encoder `qwen3vl_32b_minimax_h3-Q4_K_M.gguf` (902 tenseurs, meme structure que le safetensors, mix Q4_K/Q6_K — Q6_K sur `down_proj`/`v_proj`, coherent avec le schema "Q4_K_M" standard llama.cpp)
+- [ ] Dequantizer legacy (Q5_0) — cible DiT
+- [ ] Dequantizer K-quant (Q4_K + Q6_K, pas seulement Q4_K) — cible text encoder
+- [ ] Nodes ASDX dedies (`EmptyMiniMaxH3LatentAV`, `MiniMaxH3ImageToVideo`) portes depuis `comfy_extras/nodes_minimax_h3.py`
+- [ ] LoRA MiniMax H3 (mapping de cles) fonctionne avec `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`
+- [ ] Passe la recette `verify-checkpoint` + `comfy-reference-diff` contre `comfy/ldm/minimax/model.py`
 
 ### General
 - [ ] Tous les tests passes
@@ -410,11 +571,22 @@ qu'un faux positif).
 - Wan 2.1: https://github.com/Wan-Video/Wan2.1
 - Hunyuan DiT: https://github.com/Tencent/HunyuanDiT
 - PixArt Sigma: https://github.com/PixArt-alpha/PixArt-sigma
-- MiniMax H3: pas de source officielle verifiee dans cette session — reference
-  d'implementation la plus proche disponible localement : les packs tiers PyTorch/comfy
-  de "TJ NODE STUDIO ONE" (`ComfyUI-MiniMax-H3-Turbo`, `ComfyUI-Spectrum-MiniMax-H3`,
-  `ComfyUI-MiniMaxH3-Cache`, `ComfyUI-MiniMaxH3-FirstBlockCache`), a localiser sur la
-  machine avant de commencer l'investigation architecture (§5, Phase 6)
+- MiniMax H3 : reference d'implementation = ComfyUI lui-meme, deja a jour dans
+  l'installation locale (`comfy/ldm/minimax/model.py`, `comfy/text_encoders/minimax.py`
+  + `qwen3vl.py`, `comfy_extras/nodes_minimax_h3.py`) — meme statut que Wan/Hunyuan/
+  FLUX.2/Krea2 pour la regle CLAUDE.md "ComfyUI et le stack SceneWorks sont les
+  references". Verifie en session le 2026-09-14 (§5, Phase 6).
+- MiniMax H3 GGUF : reference d'implementation = `calcuis/gguf` (PyPI `gguf-node`,
+  https://github.com/calcuis/gguf), installe localement dans
+  `/Volumes/X10Pro/ComfyUI/MBP2026/ComfyUI/custom_nodes/gguf`. Lecteur + dequant
+  K-quant dans `gguf_connector/reader.py`, `const.py`, `quant.py` ; loader
+  diffusion_models dans `pig.py::load_gguf_sd`. Verifie en session le 2026-09-14.
+- MiniMax H3 nodes/workflow : `user/default/workflows/video_minimax_h3_t2v.json`
+  (installation ComfyUI locale) — workflow reel utilise par l'utilisateur, sous-graphe
+  "Image to Video (MiniMax H3)". A servi a identifier precisement les nodes
+  MiniMax H3 en scope (`EmptyMiniMaxH3LatentAV`, `MiniMaxH3ImageToVideo`,
+  `MiniMaxH3SigmaShift`) vs hors scope (`AddGuide`, `ReferenceToVideo`,
+  `FunControlPatch`/`BlockPatch`/`FunControlNetApply`).
 - MLX: https://ml-explore.github.io/mlx/
 - ComfyUI: https://github.com/comfyanonymous/ComfyUI (implementation de reference — voir le
   record de canon `ComfyUI and the SceneWorks stack are the reference implementations`)
