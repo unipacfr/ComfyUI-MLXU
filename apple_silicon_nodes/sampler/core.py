@@ -77,6 +77,7 @@ class _SamplerCore:
         # Low memory mode (DiffusionKit pattern)
         low_memory_mode: bool = False,
         # Krea2 Identity Edit
+        identity_edit: dict | None = None,
         source_latent: dict | None = None,
         source_image: torch.Tensor | None = None,
         vae: Any | None = None,
@@ -120,6 +121,7 @@ class _SamplerCore:
         self.noise_aug = noise_aug
         self.low_memory_mode = low_memory_mode
         # Krea2 Identity Edit
+        self.identity_edit = identity_edit
         self.source_latent = source_latent
         self.source_image = source_image
         self.vae = vae
@@ -999,6 +1001,14 @@ class _SamplerCore:
         The frame index in RoPE distinguishes source (frame=1) from target
         (frame=0) tokens for identity preservation.
         """
+        # ASDX_Krea2Edit (Task A1) pre-computes the source (fit + encode +
+        # whiten + pack) and stores it in the model dict. Prefer it over the
+        # legacy source_image / source_latent inputs, which stay as a documented
+        # fallback so saved workflows keep working unchanged.
+        if self.identity_edit is not None:
+            self._apply_identity_edit_dict(self.identity_edit)
+            return
+
         if self.source_image is not None and self.vae is not None:
             self._prepare_krea2_identity_edit_pixels()
             return
@@ -1016,54 +1026,94 @@ class _SamplerCore:
                 if hasattr(source_samples, "detach")
                 else np.asarray(source_samples, dtype=np.float32)
             )
-
-            source_np = self._fit_source_latent(
-                source_np, self.height // 8, self.width // 8
-            )
-
-            # Whiten into the model's internal Wan21 latent space -- matches
-            # comfy/model_base.py::Krea2.extra_conds's
-            # `latents.append(self.process_latent_in(lat))` for reference
-            # latents, and this project's own FLUX Kontext path
-            # (`_prepare_kontext_reference`), which applies
-            # `latent_formats.Flux().process_in(...)` for the same reason.
-            from ..native.config import process_wan21_latent_in
-
-            source_mlx = mx.array(source_np).astype(mx.float32)
-            source_mlx = process_wan21_latent_in(source_mlx)
-            mx.eval(source_mlx)
-            source_np = np.array(source_mlx, dtype=np.float32)
-
-            # [B, C, H, W] -> pack to [B, NH*NW, 64]
-            batch, channels, src_h, src_w = source_np.shape
-            packed = source_np.reshape(
-                batch, channels, src_h // 2, 2, src_w // 2, 2
-            )
-            packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
-            packed = packed.reshape(
-                batch, (src_h // 2) * (src_w // 2), channels * 4
-            )
-
-            precision = self.config.mlx_dtype
-            source_packed = mx.array(packed).astype(precision)
-            mx.eval(source_packed)
-
-            # The latent path fits onto the target's exact grid, so the ref grid
-            # equals the target grid -- no centered offset needed.
-            self._identity_edit_source = source_packed
-            self._identity_edit_src_grid = (src_h // 2, src_w // 2)
-            self._identity_edit_src_offset = (0, 0)
-
-            print(
-                f"[ASDX] Identity Edit: source latent packed "
-                f"[1, {src_h//2*src_w//2}, {channels*4}] grid={src_h//2}x{src_w//2}"
-            )
+            self._fit_whiten_pack_latent(source_np)
         except Exception as e:
             # Don't swallow this: a `source_latent` was explicitly wired in, so
             # silently disabling Identity Edit and continuing would run the full
             # (multi-minute) sampling pass while quietly ignoring the source
             # image -- a misleading "success" instead of a fast, clear failure.
             raise RuntimeError(f"ASDX: Identity Edit prep failed: {e}") from e
+
+    def _apply_identity_edit_dict(self, ie: dict) -> None:
+        """Apply a pre-computed ``identity_edit`` dict (from ASDX_Krea2Edit).
+
+        The dict carries the source latent, the token grid, the centered RoPE
+        offset, and the ref_boost. Two shapes (see ``ASDX_Krea2Edit``):
+
+        - ``fitted=True``: the node fitted the source to the target grid and
+          packed+whitened it — use ``source_latent`` directly.
+        - ``fitted=False``: no ``target_latent`` was wired, so the node encoded
+          the source at its own size (raw, unwhitened, unpacked). The sampler
+          knows the target grid the node couldn't, so fit + whiten + pack it
+          here (the same ``_fit_whiten_pack_latent`` the legacy latent path uses).
+        """
+        self.ref_boost = ie["ref_boost"]
+        src = ie["source_latent"]
+        if ie["fitted"]:
+            self._identity_edit_source = src
+            self._identity_edit_src_grid = ie["source_grid"]
+            self._identity_edit_src_offset = ie["src_offset"]
+            print(
+                f"[ASDX] Identity Edit: using ASDX_Krea2Edit source "
+                f"(fitted, grid={ie['source_grid']}, offset={ie['src_offset']})"
+            )
+            return
+        src_np = (
+            src.detach().cpu().float().numpy().astype(np.float32, copy=False)
+            if hasattr(src, "detach")
+            else np.asarray(src, dtype=np.float32)
+        )
+        self._fit_whiten_pack_latent(src_np)
+
+    def _fit_whiten_pack_latent(self, source_np: np.ndarray) -> None:
+        """Fit a raw ``[B, C, H, W]`` latent to the target grid, whiten, pack.
+
+        Sets ``_identity_edit_source`` / ``_identity_edit_src_grid`` /
+        ``_identity_edit_src_offset``. Shared by the legacy ``source_latent``
+        path and the unfitted ``identity_edit`` dict — both carry a raw latent
+        that needs the same fit + whiten + pack.
+        """
+        source_np = self._fit_source_latent(
+            source_np, self.height // 8, self.width // 8
+        )
+
+        # Whiten into the model's internal Wan21 latent space -- matches
+        # comfy/model_base.py::Krea2.extra_conds's
+        # `latents.append(self.process_latent_in(lat))` for reference
+        # latents, and this project's own FLUX Kontext path
+        # (`_prepare_kontext_reference`), which applies
+        # `latent_formats.Flux().process_in(...)` for the same reason.
+        from ..native.config import process_wan21_latent_in
+
+        source_mlx = mx.array(source_np).astype(mx.float32)
+        source_mlx = process_wan21_latent_in(source_mlx)
+        mx.eval(source_mlx)
+        source_np = np.array(source_mlx, dtype=np.float32)
+
+        # [B, C, H, W] -> pack to [B, NH*NW, 64]
+        batch, channels, src_h, src_w = source_np.shape
+        packed = source_np.reshape(
+            batch, channels, src_h // 2, 2, src_w // 2, 2
+        )
+        packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
+        packed = packed.reshape(
+            batch, (src_h // 2) * (src_w // 2), channels * 4
+        )
+
+        precision = self.config.mlx_dtype
+        source_packed = mx.array(packed).astype(precision)
+        mx.eval(source_packed)
+
+        # The latent path fits onto the target's exact grid, so the ref grid
+        # equals the target grid -- no centered offset needed.
+        self._identity_edit_source = source_packed
+        self._identity_edit_src_grid = (src_h // 2, src_w // 2)
+        self._identity_edit_src_offset = (0, 0)
+
+        print(
+            f"[ASDX] Identity Edit: source latent packed "
+            f"[{batch}, {src_h//2*src_w//2}, {channels*4}] grid={src_h//2}x{src_w//2}"
+        )
 
     def _prepare_krea2_identity_edit_pixels(self) -> None:
         """Pixel-space source prep (the blur-proof path), matching
@@ -1243,7 +1293,8 @@ class _SamplerCore:
         # Source latent prepending for Identity Edit
         has_latent = self.source_latent is not None and self.source_latent.get("samples") is not None
         has_pixels = self.source_image is not None and self.vae is not None
-        if has_latent or has_pixels:
+        has_identity_edit = self.identity_edit is not None
+        if has_latent or has_pixels or has_identity_edit:
             self._prepare_krea2_identity_edit()
 
         src_tokens = getattr(self, "_identity_edit_source", None)

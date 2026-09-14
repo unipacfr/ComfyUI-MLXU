@@ -168,6 +168,14 @@ class ASDX_MLXSampler(io.ComfyNode):
         # the legacy ASDX_LORA_SCHEDULE input above (no node produces that
         # type) -- read it from there, keeping the legacy param as a fallback.
         lora_schedule = model.get("lora_schedule") or lora_schedule
+        # ASDX_Krea2Edit (Task A1) pre-computes the Identity Edit source and
+        # stores it in the model dict. Read it from there, in priority over the
+        # legacy source_latent / source_image inputs below (which stay as a
+        # documented fallback so saved workflows keep working).
+        identity_edit = model.get("identity_edit")
+        if identity_edit is not None and (source_latent is not None or source_image is not None):
+            print("[ASDX] Identity Edit: both ASDX_Krea2Edit and legacy source_latent/"
+                  "source_image inputs are wired -- ASDX_Krea2Edit wins.")
 
         # Diagnostic: snapshot memory at the very start of every generation
         # (this node always re-executes, unlike loader/LoRA nodes which may
@@ -262,6 +270,7 @@ class ASDX_MLXSampler(io.ComfyNode):
             depth_strength=depth_strength,
             noise_aug=noise_aug,
             # Krea2 Identity Edit
+            identity_edit=identity_edit,
             source_latent=source_latent,
             source_image=source_image,
             vae=vae,
