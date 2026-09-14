@@ -253,3 +253,57 @@ def curve_time_embedding(table: mx.array, t_vals: mx.array) -> mx.array:
     row0 = table[i0]
     row1 = table[i0 + 1]
     return row0 + frac * (row1 - row0)
+
+
+class FinalLayer(nn.Module):
+    """adaLN-modulated final norm + separate video/audio output heads.
+
+    The reference's `FinalLayer` also implements a "PDD head bank" (multiple
+    output-head weight sets blended by how far the current denoising step
+    spans the timeline) when `video_out.weight.shape[0] // video_out.
+    out_features > 1`. Not implemented here: the real checkpoints this
+    project targets have exactly one head (`n == 1`, see config.py), so that
+    branch is dead code for them -- see module docstring's scope note."""
+
+    def __init__(self, hidden: int, t_dim: int, video_dim: int, audio_dim: int, eps: float):
+        super().__init__()
+        self.norm = RMSNorm(hidden, eps=eps)
+        self.adaln_proj = AdalnProj(t_dim, hidden, expand=2, modalities=1, apply_silu=False)
+        self.video_out = nn.Linear(hidden, video_dim, bias=True)
+        self.audio_out = nn.Linear(hidden, audio_dim, bias=True)
+
+    def __call__(
+        self,
+        x: mx.array,
+        t_emb: mx.array,
+        video_seg: tuple[int, int, int],
+        audio_seg: tuple[int, int, int],
+    ) -> tuple[mx.array, mx.array]:
+        shift, scale = self.adaln_proj(t_emb)
+
+        def mod(seg: tuple[int, int, int]) -> mx.array:
+            a, b, row = seg
+            return self.norm(x[a:b]) * (1.0 + scale[row]) + shift[row]
+
+        return self.video_out(mod(video_seg)), self.audio_out(mod(audio_seg))
+
+
+def build_mod_segments(
+    segments: list[tuple[int, int, str]], t_video: float, t_audio: float
+) -> tuple[list[tuple[int, int, int]], list[float]]:
+    """Assigns each packed-sequence segment a modulation row `t_row[t] * 3 +
+    tag` (`tag`: video=0, text=1, audio=2 -- fixed, matching every real
+    caller in the reference) and returns the sorted list of unique timestep
+    values those rows index into (feed to `curve_time_embedding`/
+    `AdalnProj` as `t_emb`'s `M` rows).
+
+    Minimal-path restriction (see module docstring): no denoise masks, no
+    mixed text-token tags -- every row of a given segment shares one
+    timestep, matching `comfy/ldm/minimax/model.py::MiniMaxH3Model._forward`'s
+    `seg_t = {"text": t_v, "video": t_v, "audio": t_a}` for the same case."""
+    seg_t = {"text": t_video, "video": t_video, "audio": t_audio}
+    seg_tag = {"video": 0, "text": 1, "audio": 2}
+    unique_t = sorted({t_video, t_audio})
+    t_row = {t: i for i, t in enumerate(unique_t)}
+    mod_segments = [(a, b, t_row[seg_t[kind]] * 3 + seg_tag[kind]) for a, b, kind in segments]
+    return mod_segments, unique_t
