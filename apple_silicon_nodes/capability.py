@@ -117,6 +117,13 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         requires=frozenset(),
         supports_depth=True,
         supports_controlnet=False,
+        # latent_channels=16 is the OUTPUT latent (what ASDX_VAEDecode expects
+        # back), not the transformer's img_in input width. The transformer's
+        # in_channels is 32 unpacked / 128 packed (16 noise + 16 depth-latent
+        # channels), detected dynamically from the checkpoint's own
+        # img_in.weight shape by native/weight_map.py::detect_flux_in_channels
+        # -- these are two different numbers; do not "fix" one to match the
+        # other.
         latent_channels=16,
     ),
     # Covers both Klein (Qwen3 text encoder, no guidance embed on this
