@@ -200,3 +200,33 @@ class TokenRefiner(nn.Module):
         for block in self.blocks:
             x = block(x)
         return self.final_norm(x)
+
+
+class DiTBlock(nn.Module):
+    """One main-stack block: adaLN-modulated pre-norm attention (rope-carrying)
+    + adaLN-modulated pre-norm SwiGLU MLP, both gated residual adds.
+    `rot_dim` defaults to `head_dim` (attention_head_dim) since MiniMax H3's
+    real checkpoint always rotates 96 of 128 head dims -- callers pass the
+    config's actual value rather than relying on this default in practice."""
+
+    def __init__(self, hidden: int, heads: int, head_dim: int, ffn: int, t_dim: int, eps: float, qk_eps: float, rot_dim: int | None = None):
+        super().__init__()
+        self.norm1 = RMSNorm(hidden, eps=eps)
+        self.norm2 = RMSNorm(hidden, eps=eps)
+        self.attn = Attention(hidden, heads, head_dim, qk_eps, rot_dim=rot_dim if rot_dim is not None else head_dim)
+        self.mlp = MLP(hidden, ffn)
+        self.adaln_proj = AdalnProj(t_dim, hidden, expand=6, modalities=3, apply_silu=False)
+
+    def __call__(
+        self,
+        x: mx.array,
+        t_emb: mx.array,
+        mod_segments: list[tuple[int, int, int]],
+        cos: mx.array,
+        sin: mx.array,
+    ) -> mx.array:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
+        h = mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
+        x = mod_gate(x, gate_msa, self.attn(h, cos=cos, sin=sin), mod_segments)
+        h = mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
+        return mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
