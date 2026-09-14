@@ -548,7 +548,8 @@ qu'un faux positif).
 ### Phase 6 (MiniMax H3)
 - [x] Architecture investiguee (headers safetensors des checkpoints reels + reference `comfy/ldm/minimax/`, 2026-09-14)
 - [x] Effort re-estime (25-42j : 18-30j t2va/fl2va+LoRA + 6.5-11.5j GGUF text encoder+DiT ; REF2VA/AddGuide/ControlNet en sus)
-- [ ] Profil `capability.py` + `native/minimax_h3/` crees
+- [x] `native/minimax_h3/config.py` : detection d'architecture (`detect_minimax_h3_config`) verifiee sur les headers reels des deux formats (safetensors + GGUF), config identique des deux cotes
+- [ ] Profil `capability.py` + le reste de `native/minimax_h3/` (model.py, weight_map.py, text_encoder.py) crees
 - [ ] Encodeur Qwen3-VL natif (`native/minimax_h3/text_encoder.py`)
 - [ ] Sortie audio (`AUDIO`) cablee — premiere fois dans ce projet
 - [ ] Chargement sequentiel encodeur → DiT → VAE verifie (pic RAM mesure < 64GB sur M5 Max, aucun etage resident en meme temps qu'un autre)
