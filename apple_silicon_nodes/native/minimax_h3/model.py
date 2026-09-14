@@ -100,3 +100,22 @@ class Attention(nn.Module):
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
         out = out[0].transpose(1, 0, 2).reshape(s, inner)
         return self.out_proj(out)
+
+
+class MLP(nn.Module):
+    """SwiGLU MLP: `fc1` projects to `2*ffn` (gate + value, first half is the
+    gate), `fc2` projects the gated `ffn`-wide result back to `hidden`.
+    Matches `comfy.ops.linear_input_act(fc2, fc1(x), "swiglu")` via its
+    `_swiglu_eager` implementation (`comfy/ops.py:947`):
+    `gate, up = x.chunk(2, dim=-1); return silu(gate) * up`."""
+
+    def __init__(self, hidden: int, ffn: int):
+        super().__init__()
+        self.fc1 = nn.Linear(hidden, ffn * 2, bias=False)
+        self.fc2 = nn.Linear(ffn, hidden, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        h = self.fc1(x)
+        ffn = h.shape[-1] // 2
+        gate, up = h[..., :ffn], h[..., ffn:]
+        return self.fc2(nn.silu(gate) * up)
