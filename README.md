@@ -83,6 +83,7 @@ from the safetensors header marker keys, never guessed from dtype alone.
 |------|-------------|
 | `🍏 ASDX CLIP Text Encode` | Encode prompts (T5+CLIP for FLUX-family, CLIP-only for SDXL); optional image-grounded encoding for Krea2 (Identity Edit) |
 | `🍏 ASDX Conditioning Merger` | Merge conditioning inputs |
+| `🍏 ASDX Krea2 Identity Edit` | Krea2-only: apply the Identity Edit LoRA and prepare the source (pixel-space fit + VAE encode + whiten + pack). Emits the model dict; the sampler consumes it in priority over its legacy `source_latent`/`source_image` inputs |
 
 ### Sampling
 | Node | Description |
@@ -97,14 +98,22 @@ sampling.py`, `comfy/samplers.py`) and verified numerically against them.
 TeaCache/SeaCache require `sampler_name` in `euler`/`ddim` (their step-skip
 heuristic assumes a single, stateless model call per step).
 
-Krea2 Identity Edit: wire the VAE-encoded source into `source_latent` (not
-`latent_image`, which only sets the output resolution). The source is fitted
-onto the target's latent grid automatically -- center-crop to the target aspect,
-then resize -- matching comfyui-krea2edit's `_fit_src` and SceneWorks'
-`fit_edit_references`. Training put source and target on the same grid, and an
-oversized source also crowds the sequence, weakening prompt adherence.
-`ref_boost` dials target->source attention (1.0 = off; the reference workflow
-ships 4.0 for strong likeness).
+Krea2 Identity Edit: the recommended path is the dedicated
+`🍏 ASDX Krea2 Identity Edit` node — wire your source **image** + the VAE into
+it, and its `model` output into `ASDX_MLXSampler`. It applies the Identity Edit
+LoRA and fits the source in **pixel space** (contain + /16 floor + bicubic, or a
+minimal center-crop when the AR nearly matches), then VAE-encodes, whitens, and
+packs it — the exact geometry the v1_2 LoRA was trained with and what
+comfyui-krea2edit's `fit` mode does. The sampler reads the prepared source from
+the model dict in priority over its legacy inputs.
+
+The sampler's legacy `source_latent` / `source_image` + `vae` inputs still work
+(unchanged) for saved workflows: `source_latent` is fitted onto the target's
+latent grid (center-crop + resize), `source_image` + `vae` runs the pixel path.
+If both the node and a legacy input are wired, the node wins (a log line says
+so). `ref_boost` dials target→source attention (1.0 = off; the reference
+workflow ships 4.0 for strong likeness) — set it on the node, or on the sampler
+for the legacy path.
 
 ### Latent / VAE
 | Node | Description |
