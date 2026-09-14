@@ -52,6 +52,7 @@ _DISPLAY = {
     "ASDX_Krea2Edit": "🍏 ASDX Krea2 Identity Edit",
     "ASDX_Krea2GroundedEncode": "🍏 ASDX Krea2 Grounded Encode",
     "ASDX_DepthConditioning": "🍏 ASDX Depth Conditioning",
+    "ASDX_KontextReference": "🍏 ASDX Kontext Reference",
     # LoRA
     "ASDX_LoraLoader": "🍏 ASDX LoRA Loader",
     "ASDX_MultiLoraLoader": "🍏 ASDX Multi LoRA Loader",
@@ -80,6 +81,7 @@ try:
     from .krea2_edit import NODE_LIST as _krea2_edit_nodes
     from .krea2_grounded_encode import NODE_LIST as _krea2_grounded_encode_nodes
     from .depth_conditioning import NODE_LIST as _depth_conditioning_nodes
+    from .kontext_reference import NODE_LIST as _kontext_reference_nodes
 
     # Optional: image chain, depth map, live preview
     try:
@@ -108,6 +110,7 @@ try:
         *_krea2_edit_nodes,
         *_krea2_grounded_encode_nodes,
         *_depth_conditioning_nodes,
+        *_kontext_reference_nodes,
         *_chain_nodes,
         *_depth_nodes,
         *_preview_nodes,

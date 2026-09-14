@@ -186,6 +186,20 @@ class ASDX_MLXSampler(io.ComfyNode):
             print("[ASDX] Depth: both ASDX_DepthConditioning and the legacy "
                   "depth_image input are wired -- ASDX_DepthConditioning wins.")
 
+        # ASDX_KontextReference (Phase E) stores its reference latent + strength
+        # in the model dict. Read it in priority over the sampler's own
+        # kontext/kontext_reference_latent/kontext_reference_strength inputs,
+        # which stay as a documented fallback so saved workflows keep working.
+        kontext_cfg = model.get("kontext")
+        if kontext_cfg is not None:
+            if kontext_reference_latent is not None:
+                print("[ASDX] Kontext: both ASDX_KontextReference and the legacy "
+                      "kontext_reference_latent input are wired -- "
+                      "ASDX_KontextReference wins.")
+            kontext = True
+            kontext_reference_latent = kontext_cfg["reference_latent"]
+            kontext_reference_strength = kontext_cfg["strength"]
+
         # Diagnostic: snapshot memory at the very start of every generation
         # (this node always re-executes, unlike loader/LoRA nodes which may
         # be cache-hit) -- lets us see whether the floor left over from the
