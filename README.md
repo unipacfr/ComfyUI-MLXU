@@ -81,9 +81,10 @@ from the safetensors header marker keys, never guessed from dtype alone.
 ### Conditioning
 | Node | Description |
 |------|-------------|
-| `🍏 ASDX CLIP Text Encode` | Encode prompts (T5+CLIP for FLUX-family, CLIP-only for SDXL); optional image-grounded encoding for Krea2 (Identity Edit) |
+| `🍏 ASDX CLIP Text Encode` | Encode prompts (T5+CLIP for FLUX-family, CLIP-only for SDXL) |
 | `🍏 ASDX Conditioning Merger` | Merge conditioning inputs |
 | `🍏 ASDX Krea2 Identity Edit` | Krea2-only: apply the Identity Edit LoRA and prepare the source (pixel-space fit + VAE encode + whiten + pack). Emits the model dict; the sampler consumes it in priority over its legacy `source_latent`/`source_image` inputs |
+| `🍏 ASDX Krea2 Grounded Encode` | Krea2-only: encode a prompt alongside a source image through the CLIP's vision tower (image-grounded conditioning), matching the krea2_edit LoRA's training-time conditioning. Requires a Krea2 `mlx_clip` |
 
 ### Sampling
 | Node | Description |
@@ -192,7 +193,7 @@ comfy's own OOM fallback recognises neither on Apple Silicon.
 - **Multi-LoRA Stacking**: Up to 5 LoRAs applied simultaneously with strength scheduling
 - **Kontext KV Cache**: Reference image tokens cached and injected into transformer attention layers
 - **Quantized checkpoints**: FP8_SCALED and INT8 ConvRot/tensorwise dequantized on load
-- **Krea2 image-grounded encoding**: prompt is encoded alongside a source image through the CLIP's vision tower, matching the krea2_edit LoRA's training-time conditioning
+- **Krea2 image-grounded encoding** (`🍏 ASDX Krea2 Grounded Encode`): prompt is encoded alongside a source image through the CLIP's vision tower, matching the krea2_edit LoRA's training-time conditioning
 
 ## Comparison with SDMLX
 
