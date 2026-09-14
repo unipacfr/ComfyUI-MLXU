@@ -50,6 +50,7 @@ _DISPLAY = {
     # Conditioning
     "ASDX_ConditioningMerger": "🍏 ASDX Conditioning Merger",
     "ASDX_Krea2Edit": "🍏 ASDX Krea2 Identity Edit",
+    "ASDX_Krea2GroundedEncode": "🍏 ASDX Krea2 Grounded Encode",
     # LoRA
     "ASDX_LoraLoader": "🍏 ASDX LoRA Loader",
     "ASDX_MultiLoraLoader": "🍏 ASDX Multi LoRA Loader",
@@ -76,6 +77,7 @@ try:
     from .memory import NODE_LIST as _mem_nodes
     from .lora import NODE_LIST as _lora_nodes
     from .krea2_edit import NODE_LIST as _krea2_edit_nodes
+    from .krea2_grounded_encode import NODE_LIST as _krea2_grounded_encode_nodes
 
     # Optional: image chain, depth map, live preview
     try:
@@ -102,6 +104,7 @@ try:
         *_mem_nodes,
         *_lora_nodes,
         *_krea2_edit_nodes,
+        *_krea2_grounded_encode_nodes,
         *_chain_nodes,
         *_depth_nodes,
         *_preview_nodes,
