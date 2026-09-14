@@ -76,7 +76,7 @@ import numpy as np
 
 # Re-export config from submodule
 from .config import FluxConfig  # noqa: E402
-from .weight_map import normalize_flux_keys, map_flux_to_native  # noqa: E402
+from .weight_map import normalize_flux_keys, map_flux_to_native, detect_flux_in_channels  # noqa: E402
 
 
 # ── Constants ─────────────────────────────────────────────────────────
@@ -452,7 +452,7 @@ class FluxTransformer(nn.Module):
         self.dtype = config.mlx_dtype
 
         # Input projections
-        self.img_in = nn.Linear(64, HIDDEN_DIM)
+        self.img_in = nn.Linear(config.in_channels, HIDDEN_DIM)
         self.txt_in = nn.Linear(CONTEXT_IN_DIM, HIDDEN_DIM)
 
         # Time / vector / guidance embedding (MLPEmbedder: in -> hidden -> SiLU -> hidden)
@@ -939,8 +939,9 @@ def load_transformer(
     # everything else keeps the checkpoint's own double_blocks/single_blocks layout).
     normalized = normalize_flux_keys(state)
     normalized = map_flux_to_native(normalized)
+    detected_in_channels = detect_flux_in_channels(normalized)
 
-    config = FluxConfig(dtype=dtype)
+    config = FluxConfig(dtype=dtype, in_channels=detected_in_channels)
     model = FluxTransformer(config)
 
     # Assign weights via tree_unflatten: navigating attribute-by-attribute and

@@ -24,6 +24,8 @@ class FluxConfig:
         num_heads: Number of attention heads (24 for FLUX.1)
         guidance_embed: Whether the model includes guidance embedding (dev=True, schnell=False)
         dtype: MLX dtype string ("float16" or "bfloat16")
+        in_channels: img_in's input width (64 = plain FLUX.1; 128 = depth/canny
+            dev variants, detected from the checkpoint's own img_in.weight shape)
     """
     num_double_blocks: int = 19
     num_single_blocks: int = 38
@@ -32,6 +34,7 @@ class FluxConfig:
     num_heads: int = 24
     guidance_embed: bool = True
     dtype: str = "float16"
+    in_channels: int = 64
 
     @property
     def mlx_dtype(self) -> mx.Dtype:

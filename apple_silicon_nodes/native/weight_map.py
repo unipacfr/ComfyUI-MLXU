@@ -70,6 +70,18 @@ def normalize_flux_keys(
     return normalized
 
 
+def detect_flux_in_channels(normalized: dict[str, mx.array]) -> int:
+    """Read img_in's real input width from the checkpoint, mirroring
+    comfy/model_base.py::Flux.concat_cond's own try/except on the live
+    weight shape. 64 = plain FLUX.1 (16ch * 2x2 patch); 128 = depth/canny
+    dev variants (32ch: 16 noise + 16 depth-or-canny latent).
+    """
+    weight = normalized.get("img_in.weight")
+    if weight is None:
+        return 64
+    return int(weight.shape[1])
+
+
 def map_flux_to_native(state_dict: dict[str, mx.array]) -> dict[str, mx.array]:
     """Map a normalized FLUX.1 (BFL-native) state dict to our module naming.
 
