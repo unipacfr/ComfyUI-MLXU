@@ -85,6 +85,9 @@ from the safetensors header marker keys, never guessed from dtype alone.
 | `🍏 ASDX Conditioning Merger` | Merge conditioning inputs |
 | `🍏 ASDX Krea2 Identity Edit` | Krea2-only: apply the Identity Edit LoRA and prepare the source (pixel-space fit + VAE encode + whiten + pack). Emits the model dict; the sampler consumes it in priority over its legacy `source_latent`/`source_image` inputs |
 | `🍏 ASDX Krea2 Grounded Encode` | Krea2-only: encode a prompt alongside a source image through the CLIP's vision tower (image-grounded conditioning), matching the krea2_edit LoRA's training-time conditioning. Requires a Krea2 `mlx_clip` |
+| `🍏 ASDX Depth Conditioning` | flux1_depth-only: validate and stage a depth map + VAE for depth-control generation. Emits the model dict; the sampler consumes it (`depth_cond`) in priority over its legacy `depth_image`/`depth_strength` inputs |
+| `🍏 ASDX Kontext Reference` | Attach a Kontext reference latent + strength to the model dict. The sampler consumes it (`kontext`) in priority over its legacy `kontext`/`kontext_reference_latent`/`kontext_reference_strength` inputs |
+| `🍏 ASDX Latent Noise Prep` | Validate and mode-tag img2img/inpaint/fill ingredients (`mode`/`image`/`mask`/`image_strength`/`mask_blur`/`mask_padding`). Emits the model dict; the sampler consumes it (`latent_prep`) in priority over its own same-named inputs (no schema removal — full backward compatibility) |
 
 ### Sampling
 | Node | Description |
