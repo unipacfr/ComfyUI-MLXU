@@ -177,6 +177,15 @@ class ASDX_MLXSampler(io.ComfyNode):
             print("[ASDX] Identity Edit: both ASDX_Krea2Edit and legacy source_latent/"
                   "source_image inputs are wired -- ASDX_Krea2Edit wins.")
 
+        # ASDX_DepthConditioning (Phase D) pre-validates the capability and
+        # stores its raw ingredients in the model dict. Read it in priority
+        # over the legacy depth_image/depth_strength inputs, which stay as a
+        # documented fallback so saved workflows keep working.
+        depth_cond = model.get("depth_cond")
+        if depth_cond is not None and depth_image is not None:
+            print("[ASDX] Depth: both ASDX_DepthConditioning and the legacy "
+                  "depth_image input are wired -- ASDX_DepthConditioning wins.")
+
         # Diagnostic: snapshot memory at the very start of every generation
         # (this node always re-executes, unlike loader/LoRA nodes which may
         # be cache-hit) -- lets us see whether the floor left over from the
@@ -268,6 +277,7 @@ class ASDX_MLXSampler(io.ComfyNode):
             mask_padding=mask_padding,
             depth_image=depth_image,
             depth_strength=depth_strength,
+            depth_cond=depth_cond,
             noise_aug=noise_aug,
             # Krea2 Identity Edit
             identity_edit=identity_edit,

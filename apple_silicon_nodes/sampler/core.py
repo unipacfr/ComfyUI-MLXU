@@ -73,6 +73,7 @@ class _SamplerCore:
         mask_padding: int = 48,
         depth_image: torch.Tensor | None = None,
         depth_strength: float = 1.0,
+        depth_cond: dict | None = None,
         noise_aug: float = 0.0,
         # Low memory mode (DiffusionKit pattern)
         low_memory_mode: bool = False,
@@ -118,6 +119,7 @@ class _SamplerCore:
         self.mask_padding = mask_padding
         self.depth_image = depth_image
         self.depth_strength = depth_strength
+        self.depth_cond = depth_cond
         self.noise_aug = noise_aug
         self.low_memory_mode = low_memory_mode
         # Krea2 Identity Edit
@@ -695,7 +697,7 @@ class _SamplerCore:
 
         has_image = self.image is not None and self.image.numel() > 0
         has_mask = self.mask is not None and self.mask.numel() > 0
-        has_depth = (
+        has_depth = self.depth_cond is not None or (
             self.depth_image is not None and self.depth_image.numel() > 0
         )
 
@@ -884,10 +886,18 @@ class _SamplerCore:
         on every `predict()` call this run.
         """
         self._depth_concat = None
-        if self.depth_image is None or self.vae is None:
+        if self.depth_cond is not None:
+            depth_image = self.depth_cond["depth_image"]
+            vae = self.depth_cond["vae"]
+            strength = self.depth_cond["strength"]
+        else:
+            depth_image = self.depth_image
+            vae = self.vae
+            strength = self.depth_strength
+        if depth_image is None or vae is None:
             return self.noise
         try:
-            samples = self.vae.encode(self.depth_image)
+            samples = vae.encode(depth_image)
             depth_np = (
                 samples.detach().cpu().float().numpy().astype(np.float32, copy=False)
                 if hasattr(samples, "detach")
@@ -899,7 +909,7 @@ class _SamplerCore:
             packed = depth_np.reshape(batch, channels, depth_h // 2, 2, depth_w // 2, 2)
             packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
             packed = packed.reshape(batch, (depth_h // 2) * (depth_w // 2), channels * 4)
-            packed = packed * self.depth_strength
+            packed = packed * strength
 
             depth_mlx = mx.array(packed).astype(self.config.mlx_dtype)
             mx.eval(depth_mlx)
