@@ -119,3 +119,51 @@ class MLP(nn.Module):
         ffn = h.shape[-1] // 2
         gate, up = h[..., :ffn], h[..., ffn:]
         return self.fc2(nn.silu(gate) * up)
+
+
+class AdalnProj(nn.Module):
+    """Projects a per-unique-timestep embedding `t_emb` (`[M, t_dim]`) into
+    `expand` modulation tensors, each `[M * modalities, hidden]` -- one row
+    per (unique timestep, modality) pair. `modalities` is 3 for `DiTBlock`
+    (video=0, text=1, audio=2 -- fixed tags every caller here uses) and 1 for
+    `FinalLayer`. `apply_silu` is False for the curve-form adaln this project
+    has a real checkpoint for (`curve["apply_silu"] = not use_adaln_curves`
+    in `comfy/ldm/minimax/model.py::MiniMaxH3Model.__init__` -- the plain
+    `TimeEmbedder` variant would set it True, out of scope here, see
+    config.py's module docstring)."""
+
+    def __init__(self, t_dim: int, hidden: int, expand: int, modalities: int, apply_silu: bool = False):
+        super().__init__()
+        self.expand = expand
+        self.modalities = modalities
+        self.hidden = hidden
+        self.apply_silu = apply_silu
+        self.linear = nn.Linear(t_dim, expand * hidden * modalities, bias=True)
+
+    def __call__(self, t_emb: mx.array) -> tuple[mx.array, ...]:
+        x = self.linear(nn.silu(t_emb) if self.apply_silu else t_emb)
+        m = x.shape[0]
+        x = x.reshape(m * self.modalities, self.expand * self.hidden)
+        return tuple(mx.split(x, self.expand, axis=-1))
+
+
+def mod_scale_shift(h: mx.array, shift: mx.array, scale: mx.array, segments: list[tuple[int, int, int]]) -> mx.array:
+    """`h[a:b] = h[a:b] * (1 + scale[row]) + shift[row]` per segment, ported
+    from `_mod_scale_shift`. MLX arrays are immutable, so this rebuilds `h`
+    from per-segment slices instead of the reference's in-place `.mul_`/
+    `.add_` -- same math, different (functional) execution style. `segments`
+    covers `h` contiguously and in order (guaranteed by `PackedLayout`), so
+    concatenating the rebuilt slices reproduces `h`'s original row order."""
+    pieces = []
+    for a, b, row in segments:
+        pieces.append(h[a:b] * (1.0 + scale[row]) + shift[row])
+    return mx.concatenate(pieces, axis=0)
+
+
+def mod_gate(x: mx.array, gate: mx.array, other: mx.array, segments: list[tuple[int, int, int]]) -> mx.array:
+    """`x[a:b] += other[a:b] * gate[row]` per segment, ported from
+    `_mod_gate` (same functional-rebuild adaptation as `mod_scale_shift`)."""
+    pieces = []
+    for a, b, row in segments:
+        pieces.append(x[a:b] + other[a:b] * gate[row])
+    return mx.concatenate(pieces, axis=0)
