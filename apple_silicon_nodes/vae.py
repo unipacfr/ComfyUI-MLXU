@@ -321,8 +321,79 @@ class ASDX_VAEEncode(io.ComfyNode):
         return latent
 
 
+# ── VAE Decode Audio ─────────────────────────────────────────────────
+
+class ASDX_VAEDecodeAudio(io.ComfyNode):
+    """Decode an audio latent (e.g. MiniMax H3's audio stream) to a
+    waveform. First AUDIO-type output in this project -- everything else so
+    far has been IMAGE/video. Mirrors ComfyUI's own generic
+    `comfy_extras.nodes_audio.VAEDecodeAudio`/`vae_decode_audio` exactly
+    (not MiniMax-H3-specific: any audio VAE works here), including its
+    post-decode std-normalization (avoids clipping without changing the
+    audio VAE's own output convention) and the `is_nested`-latent unwrap
+    for ComfyUI's own packed audio+video latents -- our own MiniMax H3
+    pipeline emits separate video/audio latent dicts rather than a packed
+    NestedTensor, so `is_nested` is always False for latents this project's
+    own samplers produce, but real-world AUDIO latents saved by other tools
+    could still arrive packed.
+    """
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_VAEDecodeAudio",
+            display_name="🍏 ASDX VAE Decode Audio",
+            category="ASDX/Latent",
+            inputs=[
+                io.Latent.Input("samples"),
+                io.Vae.Input("vae"),
+            ],
+            outputs=[
+                io.Audio.Output(display_name="audio"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, samples: dict, vae: Any) -> io.NodeOutput:
+        if not isinstance(samples, dict) or "samples" not in samples:
+            raise RuntimeError("ASDX VAE Decode Audio: expected LATENT input.")
+        return io.NodeOutput(cls._decode_audio(samples, vae))
+
+    @staticmethod
+    def _decode_audio(samples: dict, vae: Any) -> dict:
+        latent = samples["samples"]
+        if getattr(latent, "is_nested", False):
+            latent = latent.unbind()[-1]
+
+        do_tile = False
+        try:
+            audio = vae.decode(latent)
+        except Exception as e:
+            if not _needs_tiled_retry(e):
+                raise
+            print(f"[ASDX] VAE Decode Audio: MPS limit hit ({e}), retrying with tiled decode.")
+            do_tile = True
+
+        if do_tile:
+            import comfy.model_management
+            comfy.model_management.soft_empty_cache()
+            audio = vae.decode_tiled(latent, tile_x=512, tile_y=512, overlap=64)
+
+        audio = audio.movedim(-1, 1)  # vae's native [B, T, C] -> [B, C, T]
+
+        std = torch.std(audio, dim=[1, 2], keepdim=True) * 5.0
+        std[std < 1.0] = 1.0
+        audio = audio / std
+
+        sample_rate = samples.get("sample_rate")
+        if sample_rate is None:
+            sample_rate = getattr(vae, "audio_sample_rate_output", getattr(vae, "audio_sample_rate", 44100))
+        return {"waveform": audio, "sample_rate": sample_rate}
+
+
 NODE_LIST = [
     ASDX_VAELoader,
     ASDX_VAEDecode,
     ASDX_VAEEncode,
+    ASDX_VAEDecodeAudio,
 ]
