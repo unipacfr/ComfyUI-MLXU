@@ -6,14 +6,34 @@ PDD head bank).
 Ported from `comfy_extras/nodes_minimax_h3.py`'s `EmptyMiniMaxH3LatentAV` and
 `MiniMaxH3SigmaShift`. `MiniMaxH3ImageToVideo` (the reference's third
 in-scope node per this project's own workflow-derived node survey, see
-`docs/plan-multi-modeles-apple-silicon.md` §5 Phase 6) is NOT ported here --
+`docs/plan-multi-modeles-apple-silicon.md` §5 Phase 6) is NOT ported as-is --
 it accepts `first_frame`/`last_frame` keyframe conditioning that
 `native/minimax_h3/layout.py::PackedLayout` does not implement, so exposing
-those inputs would silently do nothing. A text-only prompt-conditioning node
-needs the real Qwen3-VL tokenizer wired through a `comfy.sd.CLIP` object
-(same pattern `krea2_grounded_encode.py` uses: `mlx_clip.tokenize(prompt)`
-for real BPE/chat-template handling, native MLX encoder for the forward
-pass) -- left as a follow-up rather than guessed at.
+those inputs would silently do nothing. Its t2va-only equivalent is
+`ASDX_MiniMaxH3TextEncode` below.
+
+Text tokenization: MiniMax H3's presentation is explicitly NOT chat-templated
+for plain t2va (`comfy/text_encoders/minimax.py`'s module docstring: "raw
+prompt/label text, no special tokens"), so `comfy.text_encoders.minimax.
+MiniMaxH3Tokenizer` is a plain, weight-free BPE tokenizer -- instantiating it
+directly (no `comfy.sd.CLIP`/`mlx_clip` needed) avoids loading the real
+encoder's dense weights a second time just to reach its tokenizer, which
+would defeat `text_encoder_weight_map.py`'s quantized-loading entirely.
+Verified directly: `MiniMaxH3Tokenizer().tokenize_with_weights("a cat...")`
+returns plain `(token_id, 1.0)` pairs with no vision/special tokens for a
+text-only prompt.
+
+Whether to keep this project's own MLX-native `Qwen3TextEncoder` for
+conditioning, versus routing through ComfyUI's real `comfy.sd.CLIP` path
+(`.encode_from_tokens_scheduled`, the same pattern `krea2_grounded_encode.py`
+uses), was an open question this session: `.claude/canon.md`'s "Porting
+CLIP/T5/Qwen text encoders to MLX has weak memory ROI, except FP8 sources"
+record says PyTorch-CPU text-encoder RAM is already near on-disk size on
+Apple Silicon, so a native MLX port usually isn't worth it. Decided to keep
+the native encoder anyway for MiniMax H3 (full MLX pipeline, no PyTorch CLIP
+at inference) -- see the commit introducing `ASDX_MiniMaxH3TextEncode` for
+the reasoning; the canon record's general guidance still applies to other
+families.
 
 Two separate LATENT outputs (video, audio) rather than ComfyUI's own packed
 `NestedTensor` pair: this project's own (not-yet-built) MiniMax H3 sampler
@@ -24,12 +44,17 @@ dicts already compose with the existing `ASDX_VAEDecode`/
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
+import mlx.core as mx
 import torch
 
 import comfy.model_management
 from comfy_api.latest import io
+
+_DIT_CACHE: dict[str, Any] = {}
+_TEXT_ENCODER_CACHE: dict[str, Any] = {}
 
 # Ported from comfy_extras/nodes_minimax_h3.py -- frame-count/latent-shape
 # math for the video/audio VAEs' downscale ratios (16x spatial, 4x temporal
@@ -185,7 +210,215 @@ def _replace_sigma_shifts(config: Any, shift_video: float, shift_audio: float) -
     return new_config
 
 
+class ASDX_MiniMaxH3ModelLoader(io.ComfyNode):
+    """Load a MiniMax H3 DiT GGUF checkpoint (quantized, see
+    `native/minimax_h3/weight_map.py`'s module docstring for why dense
+    loading would not fit in 64GB). GGUF only -- safetensors (ComfyUI
+    INT8-tensorwise) loading is not implemented (see `weight_map.py`)."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_MiniMaxH3ModelLoader",
+            display_name="🍏 ASDX MiniMax H3 Model Loader (GGUF)",
+            category="ASDX/Loaders",
+            inputs=[
+                io.Combo.Input("model_name", options=cls._get_models()),
+                io.Combo.Input("precision", options=["float16", "bfloat16", "float32"], default="float16"),
+            ],
+            outputs=[
+                io.Custom("asdx_model").Output(display_name="model"),
+            ],
+        )
+
+    @staticmethod
+    def _get_models() -> list[str]:
+        try:
+            import folder_paths
+            names: dict[str, None] = {}
+            for folder in ("diffusion_models", "unet"):
+                try:
+                    for name in folder_paths.get_filename_list(folder):
+                        if name.lower().endswith(".gguf"):
+                            names[name] = None
+                except Exception:
+                    pass
+            if names:
+                return list(names)
+        except Exception:
+            pass
+        return []
+
+    @classmethod
+    def execute(cls, model_name: str, precision: str = "float16") -> io.NodeOutput:
+        import folder_paths
+
+        path = None
+        for folder in ("diffusion_models", "unet"):
+            try:
+                found = folder_paths.get_full_path(folder, model_name)
+            except Exception:
+                found = None
+            if found:
+                path = Path(found)
+                break
+        if path is None:
+            raise RuntimeError(f"ASDX MiniMax H3 Model Loader: could not find '{model_name}'.")
+
+        cache_key = f"{path}:{precision}"
+        if cache_key in _DIT_CACHE:
+            print(f"[ASDX] MiniMax H3 model cache hit: {model_name}")
+            return io.NodeOutput(_DIT_CACHE[cache_key])
+
+        from .native.minimax_h3.weight_map import load_minimax_h3_from_gguf
+
+        _DIT_CACHE.clear()  # one resident MiniMax H3 DiT at a time -- see ASDX_DiffusionLoader's own eviction note
+        model = load_minimax_h3_from_gguf(path, dtype=precision)
+        model_desc = {
+            "type": "asdx_model",
+            "family": "minimax_h3",
+            "name": model_name,
+            "path": str(path),
+            "transformer": model,
+            "config": model.config,
+            "precision": precision,
+        }
+        _DIT_CACHE[cache_key] = model_desc
+        return io.NodeOutput(model_desc)
+
+
+class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
+    """Load MiniMax H3's Qwen3-VL-32B text encoder GGUF checkpoint
+    (quantized, see `native/minimax_h3/text_encoder_weight_map.py`)."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_MiniMaxH3TextEncoderLoader",
+            display_name="🍏 ASDX MiniMax H3 Text Encoder Loader (GGUF)",
+            category="ASDX/Loaders",
+            inputs=[
+                io.Combo.Input("encoder_name", options=cls._get_encoders()),
+                io.Combo.Input("precision", options=["float16", "bfloat16", "float32"], default="float16"),
+            ],
+            outputs=[
+                io.Custom("asdx_minimax_h3_text_encoder").Output(display_name="text_encoder"),
+            ],
+        )
+
+    @staticmethod
+    def _get_encoders() -> list[str]:
+        try:
+            import folder_paths
+            names: dict[str, None] = {}
+            for folder in ("text_encoders", "clip"):
+                try:
+                    for name in folder_paths.get_filename_list(folder):
+                        if name.lower().endswith(".gguf"):
+                            names[name] = None
+                except Exception:
+                    pass
+            if names:
+                return list(names)
+        except Exception:
+            pass
+        return []
+
+    @classmethod
+    def execute(cls, encoder_name: str, precision: str = "float16") -> io.NodeOutput:
+        import folder_paths
+
+        path = None
+        for folder in ("text_encoders", "clip"):
+            try:
+                found = folder_paths.get_full_path(folder, encoder_name)
+            except Exception:
+                found = None
+            if found:
+                path = Path(found)
+                break
+        if path is None:
+            raise RuntimeError(f"ASDX MiniMax H3 Text Encoder Loader: could not find '{encoder_name}'.")
+
+        cache_key = f"{path}:{precision}"
+        if cache_key in _TEXT_ENCODER_CACHE:
+            print(f"[ASDX] MiniMax H3 text encoder cache hit: {encoder_name}")
+            return io.NodeOutput(_TEXT_ENCODER_CACHE[cache_key])
+
+        from .native.minimax_h3.text_encoder_weight_map import load_qwen3_text_encoder_from_gguf
+
+        _TEXT_ENCODER_CACHE.clear()
+        encoder = load_qwen3_text_encoder_from_gguf(path, dtype=precision)
+        result = {
+            "type": "asdx_minimax_h3_text_encoder",
+            "name": encoder_name,
+            "path": str(path),
+            "encoder": encoder,
+            "precision": precision,
+        }
+        _TEXT_ENCODER_CACHE[cache_key] = result
+        return io.NodeOutput(result)
+
+
+class ASDX_MiniMaxH3TextEncode(io.ComfyNode):
+    """Encode a prompt for MiniMax H3 t2va conditioning.
+
+    Tokenizes via `comfy.text_encoders.minimax.MiniMaxH3Tokenizer` directly
+    (weight-free BPE, no `comfy.sd.CLIP` needed -- see module docstring) and
+    runs the token ids through the native MLX `Qwen3TextEncoder` loaded by
+    `ASDX_MiniMaxH3TextEncoderLoader`. The result is the raw hidden state
+    after layer 50 -- what `native/minimax_h3/model.py::MiniMaxH3Model`
+    consumes as `context` directly, no further processing needed (no final
+    norm/lm_head on this truncated checkpoint, matching the reference).
+    """
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_MiniMaxH3TextEncode",
+            display_name="🍏 ASDX MiniMax H3 Text Encode",
+            category="ASDX/Conditioning",
+            inputs=[
+                io.Custom("asdx_minimax_h3_text_encoder").Input("text_encoder"),
+                io.String.Input("prompt", multiline=True, default=""),
+            ],
+            outputs=[
+                io.Custom("asdx_minimax_h3_conditioning").Output(display_name="conditioning"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, text_encoder: dict, prompt: str) -> io.NodeOutput:
+        if not isinstance(text_encoder, dict) or text_encoder.get("type") != "asdx_minimax_h3_text_encoder":
+            raise RuntimeError("ASDX MiniMax H3 Text Encode: expected the output of ASDX_MiniMaxH3TextEncoderLoader.")
+
+        import comfy.text_encoders.minimax
+
+        tokenizer = comfy.text_encoders.minimax.MiniMaxH3Tokenizer()
+        tokens = tokenizer.tokenize_with_weights(prompt)["qwen3vl_32b"][0]
+        input_ids = mx.array([token_id for token_id, _weight in tokens], dtype=mx.int32)
+
+        encoder = text_encoder["encoder"]
+        hidden_states = encoder(input_ids)
+        mx.eval(hidden_states)
+        if not bool(mx.all(mx.isfinite(hidden_states)).item()):
+            raise RuntimeError(
+                "ASDX MiniMax H3 Text Encode: produced a non-finite (NaN/Inf) "
+                "embedding -- aborting before the expensive sampling pass."
+            )
+
+        print(f"[ASDX] MiniMax H3 Text Encode: {len(prompt)} chars, {len(tokens)} tokens")
+        return io.NodeOutput({
+            "type": "minimax_h3",
+            "hidden_states": hidden_states,
+            "text": prompt,
+        })
+
+
 NODE_LIST = [
     ASDX_MiniMaxH3EmptyLatentAV,
     ASDX_MiniMaxH3SigmaShift,
+    ASDX_MiniMaxH3ModelLoader,
+    ASDX_MiniMaxH3TextEncoderLoader,
+    ASDX_MiniMaxH3TextEncode,
 ]
