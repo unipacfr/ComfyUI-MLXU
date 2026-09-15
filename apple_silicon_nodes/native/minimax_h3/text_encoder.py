@@ -97,7 +97,7 @@ class TransformerBlock(nn.Module):
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
-class Qwen3TextEncoder(nn.Module):
+class _Qwen3Backbone(nn.Module):
     """Embedding + `num_hidden_layers` `TransformerBlock`s. No final norm, no
     lm_head (matches `final_norm=False`/`lm_head=False` in the reference
     config for this truncated 50-layer variant) -- the output is the raw
@@ -110,10 +110,26 @@ class Qwen3TextEncoder(nn.Module):
         self.layers = [TransformerBlock(config) for _ in range(config.num_hidden_layers)]
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        """`input_ids`: `[S]` int32 token ids (batch already squeezed, this
-        port's convention throughout). Returns `[S, hidden_size]`."""
         x = self.embed_tokens(input_ids)
         cos, sin = qwen3_rope_cos_sin(x.shape[0], self.config.head_dim, self.config.rope_theta)
         for layer in self.layers:
             x = layer(x, cos, sin)
         return x
+
+
+class Qwen3TextEncoder(nn.Module):
+    """Wraps `_Qwen3Backbone` under a `model` attribute, matching the
+    checkpoint's own key prefix exactly (`model.embed_tokens.weight`,
+    `model.layers.N....weight`) -- this project's convention throughout is
+    checkpoint-key-compatible attribute names so weight loading needs no
+    translation table."""
+
+    def __init__(self, config: Qwen3TextEncoderConfig):
+        super().__init__()
+        self.config = config
+        self.model = _Qwen3Backbone(config)
+
+    def __call__(self, input_ids: mx.array) -> mx.array:
+        """`input_ids`: `[S]` int32 token ids (batch already squeezed, this
+        port's convention throughout). Returns `[S, hidden_size]`."""
+        return self.model(input_ids)
