@@ -118,7 +118,20 @@ def _register_gguf_extension(folder_key: str) -> None:
     (which query the standard keys, matching every other ASDX loader's
     convention) would still see an empty list. Extending the standard
     keys' own extension set here makes our loaders work whether or not
-    `calcuis/gguf` is installed."""
+    `calcuis/gguf` is installed.
+
+    `folder_paths.get_filename_list()` caches its scan per folder key in
+    `folder_paths.filename_list_cache`, keyed only by directory mtimes -- it
+    never notices the extension set itself changed. ComfyUI's own core
+    loaders (UNETLoader/CLIPLoader) query "diffusion_models"/"text_encoders"
+    during core node registration, which runs before custom_nodes (this
+    module included) are even imported -- so that cache is very likely
+    already populated, without `.gguf`, by the time this function runs. If
+    we don't evict it here, the extension change has no visible effect until
+    something else invalidates the cache (e.g. a directory's mtime changes),
+    which is exactly the bug the user hit: the fix from the previous commit
+    only worked in tests because the test harness never simulates this
+    real-ComfyUI import ordering."""
     try:
         import folder_paths
     except ImportError:
@@ -126,6 +139,7 @@ def _register_gguf_extension(folder_key: str) -> None:
     paths, extensions = folder_paths.folder_names_and_paths.get(folder_key, ([], set()))
     if ".gguf" not in extensions:
         folder_paths.folder_names_and_paths[folder_key] = (paths, set(extensions) | {".gguf"})
+    folder_paths.filename_list_cache.pop(folder_key, None)
 
 
 for _folder_key in ("diffusion_models", "text_encoders"):

@@ -65,11 +65,19 @@ def _realistic_fake_folder_paths(disk_files: dict[str, tuple[str, str]]):
     }
 
     def get_filename_list(folder_key):
+        # Mirrors the real folder_paths.get_filename_list: once a folder key's
+        # scan is cached, it is reused verbatim regardless of a later
+        # extension-set change -- only filename_list_cache.pop() clears it.
+        cached = mod.filename_list_cache.get(folder_key)
+        if cached is not None:
+            return cached
         _, extensions = mod.folder_names_and_paths.get(folder_key, ([], set()))
-        return [
+        result = [
             name for name, (key, _path) in disk_files.items()
             if key == folder_key and Path(name).suffix.lower() in extensions
         ]
+        mod.filename_list_cache[folder_key] = result
+        return result
 
     def get_full_path(folder_key, name):
         entry = disk_files.get(name)
@@ -79,6 +87,7 @@ def _realistic_fake_folder_paths(disk_files: dict[str, tuple[str, str]]):
 
     mod.get_filename_list = get_filename_list
     mod.get_full_path = get_full_path
+    mod.filename_list_cache = {}
     return mod
 
 
@@ -255,3 +264,26 @@ def test_register_gguf_extension_is_idempotent(monkeypatch):
 
     _, extensions = fp.folder_names_and_paths["diffusion_models"]
     assert extensions == _REAL_SUPPORTED_PT_EXTENSIONS | {".gguf"}
+
+
+def test_register_gguf_extension_busts_a_cache_populated_before_it_ran(monkeypatch):
+    """Real-ComfyUI ordering: core loaders (UNETLoader/CLIPLoader) query
+    "diffusion_models"/"text_encoders" during core node registration, which
+    happens before custom_nodes -- including this module -- are imported.
+    That first query caches the scan without .gguf in folder_paths'
+    process-lifetime filename_list_cache, which is keyed only on directory
+    mtimes and is never invalidated by an extension-set change on its own.
+    Without popping that cache entry, `_register_gguf_extension` has no
+    visible effect -- this is the bug the user actually hit."""
+    fp = _realistic_fake_folder_paths({
+        "minimax_h3.gguf": ("diffusion_models", "/models/unet/minimax_h3.gguf"),
+    })
+    monkeypatch.setitem(sys.modules, "folder_paths", fp)
+
+    # simulate a core loader querying the list first, before .gguf is registered
+    stale = fp.get_filename_list("diffusion_models")
+    assert stale == []
+
+    nodes_module._register_gguf_extension("diffusion_models")
+
+    assert ASDX_MiniMaxH3ModelLoader._get_models() == ["minimax_h3.gguf"]
