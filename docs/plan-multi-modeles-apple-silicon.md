@@ -575,7 +575,7 @@ qu'un faux positif).
 - [x] Dequantizer K-quant (Q4_K + Q6_K) — cible text encoder, verifie bit-exact contre `calcuis/gguf` et contre le vrai fichier (`native/gguf/dequant.py`). Confirme le schema Q4_K_M standard llama.cpp (Q6_K sur `down_proj`/`v_proj`, Q4_K ailleurs)
 - [x] `ASDX_MiniMaxH3EmptyLatentAV` + `ASDX_MiniMaxH3SigmaShift` portes (deux LATENT separes video/audio au lieu du NestedTensor packe ComfyUI ; SigmaShift ecrit directement `MiniMaxH3Config.sigma_shift_*` au lieu de patcher `ModelPatcher`)
 - [x] VAE : aucun port MLX necessaire — `ASDX_VAEDecode` gere deja le latent video 5D generiquement ; ajout de `ASDX_VAEDecodeAudio` (premiere sortie AUDIO du projet, miroir de `comfy_extras.nodes_audio.vae_decode_audio`)
-- [ ] `MiniMaxH3ImageToVideo` (conditioning texte->video) : bloque sur le tokenizer Qwen3-VL reel (a cabler via un objet `comfy.sd.CLIP`, meme motif que `krea2_grounded_encode.py`) — pas devine, differe
+- [x] Conditioning texte (`ASDX_MiniMaxH3TextEncode` + loaders modele/texte) : debloque — `comfy.text_encoders.minimax.MiniMaxH3Tokenizer` s'instancie directement (BPE pur, aucun poids), pas besoin de `comfy.sd.CLIP`. Choix fait de garder l'encodeur MLX natif malgre le canon `Porting CLIP/T5/Qwen text encoders to MLX has weak memory ROI` (a canoniser si l'utilisateur confirme).
 - [ ] `sampler/core.py::_run_minimax_h3` (boucle de denoising) — pas commence
 - [ ] LoRA MiniMax H3 (mapping de cles) fonctionne avec `minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors`
 - [ ] Passe la recette `verify-checkpoint` + `comfy-reference-diff` contre `comfy/ldm/minimax/model.py`
