@@ -84,6 +84,7 @@ try:
     from .depth_conditioning import NODE_LIST as _depth_conditioning_nodes
     from .kontext_reference import NODE_LIST as _kontext_reference_nodes
     from .latent_noise_prep import NODE_LIST as _latent_noise_prep_nodes
+    from .minimax_h3_nodes import NODE_LIST as _minimax_h3_nodes
 
     # Optional: image chain, depth map, live preview
     try:
@@ -114,6 +115,7 @@ try:
         *_depth_conditioning_nodes,
         *_kontext_reference_nodes,
         *_latent_noise_prep_nodes,
+        *_minimax_h3_nodes,
         *_chain_nodes,
         *_depth_nodes,
         *_preview_nodes,
