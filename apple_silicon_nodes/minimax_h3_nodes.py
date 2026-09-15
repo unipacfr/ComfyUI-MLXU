@@ -36,10 +36,19 @@ the reasoning; the canon record's general guidance still applies to other
 families.
 
 Two separate LATENT outputs (video, audio) rather than ComfyUI's own packed
-`NestedTensor` pair: this project's own (not-yet-built) MiniMax H3 sampler
-consumes plain tensors directly, and two standard `{"samples": tensor}`
-dicts already compose with the existing `ASDX_VAEDecode`/
-`ASDX_VAEDecodeAudio` nodes with no new plumbing.
+`NestedTensor` pair: `ASDX_MiniMaxH3Sampler`'s own
+`native/minimax_h3/sampling.py` consumes plain tensors directly, and two
+standard `{"samples": tensor}` dicts already compose with the existing
+`ASDX_VAEDecode`/`ASDX_VAEDecodeAudio` nodes with no new plumbing.
+
+`ASDX_MiniMaxH3Sampler` is deliberately its own node, not a `model_type`
+branch of the shared `ASDX_MLXSampler`/`_SamplerCore` (see
+`native/minimax_h3/sampling.py`'s module docstring for why) -- it converts
+its LATENT inputs' shapes to real Gaussian noise itself (matching stock
+ComfyUI's own split: `EmptyLatentImage`-style nodes return zeros, a
+`RandomNoise`/`KSampler` seed is what actually generates the noise that
+gets denoised) rather than accepting the empty-latent's zero tensor as a
+starting point, which would never move under the flow ODE.
 """
 
 from __future__ import annotations
@@ -48,6 +57,7 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import numpy as np
 import torch
 
 import comfy.model_management
@@ -415,10 +425,82 @@ class ASDX_MiniMaxH3TextEncode(io.ComfyNode):
         })
 
 
+class ASDX_MiniMaxH3Sampler(io.ComfyNode):
+    """Run MiniMax H3's flow-matching Euler sampling loop
+    (`native/minimax_h3/sampling.py::run_minimax_h3_sampling`).
+
+    Generates the starting Gaussian noise itself from `video_latent`/
+    `audio_latent`'s shapes (matching stock ComfyUI's own
+    empty-latent-is-zero / sampler-generates-noise split -- see module
+    docstring) rather than denoising the all-zero tensors those nodes
+    actually carry, which would never move under the flow ODE.
+    """
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_MiniMaxH3Sampler",
+            display_name="🍏 ASDX MiniMax H3 Sampler",
+            category="ASDX/Sampling",
+            inputs=[
+                io.Custom("asdx_model").Input("model"),
+                io.Custom("asdx_minimax_h3_conditioning").Input("conditioning"),
+                io.Latent.Input("video_latent"),
+                io.Latent.Input("audio_latent"),
+                io.Int.Input("steps", default=4, min=1, max=200),
+                io.Int.Input("seed", default=0, min=0, max=0xFFFFFFFFFFFFFFFF),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="video_latent"),
+                io.Latent.Output(display_name="audio_latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model: dict,
+        conditioning: dict,
+        video_latent: dict,
+        audio_latent: dict,
+        steps: int,
+        seed: int,
+    ) -> io.NodeOutput:
+        if not isinstance(model, dict) or model.get("family") != "minimax_h3":
+            raise RuntimeError("ASDX MiniMax H3 Sampler: expected the output of ASDX_MiniMaxH3ModelLoader.")
+        if not isinstance(conditioning, dict) or conditioning.get("type") != "minimax_h3":
+            raise RuntimeError("ASDX MiniMax H3 Sampler: expected the output of ASDX_MiniMaxH3TextEncode.")
+        for name, latent in (("video_latent", video_latent), ("audio_latent", audio_latent)):
+            if not isinstance(latent, dict) or "samples" not in latent:
+                raise RuntimeError(f"ASDX MiniMax H3 Sampler: expected LATENT input for '{name}'.")
+
+        from .native.minimax_h3.sampling import run_minimax_h3_sampling
+
+        video_shape = tuple(video_latent["samples"].shape)
+        audio_shape = tuple(audio_latent["samples"].shape)
+
+        mx.random.seed(seed)
+        video_noise = mx.random.normal(video_shape)
+        audio_noise = mx.random.normal(audio_shape)
+
+        video_out, audio_out = run_minimax_h3_sampling(
+            model["transformer"], video_noise, audio_noise, conditioning["hidden_states"], steps,
+        )
+        mx.eval(video_out, audio_out)
+
+        device = video_latent["samples"].device
+        video_torch = torch.from_numpy(np.array(video_out)).to(device)
+        audio_torch = torch.from_numpy(np.array(audio_out)).to(device)
+
+        print(f"[ASDX] MiniMax H3 Sampler: {steps} steps, video={video_shape}, audio={audio_shape}")
+        return io.NodeOutput({"samples": video_torch}, {"samples": audio_torch})
+
+
 NODE_LIST = [
     ASDX_MiniMaxH3EmptyLatentAV,
     ASDX_MiniMaxH3SigmaShift,
     ASDX_MiniMaxH3ModelLoader,
     ASDX_MiniMaxH3TextEncoderLoader,
     ASDX_MiniMaxH3TextEncode,
+    ASDX_MiniMaxH3Sampler,
 ]
