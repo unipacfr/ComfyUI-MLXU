@@ -320,18 +320,33 @@ ControlNet-style MiniMax H3 : effort supplementaire non chiffre, a evaluer une
 fois le t2va/fl2va de base valide.
 
 **Contrainte materielle cible : MacBook Pro M5 Max, 64GB de memoire unifiee.**
-Les checkpoints DiT de l'utilisateur pesent tous environ **20GB** (variante
-retenue : `..._pruned_int8_convrot`, INT8 tensorwise — `h3ErosMax_beta5_fp8`
-existe aussi en 13GB mais n'est pas la reference a dimensionner). Avec le texte
-encoder Qwen3-VL-32B a 25GB (INT8) et les VAE (4.9GB video + 0.6GB audio),
-**charger les trois etages en meme temps est exclu** (deja ~50GB de poids seuls,
-avant KV cache Qwen3-VL et activations DiT — pas de marge sur 64GB partages avec
-l'OS et ComfyUI). Consequence directe sur le design de `_run_minimax_h3` : le
-chargement sequentiel etage par etage (`loader.py` charge l'encodeur → encode →
-**libere** avant de charger le DiT → denoise → **libere** avant de charger le
-VAE → decode) n'est pas une optimisation facultative ici, c'est une condition
-de faisabilite. Chaque etage pris isolement (25GB encodeur, 20GB DiT, 5.5GB VAE)
-tient confortablement dans 64GB.
+Les checkpoints DiT de l'utilisateur pesent tous environ **20GB SUR DISQUE**
+(variante retenue : `..._pruned_int8_convrot`, INT8 tensorwise — `h3ErosMax_beta5_fp8`
+existe aussi en 13GB mais n'est pas la reference a dimensionner). Texte
+encoder Qwen3-VL-32B : 25GB sur disque (INT8). VAE : 4.9GB video + 0.6GB audio.
+
+**Correction (implementation Phase 6, apres coup) : ces tailles sont celles du
+fichier QUANTIFIE sur disque, pas la taille reelle en memoire une fois
+dequantifie en dense** — la convention historique de ce projet pour toutes les
+autres familles (`_load_safetensors` : tout dequantifier en dense, aucun kernel
+GEMM quantifie). Mesure sur le vrai nombre de parametres (pas la taille fichier) :
+DiT 20,1 milliards de parametres → **~40GB dense en fp16, ~80GB en fp32** ;
+text encoder 25,8 milliards → **~51,5GB dense en fp16, ~103GB en fp32**. Cette
+convention **ne tient pas dans 64GB**, meme un seul etage a la fois pour le
+text encoder. Solution retenue et implementee : garder les gros poids (les
+Linear par bloc : `qkv_proj`/`out_proj`/`fc1`/`fc2`) au format quantifie natif
+MLX (`mx.quantize`/`nn.QuantizedLinear`, meme mecanisme que `mlx-lm` pour les
+gros modeles) au lieu de les dequantifier en dense — chaque tenseur source est
+dequantifie de façon transitoire (un seul a la fois) puis immediatement
+requantifie, jamais materialise en dense pour tout le modele. Voir
+`native/minimax_h3/quantized_linear.py` + `weight_map.py`, verifie sur le vrai
+checkpoint DiT (13.9GB, 532 tenseurs, chargement complet en ~3 min).
+
+**Chargement sequentiel etage par etage reste necessaire** (encoder → libere →
+DiT → libere → VAE → decode) : meme avec le format quantifie, avoir les trois
+etages residents simultanement n'est pas souhaitable — mais la marge est
+desormais dictee par la taille quantifiee-en-memoire de chaque etage (proche
+de la taille fichier, pas 2-4x plus grande), pas par la taille dense.
 
 **GGUF — requis a la fois pour le text encoder et le DiT (diffusion_models),
 et verifiable de bout en bout des maintenant.** Contrairement a ce qui avait ete
@@ -443,7 +458,7 @@ Regles:
 |--------|---------------------|--------------|---------------|
 | Wan 2.1 | 36GB | ~18GB | ~10GB |
 | Hunyuan | 16GB | ~6GB | ~4GB |
-| MiniMax H3 | **64GB (M5 Max de l'utilisateur), a condition de charger sequentiellement** | Poids sur disque : text encoder Qwen3-VL-32B INT8 25GB (ou GGUF Q4_K_M 17GB, a supporter — voir Phase 6), DiT INT8 `..._pruned_int8_convrot` ~20GB (variante de reference cote utilisateur), VAE video 4.9GB, VAE audio 0.6GB. **Chaque etage charge/libere a son tour** (encode texte → `mx.clear_cache()` → denoise → `mx.clear_cache()` → decode) — jamais les trois residents en meme temps. Pic reel ≈ encodeur texte + activations (~25-30GB en safetensors, ~17-22GB en GGUF), largement sous 64GB. Charger DiT+encodeur+VAE simultanement (chemin naif) depasserait le budget avec l'encodeur seul deja a 25GB. | non evalue |
+| MiniMax H3 | **64GB (M5 Max de l'utilisateur), a condition de charger sequentiellement ET de garder les poids quantifies (pas de dequant dense)** | Poids **sur disque** : text encoder Qwen3-VL-32B INT8 25GB (ou GGUF Q4_K_M 17GB), DiT INT8 ~20GB (ou GGUF Q5_0 ~14GB). **En memoire dense (evite) : DiT ~40GB fp16/~80GB fp32 (20,1 Md param.), text encoder ~51,5GB fp16/~103GB fp32 (25,8 Md param.)** — mesure reelle, corrige une estimation anterieure de cette session basee a tort sur la taille fichier. Solution implementee : `mx.quantize`/`nn.QuantizedLinear` (poids quantifies natifs MLX, memoire proche de la taille fichier) pour le DiT, verifie sur le vrai checkpoint (13.9GB, chargement ~3 min, 948/948 params). Meme approche requise pour le text encoder. | non evalue |
 
 ---
 
@@ -550,7 +565,8 @@ qu'un faux positif).
 - [x] Effort re-estime (25-42j : 18-30j t2va/fl2va+LoRA + 6.5-11.5j GGUF text encoder+DiT ; REF2VA/AddGuide/ControlNet en sus)
 - [x] `native/minimax_h3/config.py` : detection d'architecture (`detect_minimax_h3_config`) verifiee sur les headers reels des deux formats (safetensors + GGUF), config identique des deux cotes
 - [x] `native/minimax_h3/model.py` : DiT complet pour le chemin minimal t2va (rope.py, layout.py, patchify.py, model.py — RMSNorm/Attention/MLP/AdalnProj/TokenRefiner/DiTBlock/FinalLayer/MiniMaxH3Model), chaque brique verifiee numeriquement contre la vraie reference (comfy_kitchen eager backend pour le rope fusionne, `comfy.ldm.minimax.model` importe directement pour layout/patchify/curve embedding). Hors scope : REF2VA, AddGuide, gate_compress/VSA, PDD head bank, pad/crop non-aligne — voir le docstring de module de `model.py`.
-- [ ] Profil `capability.py` + `native/minimax_h3/weight_map.py` (chargement des vrais poids safetensors/GGUF dans `MiniMaxH3Model`) + `text_encoder.py` (Qwen3-VL)
+- [x] `native/minimax_h3/weight_map.py` (GGUF) : chargement complet du DiT verifie sur le vrai fichier (948/948 params, ~3 min). **Decouverte critique en cours de route : dequantifier en dense (convention existante du projet pour les autres familles) ne tient PAS dans 64 Go pour ce modele** — DiT 20,1 Md param. = ~40 Go dense fp16/~80 Go fp32 ; text encoder 25,8 Md = ~51,5 Go dense fp16/~103 Go fp32 (mesure sur le vrai nombre d'elements, pas la taille fichier quantifiee). Solution : poids gardes en format quantifie natif MLX (`mx.quantize`/`nn.QuantizedLinear`, memes mecanismes que mlx-lm pour les gros modeles) — voir `native/minimax_h3/quantized_linear.py`. Chargement safetensors (INT8) pas encore implemente (GGUF est la cible principale de l'utilisateur).
+- [ ] Profil `capability.py` + `native/minimax_h3/text_encoder.py` (Qwen3-VL, meme approche de chargement quantifie requise vu les 25,8 Md de parametres)
 - [ ] Encodeur Qwen3-VL natif (`native/minimax_h3/text_encoder.py`)
 - [ ] Sortie audio (`AUDIO`) cablee — premiere fois dans ce projet
 - [ ] Chargement sequentiel encodeur → DiT → VAE verifie (pic RAM mesure < 64GB sur M5 Max, aucun etage resident en meme temps qu'un autre)
