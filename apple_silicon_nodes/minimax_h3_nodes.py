@@ -102,6 +102,36 @@ def _get_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _register_gguf_extension(folder_key: str) -> None:
+    """ComfyUI's `folder_paths.supported_pt_extensions` -- what the
+    `"diffusion_models"`/`"text_encoders"` folder keys use -- does NOT
+    include `.gguf` (confirmed against the real `folder_paths.py`:
+    `{'.ckpt', '.pt', '.pt2', '.bin', '.pth', '.safetensors', '.pkl', '.sft'}`).
+    `folder_paths.get_filename_list(folder_key)` therefore never returns a
+    `.gguf` file for ANY folder by default -- this has nothing to do with
+    our own filtering, the files are invisible before we ever see the list.
+
+    The reference `calcuis/gguf` node pack works around this by registering
+    brand-new folder keys (`'model_gguf'`/`'clip_gguf'`) with `{'.gguf'}` as
+    their only extension, rather than extending `'diffusion_models'`/
+    `'text_encoders'` -- so even with that node installed, OUR loaders
+    (which query the standard keys, matching every other ASDX loader's
+    convention) would still see an empty list. Extending the standard
+    keys' own extension set here makes our loaders work whether or not
+    `calcuis/gguf` is installed."""
+    try:
+        import folder_paths
+    except ImportError:
+        return
+    paths, extensions = folder_paths.folder_names_and_paths.get(folder_key, ([], set()))
+    if ".gguf" not in extensions:
+        folder_paths.folder_names_and_paths[folder_key] = (paths, set(extensions) | {".gguf"})
+
+
+for _folder_key in ("diffusion_models", "text_encoders"):
+    _register_gguf_extension(_folder_key)
+
+
 class ASDX_MiniMaxH3EmptyLatentAV(io.ComfyNode):
     """Create empty video + audio latents for MiniMax H3 t2va.
 
@@ -245,35 +275,21 @@ class ASDX_MiniMaxH3ModelLoader(io.ComfyNode):
     def _get_models() -> list[str]:
         try:
             import folder_paths
-            names: dict[str, None] = {}
-            for folder in ("diffusion_models", "unet"):
-                try:
-                    for name in folder_paths.get_filename_list(folder):
-                        if name.lower().endswith(".gguf"):
-                            names[name] = None
-                except Exception:
-                    pass
-            if names:
-                return list(names)
+            # "diffusion_models" already scans both models/diffusion_models/
+            # and models/unet/ (see folder_paths.py) -- no separate "unet" key
+            # exists in stock ComfyUI, so there is nothing to loop over here.
+            return [n for n in folder_paths.get_filename_list("diffusion_models") if n.lower().endswith(".gguf")]
         except Exception:
-            pass
-        return []
+            return []
 
     @classmethod
     def execute(cls, model_name: str, precision: str = "float16") -> io.NodeOutput:
         import folder_paths
 
-        path = None
-        for folder in ("diffusion_models", "unet"):
-            try:
-                found = folder_paths.get_full_path(folder, model_name)
-            except Exception:
-                found = None
-            if found:
-                path = Path(found)
-                break
-        if path is None:
+        found = folder_paths.get_full_path("diffusion_models", model_name)
+        if not found:
             raise RuntimeError(f"ASDX MiniMax H3 Model Loader: could not find '{model_name}'.")
+        path = Path(found)
 
         cache_key = f"{path}:{precision}"
         if cache_key in _DIT_CACHE:
@@ -320,35 +336,21 @@ class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
     def _get_encoders() -> list[str]:
         try:
             import folder_paths
-            names: dict[str, None] = {}
-            for folder in ("text_encoders", "clip"):
-                try:
-                    for name in folder_paths.get_filename_list(folder):
-                        if name.lower().endswith(".gguf"):
-                            names[name] = None
-                except Exception:
-                    pass
-            if names:
-                return list(names)
+            # "text_encoders" already scans both models/text_encoders/ and
+            # models/clip/ (see folder_paths.py) -- no separate "clip" key
+            # exists in stock ComfyUI, so there is nothing to loop over here.
+            return [n for n in folder_paths.get_filename_list("text_encoders") if n.lower().endswith(".gguf")]
         except Exception:
-            pass
-        return []
+            return []
 
     @classmethod
     def execute(cls, encoder_name: str, precision: str = "float16") -> io.NodeOutput:
         import folder_paths
 
-        path = None
-        for folder in ("text_encoders", "clip"):
-            try:
-                found = folder_paths.get_full_path(folder, encoder_name)
-            except Exception:
-                found = None
-            if found:
-                path = Path(found)
-                break
-        if path is None:
+        found = folder_paths.get_full_path("text_encoders", encoder_name)
+        if not found:
             raise RuntimeError(f"ASDX MiniMax H3 Text Encoder Loader: could not find '{encoder_name}'.")
+        path = Path(found)
 
         cache_key = f"{path}:{precision}"
         if cache_key in _TEXT_ENCODER_CACHE:

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sys
 import types
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -36,6 +37,45 @@ def _fake_folder_paths(files: dict[str, str]):
 
     def get_full_path(folder, name):
         return files.get(name)
+
+    mod.get_filename_list = get_filename_list
+    mod.get_full_path = get_full_path
+    return mod
+
+
+_REAL_SUPPORTED_PT_EXTENSIONS = {".ckpt", ".pt", ".pt2", ".bin", ".pth", ".safetensors", ".pkl", ".sft"}
+
+
+def _realistic_fake_folder_paths(disk_files: dict[str, tuple[str, str]]):
+    """A closer simulation of the real `folder_paths` module than
+    `_fake_folder_paths` above: `get_filename_list` actually filters by each
+    folder key's registered extension set, the same way the real ComfyUI
+    module does (and the same way it silently hid MiniMax H3's own .gguf
+    checkpoints before `_register_gguf_extension` was added -- this is the
+    regression test for exactly that bug).
+
+    `disk_files`: {name: (folder_key, full_path)} -- every file physically
+    "on disk", regardless of whether its extension is currently registered
+    for its folder.
+    """
+    mod = types.ModuleType("folder_paths")
+    mod.folder_names_and_paths = {
+        "diffusion_models": (["/models/diffusion_models", "/models/unet"], set(_REAL_SUPPORTED_PT_EXTENSIONS)),
+        "text_encoders": (["/models/text_encoders", "/models/clip"], set(_REAL_SUPPORTED_PT_EXTENSIONS)),
+    }
+
+    def get_filename_list(folder_key):
+        _, extensions = mod.folder_names_and_paths.get(folder_key, ([], set()))
+        return [
+            name for name, (key, _path) in disk_files.items()
+            if key == folder_key and Path(name).suffix.lower() in extensions
+        ]
+
+    def get_full_path(folder_key, name):
+        entry = disk_files.get(name)
+        if entry is None or entry[0] != folder_key:
+            return None
+        return entry[1]
 
     mod.get_filename_list = get_filename_list
     mod.get_full_path = get_full_path
@@ -158,3 +198,60 @@ def test_text_encode_raises_on_non_finite_output(monkeypatch):
     }
     with pytest.raises(RuntimeError, match="non-finite"):
         ASDX_MiniMaxH3TextEncode.execute(text_encoder, "prompt")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the real bug reported by the user: .gguf files were
+# invisible in both loader dropdowns because ComfyUI's real
+# folder_paths.supported_pt_extensions (what "diffusion_models"/
+# "text_encoders" use) does not include ".gguf" -- confirmed against the
+# real folder_paths.py, not assumed. _fake_folder_paths above (used by the
+# tests before this point) doesn't simulate extension filtering at all, so
+# it could not have caught this; _realistic_fake_folder_paths does.
+# ---------------------------------------------------------------------------
+
+
+def test_gguf_files_invisible_without_extension_registered():
+    # Documents the bug itself: querying the unmodified real extension set
+    # never returns a .gguf name, regardless of what our own code filters for.
+    fp = _realistic_fake_folder_paths({
+        "minimax_h3.gguf": ("diffusion_models", "/models/unet/minimax_h3.gguf"),
+    })
+    assert fp.get_filename_list("diffusion_models") == []
+
+
+def test_register_gguf_extension_makes_model_gguf_visible(monkeypatch):
+    fp = _realistic_fake_folder_paths({
+        "minimax_h3.gguf": ("diffusion_models", "/models/unet/minimax_h3.gguf"),
+        "some_model.safetensors": ("diffusion_models", "/models/diffusion_models/some_model.safetensors"),
+    })
+    monkeypatch.setitem(sys.modules, "folder_paths", fp)
+
+    nodes_module._register_gguf_extension("diffusion_models")
+
+    names = ASDX_MiniMaxH3ModelLoader._get_models()
+    assert names == ["minimax_h3.gguf"]  # only .gguf, the safetensors file is a different loader's job
+    # the non-.gguf file must still be visible to other code querying the same key
+    assert set(fp.get_filename_list("diffusion_models")) == {"minimax_h3.gguf", "some_model.safetensors"}
+
+
+def test_register_gguf_extension_makes_text_encoder_gguf_visible(monkeypatch):
+    fp = _realistic_fake_folder_paths({
+        "qwen3vl.gguf": ("text_encoders", "/models/text_encoders/qwen3vl.gguf"),
+    })
+    monkeypatch.setitem(sys.modules, "folder_paths", fp)
+
+    nodes_module._register_gguf_extension("text_encoders")
+
+    assert ASDX_MiniMaxH3TextEncoderLoader._get_encoders() == ["qwen3vl.gguf"]
+
+
+def test_register_gguf_extension_is_idempotent(monkeypatch):
+    fp = _realistic_fake_folder_paths({})
+    monkeypatch.setitem(sys.modules, "folder_paths", fp)
+
+    nodes_module._register_gguf_extension("diffusion_models")
+    nodes_module._register_gguf_extension("diffusion_models")
+
+    _, extensions = fp.folder_names_and_paths["diffusion_models"]
+    assert extensions == _REAL_SUPPORTED_PT_EXTENSIONS | {".gguf"}
