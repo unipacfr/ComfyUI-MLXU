@@ -1720,6 +1720,71 @@ def _apply_lora_to_minimax_h3(transformer: Any, lora: "LoRAAdapter", config: Any
     return new_transformer
 
 
+# ── MiniMax H3 turbo step-distill LoRA recipes ──────────────────────────
+#
+# lightx2v/Minimax-h3-Turbo publishes step-distilled adapters that each need
+# their OWN {steps, video shift, audio shift} recipe -- ported from
+# SceneWorks' measured manifest (config/manifests/builtin.loras.jsonc,
+# epic 17137/sc-18725, MEASURED on real weights: 12.6min vs 2.42h at
+# 1344x768/124 frames, 11.57x, with a 7.05x floor at 576x320). The four
+# published files disagree with each other (768p trains at shift 6, the
+# other two 4-/8-step files at shift 12), so "one recipe per family" doesn't
+# work -- this table is keyed per file, matching SceneWorks' own approach.
+#
+# Values are (steps, shift_video, shift_audio). Keys are the lightx2v
+# DIFFUSERS-format filename stems (lowercase, no extension) -- the repo also
+# publishes each adapter as a `_comfyui_` twin (`diffusion_model.*` prefix,
+# block-diagonal `attn.qkv_proj` B with alpha x3, `mlp.fc1` packed
+# `[gate | value]`). That initially looked incompatible with this project's
+# own fused representation (going by SceneWorks' warning that ITS OWN Rust
+# DiT uses `[value | gate]` and refuses the `_comfyui_` files for that
+# reason) -- but this project's `MLP.__call__`
+# (`native/minimax_h3/model.py:109-124`) splits `fc1`'s output the same way
+# ComfyUI does, gate first, and a real local file's header confirms the same
+# target convention (`__metadata__.swi_glu_mapping`:
+# "Diffusers [value;gate] -> ComfyUI [gate;value]", `qkv_fusion`: "block
+# diagonal B; concat A; alpha multiplied by 3") -- SceneWorks' caveat was
+# about ITS OWN engine's differing convention, not a defect in the
+# `_comfyui_` files themselves. The block-diagonal qkv construction folds
+# correctly through a plain `B @ A` (verified: stored alpha 384 against
+# per-sub-block rank 128 keeps the alpha/rank scale ratio at 1.0, matching
+# `mlp.fc1`'s own 128/128). Matching strips a `_comfyui` infix so both twins
+# resolve to the same entry.
+_MINIMAX_H3_TURBO_LORA_RECIPES: dict[str, tuple[int, float, float]] = {
+    "minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16": (4, 6.0, 3.0),
+    "minimax_h3_fl2v_turbo_8step_v1.0_bf16": (8, 12.0, 3.0),
+    "minimax_h3_fl2v_turbo_4step_v0.1": (4, 12.0, 3.0),
+    "minimax_h3_ref2v_turbo_4step_v0.1_bf16": (4, 12.0, 3.0),
+}
+
+
+def _maybe_apply_minimax_h3_turbo_recipe(lora_name: str, model: dict) -> dict:
+    """If `lora_name` matches a known MiniMax H3 turbo LoRA (diffusers or
+    `_comfyui_` export), auto-apply its measured sigma shifts and print the
+    matching step count -- `steps` lives on `ASDX_MiniMaxH3Sampler`, a
+    separate node this function can't reach, so it can only recommend that
+    value rather than set it. No-op for anything that isn't a recognized
+    MiniMax H3 turbo file (returns `model` unchanged).
+    """
+    if model.get("family") != "minimax_h3":
+        return model
+    stem = Path(lora_name).stem.lower().replace("_comfyui", "")
+    recipe = _MINIMAX_H3_TURBO_LORA_RECIPES.get(stem)
+    if recipe is None:
+        return model
+
+    steps, shift_video, shift_audio = recipe
+    from .minimax_h3_nodes import _replace_sigma_shifts
+
+    new_config = _replace_sigma_shifts(model["config"], shift_video, shift_audio)
+    print(
+        f"[ASDX] MiniMax H3 turbo LoRA recipe matched for '{lora_name}': "
+        f"shift_video={shift_video}, shift_audio={shift_audio} applied automatically -- "
+        f"set ASDX_MiniMaxH3Sampler's steps to {steps} to match (SceneWorks-measured recipe)."
+    )
+    return {**model, "config": new_config}
+
+
 # ── Diffusers/PEFT FLUX.1 / Flux.2 LoRA key mapping ─────────────────────
 #
 # A diffusers-trained FLUX.1 or Flux.2/Klein LoRA (e.g. ai-toolkit,
@@ -2030,6 +2095,7 @@ class ASDX_LoraLoader(io.ComfyNode):
         # _apply_lora_to_transformer docstring).
         new_transformer = cls._apply_lora_to_transformer(transformer, lora, model["config"])
         new_model = {**model, "transformer": new_transformer}
+        new_model = _maybe_apply_minimax_h3_turbo_recipe(lora_name, new_model)
 
         # The raw delta/factor arrays are already merged into new_transformer
         # and never read again below -- `lora` otherwise stays referenced by
@@ -2584,6 +2650,9 @@ class ASDX_MultiLoraLoader(io.ComfyNode):
 
             clip = _apply_lora_to_clip(clip, lora_path, strength_clip)
 
+            updated = _maybe_apply_minimax_h3_turbo_recipe(lora_name, {**model, "config": config})
+            config = updated["config"]
+
             applied_any = True
             print(f"[ASDX] MultiLoRA: '{lora_name}' "
                   f"(model={strength_model:.2f}, clip={strength_clip:.2f})")
@@ -2592,7 +2661,7 @@ class ASDX_MultiLoraLoader(io.ComfyNode):
             print("[ASDX] MultiLoRA: no LoRAs to apply")
             return io.NodeOutput(model, clip)
 
-        return io.NodeOutput({**model, "transformer": transformer}, clip)
+        return io.NodeOutput({**model, "transformer": transformer, "config": config}, clip)
 
 
 # ── LoRA Schedule (per-step strength modulation) ─────────────────────
