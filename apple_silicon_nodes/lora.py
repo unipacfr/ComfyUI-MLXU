@@ -31,6 +31,7 @@ from . import bridge
 from .native import FluxTransformer
 from .native.flux2 import Flux2Transformer
 from .native.krea2 import SingleStreamDiT
+from .native.minimax_h3.model import MiniMaxH3Model
 from .native.zimage import NextDiT
 from .native.safetensors_header import read_safetensors_header
 from .native.sdxl import UNetModel as SDXLUNetModel
@@ -1639,6 +1640,86 @@ def _apply_lora_residual_to_zimage(transformer: Any, lora: "LoRAAdapter") -> Any
     return new_transformer
 
 
+def _apply_lora_to_minimax_h3(transformer: Any, lora: "LoRAAdapter", config: Any) -> Any:
+    """Merge LoRA deltas into MiniMax H3's DiT, dequantizing/requantizing
+    the four big per-block linears (`attn.qkv_proj`, `attn.out_proj`,
+    `mlp.fc1`, `mlp.fc2`) that `load_minimax_h3_from_gguf` keeps in MLX's
+    native quantized format (see `quantized_linear.py`'s module docstring
+    for why -- the dense weight doesn't fit in 64GB).
+
+    The generic merge loop below (`_apply_lora_to_transformer`'s fallthrough
+    path) assumes every targeted parameter is a dense `[out, in]` array
+    matching the LoRA delta's shape 1:1. For a quantized linear, `.weight`
+    is instead a packed array whose last dimension is narrower by the bit
+    width's pack factor (4-bit -> 8x narrower), so `value + delta * scale`
+    broadcasts two differently-shaped matrices -- this is what produced the
+    `[broadcast_shapes] (21504,672) and (21504,5376)` crash. Fixed by
+    dequantizing the current packed weight, adding the dense delta, and
+    requantizing with the module's own `group_size`/`bits` (read off the
+    live module rather than assumed, in case a future loader call changes
+    them) -- the same dequantize/operate/requantize shape this project
+    already uses to build these weights in the first place
+    (`weight_map.py::load_minimax_h3_from_gguf`).
+    """
+    from mlx.utils import tree_flatten, tree_unflatten
+
+    from .native.minimax_h3.weight_map import _is_big_linear
+
+    model_flat = dict(tree_flatten(transformer.parameters()))
+    quantized_modules = {
+        name: module for name, module in transformer.named_modules()
+        if isinstance(module, nn.QuantizedLinear)
+    }
+
+    new_flat = dict(model_flat)
+    applied = 0
+    for stem, module in quantized_modules.items():
+        weight_key = f"{stem}.weight"
+        delta = _materialize_delta(weight_key, lora)
+        if delta is None:
+            continue
+        dense = mx.dequantize(
+            model_flat[weight_key], model_flat[f"{stem}.scales"], model_flat[f"{stem}.biases"],
+            group_size=module.group_size, bits=module.bits,
+        )
+        merged_dense = dense.astype(mx.float32) + delta.astype(mx.float32) * lora.scale
+        w_q, scales, biases = mx.quantize(merged_dense, group_size=module.group_size, bits=module.bits)
+        new_flat[weight_key] = w_q
+        new_flat[f"{stem}.scales"] = scales
+        new_flat[f"{stem}.biases"] = biases
+        applied += 1
+        mx.eval(w_q, scales, biases)
+        mx.clear_cache()
+
+    for flat_key, value in model_flat.items():
+        stem = flat_key[: -len(".weight")] if flat_key.endswith(".weight") else None
+        if stem in quantized_modules or flat_key.endswith((".scales", ".biases")):
+            continue  # handled above, or belongs to an already-handled quantized triple
+        delta = _materialize_delta(flat_key, lora)
+        if delta is not None:
+            new_flat[flat_key] = value + delta.astype(value.dtype) * lora.scale
+            applied += 1
+
+    if applied == 0:
+        print("[ASDX] LoRA: no matching weights found")
+        return transformer
+
+    # A fresh `type(transformer)(config)` is dense (plain `nn.Linear`), so its
+    # module tree wouldn't have the `.scales`/`.biases` leaves `new_flat`
+    # carries for the four quantized linears -- re-quantize the skeleton
+    # with the SAME group_size/bits the source model actually used (read off
+    # a live quantized module, not assumed) before `.update()`, exactly like
+    # `load_minimax_h3_from_gguf` builds it.
+    sample_module = next(iter(quantized_modules.values()))
+    new_transformer = type(transformer)(config)
+    nn.quantize(new_transformer, group_size=sample_module.group_size, bits=sample_module.bits,
+                class_predicate=_is_big_linear)
+    new_transformer.update(tree_unflatten(list(new_flat.items())))
+    mx.eval(new_transformer.parameters())
+    print(f"[ASDX] LoRA: applied {applied}/{len(lora.deltas) + len(lora.factors)} deltas (MiniMax H3)")
+    return new_transformer
+
+
 # ── Diffusers/PEFT FLUX.1 / Flux.2 LoRA key mapping ─────────────────────
 #
 # A diffusers-trained FLUX.1 or Flux.2/Klein LoRA (e.g. ai-toolkit,
@@ -2272,6 +2353,13 @@ class ASDX_LoraLoader(io.ComfyNode):
             # Z-Image -- Phase 3 forward-time residual, see canon and the
             # module comment above `_apply_lora_residual_to_zimage`.
             return _apply_lora_residual_to_zimage(transformer, lora)
+        if isinstance(transformer, MiniMaxH3Model):
+            # MiniMax H3's DiT keeps its 4 big per-block linears in MLX's
+            # quantized format (memory, not a Phase 1-3 residual choice) --
+            # the merge below assumes dense `[out, in]` weights and breaks on
+            # a quantized target's packed shape, see
+            # `_apply_lora_to_minimax_h3`'s docstring.
+            return _apply_lora_to_minimax_h3(transformer, lora, config)
 
         # key could be something like "double_blocks.0.img_attn.qkv.weight"
         # or "single_blocks.5.mlp_0.weight" — same dotted-string convention
