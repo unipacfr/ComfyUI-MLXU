@@ -66,6 +66,81 @@ from comfy_api.latest import io
 _DIT_CACHE: dict[str, Any] = {}
 _TEXT_ENCODER_CACHE: dict[str, Any] = {}
 
+
+def _gate_minimax_h3_component(component: str, path: Path, precision: str, other_cache: dict) -> MemoryEstimate | None:
+    """Predict `component`'s (`"dit"` or `"text_encoder"`) peak footprint via
+    `memory_calibration.py`, then -- since MiniMax H3's text encoder
+    (`_TEXT_ENCODER_CACHE`) and DiT (`_DIT_CACHE`) cache independently and
+    neither loader node otherwise knows the other is resident -- check
+    whether loading this component on top of an already-resident other one
+    would exceed this machine's total memory.
+
+    Pattern ported from SceneWorks' `mlx_fit_gate.rs`: predict from on-disk
+    size (not live allocator counters -- MLX's lazy evaluation means those
+    read close to zero right after a load), and when the combined footprint
+    clearly cannot fit, evict the other component (sequential offload,
+    bounding the peak to the larger single component) instead of proceeding
+    toward a near-certain OOM. Only the exact `total_bytes` ceiling
+    (`sysctl hw.memsize`) triggers eviction -- the "available" estimate is
+    too unreliable on unified memory to act on (see
+    `check_fits_or_warn`'s docstring), so an available-only overshoot is a
+    warning, same as the single-component gate.
+
+    Returns the `MemoryEstimate` for `component` alone (or `None` if the file
+    couldn't be stat'd -- e.g. a mocked path in a test -- mirroring
+    `loader.py::_gate_memory_before_load`'s own degrade-on-failure
+    behavior), to stash on its cache entry so the OTHER loader can read it
+    back next time.
+    """
+    from . import bridge
+    from .memory_calibration import (
+        LoadShape,
+        available_unified_memory_bytes,
+        check_fits_or_warn,
+        predict_peak_memory,
+    )
+
+    try:
+        file_size_bytes = path.stat().st_size
+    except OSError as e:
+        print(f"[ASDX] MiniMax H3 memory gate: stat failed ({e}), skipping memory gate")
+        return None
+
+    shape = LoadShape(
+        family=f"minimax_h3_{component}",
+        quant_format="gguf",
+        precision=precision,
+        low_memory_mode=False,
+        file_size_bytes=file_size_bytes,
+    )
+
+    other_entries = list(other_cache.values())
+    if not other_entries:
+        return check_fits_or_warn(shape)
+
+    estimate = predict_peak_memory(shape)
+    other_peak = other_entries[0].get("_predicted_peak_bytes", 0)
+    combined = estimate.predicted_peak_bytes + other_peak
+    total_bytes, available_bytes = available_unified_memory_bytes()
+
+    print(f"[ASDX] MiniMax H3 memory gate: {component}={estimate.predicted_peak_gb:.1f}GB "
+          f"({estimate.status}) + resident other={other_peak / (1024**3):.1f}GB = "
+          f"{combined / (1024**3):.1f}GB vs {total_bytes / (1024**3):.1f}GB total")
+
+    if total_bytes and combined > total_bytes:
+        other_name = "text encoder" if component == "dit" else "DiT"
+        print(f"[ASDX] MiniMax H3 memory gate: combined footprint exceeds total memory -- "
+              f"evicting the resident {other_name} before loading (sequential offload).")
+        other_cache.clear()
+        bridge.clear_mlx_cache()
+    elif available_bytes and combined > available_bytes:
+        overshoot = (combined - available_bytes) / available_bytes
+        print(f"[ASDX] MiniMax H3 memory gate: combined footprint may exceed currently "
+              f"available memory ({available_bytes / (1024**3):.1f}GB) by {overshoot*100:.0f}% "
+              f"-- proceeding (this is an estimate, not a guarantee).")
+
+    return estimate
+
 # Ported from comfy_extras/nodes_minimax_h3.py -- frame-count/latent-shape
 # math for the video/audio VAEs' downscale ratios (16x spatial, 4x temporal
 # video; 40 latent-frames/sec audio).
@@ -312,6 +387,8 @@ class ASDX_MiniMaxH3ModelLoader(io.ComfyNode):
 
         from .native.minimax_h3.weight_map import load_minimax_h3_from_gguf
 
+        estimate = _gate_minimax_h3_component("dit", path, precision, _TEXT_ENCODER_CACHE)
+
         _DIT_CACHE.clear()  # one resident MiniMax H3 DiT at a time -- see ASDX_DiffusionLoader's own eviction note
         model = load_minimax_h3_from_gguf(path, dtype=precision)
         model_desc = {
@@ -322,6 +399,7 @@ class ASDX_MiniMaxH3ModelLoader(io.ComfyNode):
             "transformer": model,
             "config": model.config,
             "precision": precision,
+            "_predicted_peak_bytes": estimate.predicted_peak_bytes if estimate else 0,
         }
         _DIT_CACHE[cache_key] = model_desc
         return io.NodeOutput(model_desc)
@@ -373,6 +451,8 @@ class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
 
         from .native.minimax_h3.text_encoder_weight_map import load_qwen3_text_encoder_from_gguf
 
+        estimate = _gate_minimax_h3_component("text_encoder", path, precision, _DIT_CACHE)
+
         _TEXT_ENCODER_CACHE.clear()
         encoder = load_qwen3_text_encoder_from_gguf(path, dtype=precision)
         result = {
@@ -381,6 +461,7 @@ class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
             "path": str(path),
             "encoder": encoder,
             "precision": precision,
+            "_predicted_peak_bytes": estimate.predicted_peak_bytes if estimate else 0,
         }
         _TEXT_ENCODER_CACHE[cache_key] = result
         return io.NodeOutput(result)
