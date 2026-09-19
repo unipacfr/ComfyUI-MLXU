@@ -909,7 +909,12 @@ def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
     elif quant_format == QuantFormat.FP8_SCALED:
         state = _dequantize_fp8_scaled(state, Path(path).name)
     result = {}
-    for k, v in state.items():
+    # pop (not .items()): drops each torch tensor from `state` as soon as it's
+    # converted, so the torch CPU dict and the growing mx dict don't both stay
+    # resident for the whole checkpoint (same fix as the per-family transformer
+    # loaders below, sc-11030-style).
+    for k in list(state.keys()):
+        v = state.pop(k)
         if v.dtype in (torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2):
             v = v.float()
         result[k] = mx.array(v.cpu().numpy())
@@ -957,7 +962,7 @@ def load_transformer(
     matched = 0
     for flat_key, value in model_flat:
         if flat_key in normalized:
-            new_flat.append((flat_key, normalized[flat_key].astype(config.mlx_dtype)))
+            new_flat.append((flat_key, normalized.pop(flat_key).astype(config.mlx_dtype)))
             matched += 1
         else:
             new_flat.append((flat_key, value))

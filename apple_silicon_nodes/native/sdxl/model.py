@@ -420,7 +420,7 @@ def load_sdxl_unet(path, dtype: str = "float16") -> UNetModel:
     matched = 0
     for flat_key, value in model_flat:
         if flat_key in state_dict:
-            loaded = state_dict[flat_key]
+            loaded = state_dict.pop(flat_key)
             if loaded.ndim == 4:
                 # Every 4D tensor in this checkpoint is a Conv2d kernel:
                 # PyTorch [out, in, kh, kw] -> MLX [out, kh, kw, in].

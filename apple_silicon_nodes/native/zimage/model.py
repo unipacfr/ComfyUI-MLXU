@@ -404,7 +404,7 @@ def load_zimage_transformer(path, dtype: str = "float16") -> NextDiT:
     matched = 0
     for flat_key, value in model_flat:
         if flat_key in state_dict:
-            new_flat.append((flat_key, state_dict[flat_key].astype(config.mlx_dtype)))
+            new_flat.append((flat_key, state_dict.pop(flat_key).astype(config.mlx_dtype)))
             matched += 1
         else:
             new_flat.append((flat_key, value))
