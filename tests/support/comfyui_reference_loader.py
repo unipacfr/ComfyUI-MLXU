@@ -35,3 +35,22 @@ def load_real_comfy_minimax_model():
     except ImportError as e:
         pytest.skip(f"comfy.ldm.minimax.model not importable: {e}")
     return mm
+
+
+def load_real_comfy_qwen3vl():
+    """Real `comfy.text_encoders.qwen3vl`, `qwen_vl` and `comfy.ops`, for
+    numerical parity tests of the MLX vision tower."""
+    if not _COMFYUI_ROOT.exists() or not _COMFYUI_VENV_SITE_PACKAGES.exists():
+        pytest.skip("ComfyUI install not present on this machine")
+    for name in list(sys.modules):
+        if name == "comfy" or name.startswith("comfy."):
+            del sys.modules[name]
+    sys.path.insert(0, str(_COMFYUI_ROOT))
+    sys.path.insert(0, str(_COMFYUI_VENV_SITE_PACKAGES))
+    try:
+        import comfy.ops as ops
+        import comfy.text_encoders.qwen3vl as qwen3vl
+        import comfy.text_encoders.qwen_vl as qwen_vl
+    except ImportError as e:
+        pytest.skip(f"comfy Qwen3-VL modules not importable: {e}")
+    return qwen3vl, qwen_vl, ops
