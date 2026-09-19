@@ -1109,7 +1109,11 @@ def load_krea2_transformer(
             # precision instead of blanket-downcasting to config.mlx_dtype
             # (see f32_keys comment above).
             target_dtype = mx.float32 if flat_key in f32_keys else config.mlx_dtype
-            new_flat.append((flat_key, state_dict[flat_key].astype(target_dtype)))
+            # pop (not index): drops the source tensor from state_dict as soon as
+            # it's consumed, so the source and the growing transformer don't both
+            # stay resident -- bounds the load-time peak to ~the built size instead
+            # of source+built (same fix as mlx-gen's Weights::remove(), sc-11030).
+            new_flat.append((flat_key, state_dict.pop(flat_key).astype(target_dtype)))
             matched += 1
         else:
             # mx.random-initialized params (nn.Linear's default bias is a
