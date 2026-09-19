@@ -67,6 +67,14 @@ _DIT_CACHE: dict[str, Any] = {}
 _TEXT_ENCODER_CACHE: dict[str, Any] = {}
 
 
+def _is_h3_checkpoint_name(name: str) -> bool:
+    """GGUF files are always listed (this extension is only registered for
+    these loaders); safetensors are filtered by name because the shared
+    diffusion_models/text_encoders folders hold every other family's too."""
+    lower = name.lower()
+    return lower.endswith(".gguf") or (lower.endswith(".safetensors") and "h3" in lower)
+
+
 def _gate_minimax_h3_component(component: str, path: Path, precision: str, other_cache: dict) -> MemoryEstimate | None:
     """Predict `component`'s (`"dit"` or `"text_encoder"`) peak footprint via
     `memory_calibration.py`, then -- since MiniMax H3's text encoder
@@ -108,7 +116,7 @@ def _gate_minimax_h3_component(component: str, path: Path, precision: str, other
 
     shape = LoadShape(
         family=f"minimax_h3_{component}",
-        quant_format="gguf",
+        quant_format="gguf" if path.suffix.lower() == ".gguf" else "safetensors",
         precision=precision,
         low_memory_mode=False,
         file_size_bytes=file_size_bytes,
@@ -340,16 +348,16 @@ def _replace_sigma_shifts(config: Any, shift_video: float, shift_audio: float) -
 
 
 class ASDX_MiniMaxH3ModelLoader(io.ComfyNode):
-    """Load a MiniMax H3 DiT GGUF checkpoint (quantized, see
-    `native/minimax_h3/weight_map.py`'s module docstring for why dense
-    loading would not fit in 64GB). GGUF only -- safetensors (ComfyUI
-    INT8-tensorwise) loading is not implemented (see `weight_map.py`)."""
+    """Load a MiniMax H3 DiT checkpoint -- GGUF or ComfyUI safetensors (dense or
+    INT8/ConvRot; the W4A8 variant is rejected) -- requantized to MLX 4-bit
+    (see `native/minimax_h3/weight_map.py`'s module docstring for why dense
+    loading would not fit in 64GB)."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
             node_id="ASDX_MiniMaxH3ModelLoader",
-            display_name="🍏 ASDX MiniMax H3 Model Loader (GGUF)",
+            display_name="🍏 ASDX MiniMax H3 Model Loader",
             category="ASDX/Loaders",
             inputs=[
                 io.Combo.Input("model_name", options=cls._get_models()),
@@ -367,7 +375,7 @@ class ASDX_MiniMaxH3ModelLoader(io.ComfyNode):
             # "diffusion_models" already scans both models/diffusion_models/
             # and models/unet/ (see folder_paths.py) -- no separate "unet" key
             # exists in stock ComfyUI, so there is nothing to loop over here.
-            return [n for n in folder_paths.get_filename_list("diffusion_models") if n.lower().endswith(".gguf")]
+            return [n for n in folder_paths.get_filename_list("diffusion_models") if _is_h3_checkpoint_name(n)]
         except Exception:
             return []
 
@@ -385,12 +393,12 @@ class ASDX_MiniMaxH3ModelLoader(io.ComfyNode):
             print(f"[ASDX] MiniMax H3 model cache hit: {model_name}")
             return io.NodeOutput(_DIT_CACHE[cache_key])
 
-        from .native.minimax_h3.weight_map import load_minimax_h3_from_gguf
+        from .native.minimax_h3.weight_map import load_minimax_h3_checkpoint
 
         estimate = _gate_minimax_h3_component("dit", path, precision, _TEXT_ENCODER_CACHE)
 
         _DIT_CACHE.clear()  # one resident MiniMax H3 DiT at a time -- see ASDX_DiffusionLoader's own eviction note
-        model = load_minimax_h3_from_gguf(path, dtype=precision)
+        model = load_minimax_h3_checkpoint(path, dtype=precision)
         model_desc = {
             "type": "asdx_model",
             "family": "minimax_h3",
@@ -406,14 +414,14 @@ class ASDX_MiniMaxH3ModelLoader(io.ComfyNode):
 
 
 class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
-    """Load MiniMax H3's Qwen3-VL-32B text encoder GGUF checkpoint
-    (quantized, see `native/minimax_h3/text_encoder_weight_map.py`)."""
+    """Load MiniMax H3's Qwen3-VL-32B text encoder (GGUF or ComfyUI
+    INT8/ConvRot safetensors, see `native/minimax_h3/text_encoder_weight_map.py`)."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
             node_id="ASDX_MiniMaxH3TextEncoderLoader",
-            display_name="🍏 ASDX MiniMax H3 Text Encoder Loader (GGUF)",
+            display_name="🍏 ASDX MiniMax H3 Text Encoder Loader",
             category="ASDX/Loaders",
             inputs=[
                 io.Combo.Input("encoder_name", options=cls._get_encoders()),
@@ -431,7 +439,7 @@ class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
             # "text_encoders" already scans both models/text_encoders/ and
             # models/clip/ (see folder_paths.py) -- no separate "clip" key
             # exists in stock ComfyUI, so there is nothing to loop over here.
-            return [n for n in folder_paths.get_filename_list("text_encoders") if n.lower().endswith(".gguf")]
+            return [n for n in folder_paths.get_filename_list("text_encoders") if _is_h3_checkpoint_name(n)]
         except Exception:
             return []
 
@@ -449,12 +457,12 @@ class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
             print(f"[ASDX] MiniMax H3 text encoder cache hit: {encoder_name}")
             return io.NodeOutput(_TEXT_ENCODER_CACHE[cache_key])
 
-        from .native.minimax_h3.text_encoder_weight_map import load_qwen3_text_encoder_from_gguf
+        from .native.minimax_h3.text_encoder_weight_map import load_qwen3_text_encoder_checkpoint
 
         estimate = _gate_minimax_h3_component("text_encoder", path, precision, _DIT_CACHE)
 
         _TEXT_ENCODER_CACHE.clear()
-        encoder = load_qwen3_text_encoder_from_gguf(path, dtype=precision)
+        encoder = load_qwen3_text_encoder_checkpoint(path, dtype=precision)
         result = {
             "type": "asdx_minimax_h3_text_encoder",
             "name": encoder_name,

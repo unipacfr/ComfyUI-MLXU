@@ -2,8 +2,8 @@
 ASDX_MiniMaxH3TextEncode.
 
 Runs in the bare project venv via ``comfy_stub.load_node_module``. Real
-weight loading (``load_minimax_h3_from_gguf`` /
-``load_qwen3_text_encoder_from_gguf``) is monkeypatched out -- those
+weight loading (``load_minimax_h3_checkpoint`` /
+``load_qwen3_text_encoder_checkpoint``) is monkeypatched out -- those
 functions already have their own dedicated, real-checkpoint-verified tests
 (``test_weight_map.py`` / ``test_text_encoder_weight_map.py``); this file
 only exercises the node-level plumbing (file resolution, caching, the
@@ -119,7 +119,7 @@ def test_model_loader_calls_weight_map_and_caches(monkeypatch):
         return fake_model
 
     weight_map_stub = types.ModuleType("apple_silicon_nodes.native.minimax_h3.weight_map")
-    weight_map_stub.load_minimax_h3_from_gguf = fake_load
+    weight_map_stub.load_minimax_h3_checkpoint = fake_load
     monkeypatch.setitem(sys.modules, "apple_silicon_nodes.native.minimax_h3.weight_map", weight_map_stub)
 
     result = ASDX_MiniMaxH3ModelLoader.execute("h3.gguf", precision="float16")
@@ -147,7 +147,7 @@ def test_text_encoder_loader_calls_weight_map(monkeypatch):
         return fake_encoder
 
     stub = types.ModuleType("apple_silicon_nodes.native.minimax_h3.text_encoder_weight_map")
-    stub.load_qwen3_text_encoder_from_gguf = fake_load
+    stub.load_qwen3_text_encoder_checkpoint = fake_load
     monkeypatch.setitem(sys.modules, "apple_silicon_nodes.native.minimax_h3.text_encoder_weight_map", stub)
 
     result = ASDX_MiniMaxH3TextEncoderLoader.execute("qwen.gguf")

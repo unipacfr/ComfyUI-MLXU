@@ -1,4 +1,4 @@
-"""Loads the Qwen3-VL-32B text encoder GGUF checkpoint into a
+"""Loads the Qwen3-VL-32B text encoder checkpoint (GGUF or safetensors) into a
 `Qwen3TextEncoder`, streaming one tensor at a time and keeping every large
 weight (all attention/MLP linears, plus the embedding table) in MLX's own
 quantized format -- same rationale and mechanism as
@@ -22,8 +22,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
-from ..gguf.dequant import dequantize_tensor
-from ..gguf.reader import GGUFHeader, read_gguf_header
+from .checkpoint_source import open_checkpoint
 from .quantized_linear import DEFAULT_BITS, DEFAULT_GROUP_SIZE, requantize
 from .text_encoder import Qwen3TextEncoder
 from .text_encoder_config import detect_qwen3_text_encoder_config
@@ -44,11 +43,11 @@ def _is_quantizable(path: str, module: nn.Module) -> bool:
     return isinstance(module, (nn.Linear, nn.Embedding))
 
 
-def _placeholder_state_dict(header: GGUFHeader) -> dict[str, mx.array]:
-    return {name: mx.zeros(info.torch_shape) for name, info in header.tensors.items()}
+def _placeholder_state_dict(shapes: dict[str, tuple[int, ...]]) -> dict[str, mx.array]:
+    return {name: mx.zeros(shape) for name, shape in shapes.items()}
 
 
-def load_qwen3_text_encoder_from_gguf(
+def load_qwen3_text_encoder_checkpoint(
     path: str | Path,
     dtype: str = "float16",
     group_size: int = DEFAULT_GROUP_SIZE,
@@ -59,9 +58,10 @@ def load_qwen3_text_encoder_from_gguf(
     quantized (never materializing the whole checkpoint's dense size at
     once)."""
     path = Path(path)
-    header = read_gguf_header(path)
+    source = open_checkpoint(path)
+    shapes = source.shapes()
 
-    config = detect_qwen3_text_encoder_config(_placeholder_state_dict(header), dtype=dtype)
+    config = detect_qwen3_text_encoder_config(_placeholder_state_dict(shapes), dtype=dtype)
     model = Qwen3TextEncoder(config)
     nn.quantize(model, group_size=group_size, bits=bits, class_predicate=_is_quantizable)
 
@@ -69,29 +69,37 @@ def load_qwen3_text_encoder_from_gguf(
     quantized_module_prefixes = {key[: -len(".scales")] for key in model_flat if key.endswith(".scales")}
 
     matched = 0
-    for name in header.tensors:
+    for name in shapes:
         module_prefix = name[: -len(".weight")] if name.endswith(".weight") else None
         is_quantized_weight = module_prefix is not None and module_prefix in quantized_module_prefixes
 
         if not is_quantized_weight and name not in model_flat:
             continue
 
-        dense = dequantize_tensor(path, header, name)
+        dense = source.get(name)
 
         if is_quantized_weight:
             w_q, scales, biases = requantize(dense.astype(mx.float32), group_size=group_size, bits=bits)
             model_flat[f"{module_prefix}.weight"] = w_q
             model_flat[f"{module_prefix}.scales"] = scales
             model_flat[f"{module_prefix}.biases"] = biases
+            # requantize is lazy: without evaluating here, the graph keeps every
+            # dense fp32 `dense` alive until the final mx.eval (measured 79GB
+            # peak vs 12.8GB resident on the real 20B DiT).
+            mx.eval(w_q, scales, biases)
             matched += 3
         else:
             model_flat[name] = dense.astype(model_flat[name].dtype)
+            mx.eval(model_flat[name])
             matched += 1
         del dense
 
     model.update(tree_unflatten(list(model_flat.items())))
     mx.eval(model.parameters())
 
-    print(f"[ASDX] Qwen3 text encoder (GGUF): matched {matched}/{len(model_flat)} params from checkpoint")
+    print(f"[ASDX] Qwen3 text encoder ({path.suffix.lstrip(".").lower()}): matched {matched}/{len(model_flat)} params from checkpoint")
     _check_weight_match(matched, len(model_flat), "Qwen3 text encoder", path)
     return model
+
+
+load_qwen3_text_encoder_from_gguf = load_qwen3_text_encoder_checkpoint  # kept for existing callers/tests

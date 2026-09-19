@@ -37,6 +37,16 @@ _DEFAULT_MULTIPLIER = 2.3        # weights + activations + MLX overhead, rough s
 _FAMILY_HEURISTIC_MULTIPLIER: dict[str, float] = {
     # Populated as real measurements justify a per-family override; until
     # then every family shares the default above.
+    #
+    # MiniMax H3 requantizes every big linear to MLX 4-bit at load (see
+    # native/minimax_h3/quantized_linear.py), so resident size depends on the
+    # parameter count, not on the source file's quant format. Measured on the
+    # real checkpoints (2026-09-19, per-tensor eval loader): DiT peak 14.1GB
+    # from a 20GB INT8-ConvRot safetensors, 13.4GB from the 13.9GB Q5_0 GGUF;
+    # text encoder peak 16.8GB from the 26GB INT8 safetensors, 16.2GB from
+    # the 18GB Q4_K_M GGUF. 1.0x + OS_RESERVE_GB covers every one of them.
+    "minimax_h3_dit": 1.0,
+    "minimax_h3_text_encoder": 1.0,
 }
 
 _MODULE_DIR = Path(__file__).parent
