@@ -54,3 +54,23 @@ def load_real_comfy_qwen3vl():
     except ImportError as e:
         pytest.skip(f"comfy Qwen3-VL modules not importable: {e}")
     return qwen3vl, qwen_vl, ops
+
+
+def load_real_comfy_text_encoders():
+    """Real `comfy.text_encoders.minimax`, `qwen_vl`, `llama` and `comfy.ops`,
+    for parity tests of the MiniMax H3 vision-grounded text encoder."""
+    if not _COMFYUI_ROOT.exists() or not _COMFYUI_VENV_SITE_PACKAGES.exists():
+        pytest.skip("ComfyUI install not present on this machine")
+    for name in list(sys.modules):
+        if name == "comfy" or name.startswith("comfy."):
+            del sys.modules[name]
+    sys.path.insert(0, str(_COMFYUI_ROOT))
+    sys.path.insert(0, str(_COMFYUI_VENV_SITE_PACKAGES))
+    try:
+        import comfy.ops as ops
+        import comfy.text_encoders.llama as llama
+        import comfy.text_encoders.minimax as minimax
+        import comfy.text_encoders.qwen_vl as qwen_vl
+    except ImportError as e:
+        pytest.skip(f"comfy text-encoder modules not importable: {e}")
+    return minimax, qwen_vl, llama, ops

@@ -426,6 +426,8 @@ class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
             inputs=[
                 io.Combo.Input("encoder_name", options=cls._get_encoders()),
                 io.Combo.Input("precision", options=["float16", "bfloat16", "float32"], default="float16"),
+                io.Boolean.Input("load_vision", default=False,
+                                 tooltip="Also load the Qwen3-VL vision tower (needed for image/video references; ~2.4GB more)."),
             ],
             outputs=[
                 io.Custom("asdx_minimax_h3_text_encoder").Output(display_name="text_encoder"),
@@ -444,7 +446,7 @@ class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
             return []
 
     @classmethod
-    def execute(cls, encoder_name: str, precision: str = "float16") -> io.NodeOutput:
+    def execute(cls, encoder_name: str, precision: str = "float16", load_vision: bool = False) -> io.NodeOutput:
         import folder_paths
 
         found = folder_paths.get_full_path("text_encoders", encoder_name)
@@ -452,7 +454,7 @@ class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
             raise RuntimeError(f"ASDX MiniMax H3 Text Encoder Loader: could not find '{encoder_name}'.")
         path = Path(found)
 
-        cache_key = f"{path}:{precision}"
+        cache_key = f"{path}:{precision}:vision={int(load_vision)}"
         if cache_key in _TEXT_ENCODER_CACHE:
             print(f"[ASDX] MiniMax H3 text encoder cache hit: {encoder_name}")
             return io.NodeOutput(_TEXT_ENCODER_CACHE[cache_key])
@@ -463,16 +465,59 @@ class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
 
         _TEXT_ENCODER_CACHE.clear()
         encoder = load_qwen3_text_encoder_checkpoint(path, dtype=precision)
+        tower = None
+        if load_vision:
+            from .native.minimax_h3.vision_weight_map import load_vision_tower
+
+            tower = load_vision_tower(path)  # separate open of the same file: TensorSource.get() pops tensors
+        # measured peak of the tower load alone: 3.6GB (brick 1)
+        peak = (estimate.predicted_peak_bytes if estimate else 0) + (int(3.6e9) if load_vision else 0)
         result = {
             "type": "asdx_minimax_h3_text_encoder",
             "name": encoder_name,
             "path": str(path),
             "encoder": encoder,
+            "vision_tower": tower,
             "precision": precision,
-            "_predicted_peak_bytes": estimate.predicted_peak_bytes if estimate else 0,
+            "_predicted_peak_bytes": peak,
         }
         _TEXT_ENCODER_CACHE[cache_key] = result
         return io.NodeOutput(result)
+
+
+def encode_minimax_h3_prompt(
+    text_encoder: dict, prompt: str, *, images: list | None = None, ref_items: list | None = None
+) -> dict:
+    """Tokenize (ComfyUI's weight-free `MiniMaxH3Tokenizer`), unfold vision
+    blocks, and encode with the native encoder (+ vision tower when the
+    prompt has images). `images`: fl2va keyframes (ComfyUI IMAGE tensors);
+    `ref_items`: ref2va items in request order (see
+    `comfy_extras/nodes_minimax_h3.py::MiniMaxH3ReferenceToVideo`). Returns the
+    conditioning dict the sampler consumes, plus `token_tags`."""
+    if not isinstance(text_encoder, dict) or text_encoder.get("type") != "asdx_minimax_h3_text_encoder":
+        raise RuntimeError("ASDX MiniMax H3 Text Encode: expected the output of ASDX_MiniMaxH3TextEncoderLoader.")
+
+    import comfy.text_encoders.minimax
+
+    from .native.minimax_h3.vision_conditioning import encode_with_vision
+
+    tokenizer = comfy.text_encoders.minimax.MiniMaxH3Tokenizer()
+    entries = tokenizer.tokenize_with_weights(
+        prompt, images=images or [], minimax_ref_items=ref_items
+    )["qwen3vl_32b"][0]
+    hidden_states, tags = encode_with_vision(text_encoder["encoder"], text_encoder.get("vision_tower"), entries)
+    if not bool(mx.all(mx.isfinite(hidden_states)).item()):
+        raise RuntimeError(
+            "ASDX MiniMax H3 Text Encode: produced a non-finite (NaN/Inf) "
+            "embedding -- aborting before the expensive sampling pass."
+        )
+    print(f"[ASDX] MiniMax H3 Text Encode: {len(prompt)} chars, {hidden_states.shape[0]} rows")
+    return {
+        "type": "minimax_h3",
+        "hidden_states": hidden_states,
+        "token_tags": mx.array(tags),
+        "text": prompt,
+    }
 
 
 class ASDX_MiniMaxH3TextEncode(io.ComfyNode):
@@ -504,30 +549,7 @@ class ASDX_MiniMaxH3TextEncode(io.ComfyNode):
 
     @classmethod
     def execute(cls, text_encoder: dict, prompt: str) -> io.NodeOutput:
-        if not isinstance(text_encoder, dict) or text_encoder.get("type") != "asdx_minimax_h3_text_encoder":
-            raise RuntimeError("ASDX MiniMax H3 Text Encode: expected the output of ASDX_MiniMaxH3TextEncoderLoader.")
-
-        import comfy.text_encoders.minimax
-
-        tokenizer = comfy.text_encoders.minimax.MiniMaxH3Tokenizer()
-        tokens = tokenizer.tokenize_with_weights(prompt)["qwen3vl_32b"][0]
-        input_ids = mx.array([token_id for token_id, _weight in tokens], dtype=mx.int32)
-
-        encoder = text_encoder["encoder"]
-        hidden_states = encoder(input_ids)
-        mx.eval(hidden_states)
-        if not bool(mx.all(mx.isfinite(hidden_states)).item()):
-            raise RuntimeError(
-                "ASDX MiniMax H3 Text Encode: produced a non-finite (NaN/Inf) "
-                "embedding -- aborting before the expensive sampling pass."
-            )
-
-        print(f"[ASDX] MiniMax H3 Text Encode: {len(prompt)} chars, {len(tokens)} tokens")
-        return io.NodeOutput({
-            "type": "minimax_h3",
-            "hidden_states": hidden_states,
-            "text": prompt,
-        })
+        return io.NodeOutput(encode_minimax_h3_prompt(text_encoder, prompt))
 
 
 class ASDX_MiniMaxH3Sampler(io.ComfyNode):

@@ -18,13 +18,17 @@ bidirectional-attention option exists in the reference to omit.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .model import RMSNorm
 from .rope import rms_norm_rope_split_half
 from .text_encoder_config import Qwen3TextEncoderConfig
 from .text_encoder_rope import qwen3_rope_cos_sin
+from .vision_rope import interleaved_mrope_cos_sin
 
 
 class Attention(nn.Module):
@@ -97,6 +101,19 @@ class TransformerBlock(nn.Module):
         return x + self.mlp(self.post_attention_layernorm(x))
 
 
+@dataclass(frozen=True)
+class VisionInputs:
+    """Vision-grounded conditioning for one prompt (fl2va / ref2va): rows that
+    replace text embeddings, DeepStack features added after the first layers,
+    and the M-RoPE position ids. See `vision_conditioning.py`."""
+
+    rows: mx.array                  # [Nv, hidden], merged vision embeddings
+    row_indices: np.ndarray         # [Nv] int, positions in the unfolded sequence
+    deepstack: list[mx.array]       # each [Nv, hidden]; layer i gets deepstack[i] for i < len
+    position_ids: np.ndarray        # [3, S] M-RoPE ids (float32)
+    rope_dims: tuple[int, int, int] = (24, 20, 20)
+
+
 class _Qwen3Backbone(nn.Module):
     """Embedding + `num_hidden_layers` `TransformerBlock`s. No final norm, no
     lm_head (matches `final_norm=False`/`lm_head=False` in the reference
@@ -109,11 +126,20 @@ class _Qwen3Backbone(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [TransformerBlock(config) for _ in range(config.num_hidden_layers)]
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def __call__(self, input_ids: mx.array, vision: VisionInputs | None = None) -> mx.array:
         x = self.embed_tokens(input_ids)
-        cos, sin = qwen3_rope_cos_sin(x.shape[0], self.config.head_dim, self.config.rope_theta)
-        for layer in self.layers:
+        if vision is None:
+            cos, sin = qwen3_rope_cos_sin(x.shape[0], self.config.head_dim, self.config.rope_theta)
+        else:
+            idx = mx.array(np.asarray(vision.row_indices, dtype=np.int32))
+            x[idx] = vision.rows.astype(x.dtype)
+            cos, sin = interleaved_mrope_cos_sin(
+                vision.position_ids, self.config.head_dim, self.config.rope_theta, vision.rope_dims
+            )
+        for i, layer in enumerate(self.layers):
             x = layer(x, cos, sin)
+            if vision is not None and i < len(vision.deepstack):
+                x = x.at[idx].add(vision.deepstack[i].astype(x.dtype))
         return x
 
 
@@ -129,7 +155,9 @@ class Qwen3TextEncoder(nn.Module):
         self.config = config
         self.model = _Qwen3Backbone(config)
 
-    def __call__(self, input_ids: mx.array) -> mx.array:
+    def __call__(self, input_ids: mx.array, vision: VisionInputs | None = None) -> mx.array:
         """`input_ids`: `[S]` int32 token ids (batch already squeezed, this
-        port's convention throughout). Returns `[S, hidden_size]`."""
-        return self.model(input_ids)
+        port's convention throughout); with `vision`, the ids at
+        `vision.row_indices` are placeholders that get replaced. Returns
+        `[S, hidden_size]`."""
+        return self.model(input_ids, vision)

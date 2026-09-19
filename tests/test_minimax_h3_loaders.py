@@ -162,11 +162,13 @@ def test_text_encode_rejects_wrong_input_type():
         ASDX_MiniMaxH3TextEncode.execute({"type": "something_else"}, "a prompt")
 
 
-def _install_fake_minimax_tokenizer(monkeypatch, token_ids):
+def _install_fake_minimax_tokenizer(monkeypatch, token_ids, record=None):
     minimax_mod = types.ModuleType("comfy.text_encoders.minimax")
 
     class FakeTokenizer:
-        def tokenize_with_weights(self, text):
+        def tokenize_with_weights(self, text, images=(), minimax_ref_items=None):
+            if record is not None:
+                record.append({"images": images, "minimax_ref_items": minimax_ref_items})
             return {"qwen3vl_32b": [[(tid, 1.0) for tid in token_ids]]}
 
     minimax_mod.MiniMaxH3Tokenizer = FakeTokenizer
@@ -183,7 +185,7 @@ def test_text_encode_runs_tokenizer_and_encoder(monkeypatch):
 
     captured_input_ids = {}
 
-    def fake_encoder(input_ids):
+    def fake_encoder(input_ids, vision=None):
         captured_input_ids["ids"] = input_ids
         return mx.ones((len(token_ids), 8))
 
@@ -203,7 +205,7 @@ def test_text_encode_raises_on_non_finite_output(monkeypatch):
     _install_fake_minimax_tokenizer(monkeypatch, [1, 2, 3])
     text_encoder = {
         "type": "asdx_minimax_h3_text_encoder",
-        "encoder": lambda input_ids: mx.array([[float("nan")] * 4] * 3),
+        "encoder": lambda input_ids, vision=None: mx.array([[float("nan")] * 4] * 3),
     }
     with pytest.raises(RuntimeError, match="non-finite"):
         ASDX_MiniMaxH3TextEncode.execute(text_encoder, "prompt")
@@ -287,3 +289,79 @@ def test_register_gguf_extension_busts_a_cache_populated_before_it_ran(monkeypat
     nodes_module._register_gguf_extension("diffusion_models")
 
     assert ASDX_MiniMaxH3ModelLoader._get_models() == ["minimax_h3.gguf"]
+
+
+def test_text_encoder_loader_loads_vision_tower_only_on_request(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "folder_paths", _fake_folder_paths({"qwen.safetensors": "/models/text_encoders/qwen.safetensors"})
+    )
+    nodes_module._TEXT_ENCODER_CACHE.clear()
+    encoder, tower = Mock(), Mock()
+    tower_calls = []
+
+    enc_stub = types.ModuleType("apple_silicon_nodes.native.minimax_h3.text_encoder_weight_map")
+    enc_stub.load_qwen3_text_encoder_checkpoint = lambda path, dtype: encoder
+    monkeypatch.setitem(sys.modules, "apple_silicon_nodes.native.minimax_h3.text_encoder_weight_map", enc_stub)
+    vis_stub = types.ModuleType("apple_silicon_nodes.native.minimax_h3.vision_weight_map")
+    vis_stub.load_vision_tower = lambda path: tower_calls.append(str(path)) or tower
+    monkeypatch.setitem(sys.modules, "apple_silicon_nodes.native.minimax_h3.vision_weight_map", vis_stub)
+
+    plain = ASDX_MiniMaxH3TextEncoderLoader.execute("qwen.safetensors").values[0]
+    assert plain["vision_tower"] is None and tower_calls == []
+
+    with_vision = ASDX_MiniMaxH3TextEncoderLoader.execute("qwen.safetensors", load_vision=True).values[0]
+    assert with_vision["vision_tower"] is tower and tower_calls == ["/models/text_encoders/qwen.safetensors"]
+    assert with_vision is not plain  # the flag is part of the cache key
+
+
+def test_encode_prompt_helper_rejects_wrong_input_type():
+    with pytest.raises(RuntimeError, match="ASDX_MiniMaxH3TextEncoderLoader"):
+        nodes_module.encode_minimax_h3_prompt({"type": "something_else"}, "a prompt")
+
+
+def test_encode_prompt_helper_returns_hidden_states_and_tags(monkeypatch):
+    import mlx.core as mx
+    import numpy as np
+
+    _install_fake_minimax_tokenizer(monkeypatch, [11, 22, 33])
+    hidden = mx.ones((3, 8))
+    stub = types.ModuleType("apple_silicon_nodes.native.minimax_h3.vision_conditioning")
+    stub.encode_with_vision = lambda enc, tower, entries: (hidden, np.array([1, 1, 1]))
+    monkeypatch.setitem(sys.modules, "apple_silicon_nodes.native.minimax_h3.vision_conditioning", stub)
+
+    desc = {"type": "asdx_minimax_h3_text_encoder", "encoder": Mock(), "vision_tower": None}
+    out = nodes_module.encode_minimax_h3_prompt(desc, "a prompt")
+    assert out["type"] == "minimax_h3" and out["text"] == "a prompt"
+    assert out["hidden_states"] is hidden and out["token_tags"].tolist() == [1, 1, 1]
+
+
+def test_encode_prompt_helper_aborts_on_non_finite(monkeypatch):
+    import mlx.core as mx
+    import numpy as np
+
+    _install_fake_minimax_tokenizer(monkeypatch, [11])
+    stub = types.ModuleType("apple_silicon_nodes.native.minimax_h3.vision_conditioning")
+    stub.encode_with_vision = lambda enc, tower, entries: (mx.array([[float("nan")]]), np.array([1]))
+    monkeypatch.setitem(sys.modules, "apple_silicon_nodes.native.minimax_h3.vision_conditioning", stub)
+    desc = {"type": "asdx_minimax_h3_text_encoder", "encoder": Mock(), "vision_tower": None}
+    with pytest.raises(RuntimeError, match="non-finite"):
+        nodes_module.encode_minimax_h3_prompt(desc, "x")
+
+
+def test_encode_prompt_helper_forwards_images_and_ref_items(monkeypatch):
+    import mlx.core as mx
+    import numpy as np
+
+    calls: list = []
+    _install_fake_minimax_tokenizer(monkeypatch, [11], record=calls)
+    stub = types.ModuleType("apple_silicon_nodes.native.minimax_h3.vision_conditioning")
+    stub.encode_with_vision = lambda enc, tower, entries: (mx.ones((1, 4)), np.array([1]))
+    monkeypatch.setitem(sys.modules, "apple_silicon_nodes.native.minimax_h3.vision_conditioning", stub)
+    desc = {"type": "asdx_minimax_h3_text_encoder", "encoder": Mock(), "vision_tower": None}
+
+    images, ref_items = [object(), object()], [{"kind": "ref"}]
+    nodes_module.encode_minimax_h3_prompt(desc, "p", images=images, ref_items=ref_items)
+    assert calls[-1]["images"] is images and calls[-1]["minimax_ref_items"] is ref_items
+
+    nodes_module.encode_minimax_h3_prompt(desc, "p")
+    assert calls[-1] == {"images": [], "minimax_ref_items": None}
