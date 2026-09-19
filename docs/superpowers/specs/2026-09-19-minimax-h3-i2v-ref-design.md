@@ -97,6 +97,13 @@ aléatoires, avec et sans keyframes/refs.
   encodés par l'audio VAE via le pont `comfy.sd.VAE` (aucun encodeur audio à porter).
 - Sortie : conditioning + latent AV, consommés par `ASDX_MiniMaxH3Sampler` existant.
 
+**Notes de passage vers la brique 4**
+
+- `preprocess_image` lève une erreur pour un IMAGE ComfyUI multi-images `[B,H,W,C]` alors que ComfyUI utilise silencieusement la première image : les nœuds doivent passer `image[:1]`.
+- Les entrées du tokenizer qui ne sont ni un id ni un dict vision (tenseur nu, `{"type": "embedding"}`) ne sont pas gérées (le tokenizer n'en émet pas sans répertoire d'embeddings).
+- Le pic de la tour (3,6 Go) est ajouté après l'appel du gate mémoire du loader de l'encodeur (le gate du DiT le voit via `_predicted_peak_bytes`).
+- `encode_minimax_h3_prompt` est le point d'intégration unique pour les nœuds i2v/ref (images des keyframes, `ref_items` dans l'ordre de la requête).
+
 ## Mémoire
 
 - Les lignes de référence traversent les 50 blocs à chaque pas ; l'attention est quadratique.
