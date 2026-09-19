@@ -901,6 +901,23 @@ def _load_safetensors(path: str | Path) -> dict[str, mx.array]:
             f"this format is not implemented yet."
         )
 
+    if quant_format == QuantFormat.DENSE:
+        # Native path: mx.load() decodes F16/BF16/F32 straight into MLX
+        # arrays with no torch/numpy intermediate and no blanket fp32
+        # upcast -- cuts the load-time peak from ~2-3x the checkpoint size
+        # down to ~1x (every caller already re-casts each tensor to its own
+        # target dtype explicitly, so skipping the upcast here changes
+        # nothing downstream). Verified bit-exact against the torch path
+        # for F32/F16/BF16/I64 before this branch was added.
+        #
+        # Only safe for DENSE: MLX has no native fp8 array dtype, so
+        # mx.load() on an FP8_NAIVE file silently returns raw mx.uint8
+        # instead of a float -- every other quant_format below keeps using
+        # the torch path, which decodes FP8 correctly and also carries the
+        # dequantization math (_dequantize_comfy_quant_int8 /
+        # _dequantize_fp8_scaled) that mx.load() has no equivalent for.
+        return mx.load(str(path))
+
     import torch
     import safetensors.torch
     state = safetensors.torch.load_file(path, device="cpu")
