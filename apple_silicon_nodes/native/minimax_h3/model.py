@@ -1,10 +1,10 @@
 """
-MiniMax H3 audio-video DiT -- MLX port (in progress, minimal t2va/fl2va path).
+MiniMax H3 audio-video DiT -- MLX port (t2va, fl2va keyframe and ref2va reference conditioning rows).
 
-Ports `comfy/ldm/minimax/model.py` block by block. Scope for this first pass,
-per plan §5 Phase 6: no reference conditioning (`MiniMaxH3ReferenceToVideo`),
-no extra guide frames (`MiniMaxH3AddGuide`), no VSA sparse-attention gate
-(`gate_compress`), no PDD head bank (`FinalLayer`'s multi-head-per-timestep
+Ports `comfy/ldm/minimax/model.py` block by block. Scope, per plan §5
+Phase 6: reference conditioning (`MiniMaxH3ReferenceToVideo`) is built outside this module
+(`minimax_h3_conditioning.py`); no extra guide frames (`MiniMaxH3AddGuide`), no VSA
+sparse-attention gate (`gate_compress`), no PDD head bank (`FinalLayer`'s multi-head-per-timestep
 variant -- not present on the real checkpoints this project targets, see
 `config.py`'s `video_out.weight.shape[0] // out_features == 1` check in the
 reference), batch size 1 only. Curve-form adaln only (`adaln_curve_grid` set)

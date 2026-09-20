@@ -150,6 +150,60 @@ comfy's own OOM fallback recognises neither on Apple Silicon.
 > ControlNet Union and IP-Adapter nodes exist in `disabled_nodes/` but are not currently
 > registered — kept for a future revisit, not deleted.
 
+## MiniMax H3 (Apple Silicon native)
+
+Text-to-video, first/last-frame video and reference-to-video with audio, run on the native
+MLX MiniMax H3 DiT and its Qwen3-VL text encoder.
+
+| Node | Description |
+|------|-------------|
+| `🍏 ASDX MiniMax H3 Empty Latent (AV)` | Empty video + audio latents (length snapped up to the 17k+5 frame grid, 124 = ~5s at 24 fps) |
+| `🍏 ASDX MiniMax H3 Sigma Shift` | Override the video/audio sigma shifts on the model dict |
+| `🍏 ASDX MiniMax H3 Model Loader` | Load the DiT checkpoint, requantized to MLX 4-bit |
+| `🍏 ASDX MiniMax H3 Text Encoder Loader` | Load the Qwen3-VL-32B text encoder. `load_vision` also loads the vision tower (about 2.4GB more); it is required whenever the prompt contains images: first/last frames, reference images and reference videos. Audio-only references do not need it |
+| `🍏 ASDX MiniMax H3 Text Encode` | Text-only prompt to conditioning |
+| `🍏 ASDX MiniMax H3 Image to Video` | Prompt plus optional `first_frame` / `last_frame` to conditioning and empty video/audio latents. With no frame it is plain text-to-video. Frames need the `vae` input |
+| `🍏 ASDX MiniMax H3 Reference to Video` | Prompt plus reference images (up to 9), videos (up to 3, with optional soundtracks) and standalone audio (up to 3), to conditioning and empty latents. Refer to them in the prompt as `<Picture i>`, `<Video k>`, `<Audio j>` (1-based per type). `ref_image_size`: `match` (default) scales each reference down to the generation's pixel area, `max` uses a 2048px short edge |
+| `🍏 ASDX MiniMax H3 Sampler` | Flow-matching Euler sampling of the video and audio latents |
+
+Accepted checkpoint formats (DiT and text encoder): GGUF, and ComfyUI safetensors either dense
+or INT8 ConvRot. The W4A8 variant is refused.
+
+Loading the VAEs: the video VAE and the audio VAE are two separate files, each loaded by a
+VAE loader node. `🍏 ASDX VAE Loader` works for both: it builds `comfy.sd.VAE`, which
+recognizes the MiniMax H3 video VAE and the MiniMax H3 audio VAE from their state-dict keys
+(`comfy/sd.py`), so use one loader node per file. ComfyUI's core `VAELoader` builds the same
+class. The audio VAE is only needed for reference audio and for decoding the audio latent.
+
+Minimal graphs. The `🍏 ASDX MiniMax H3 Sampler` takes `model` (from `Model Loader`),
+`conditioning`, `video_latent` and `audio_latent` (all three emitted by the conditioning node
+below), plus `steps` and `seed`. Text-to-video, first/last frame and reference graphs differ
+only in the conditioning node:
+
+- t2v: `Text Encoder Loader` -> `Image to Video` (no frame connected) -> `Sampler`.
+- i2v / first-last frame: `Text Encoder Loader` (`load_vision` on) and a video VAE -> `Image to Video`
+  with `first_frame` and/or `last_frame` -> `Sampler`.
+- ref: `Text Encoder Loader` (`load_vision` on if any image or video reference is used), video VAE
+  and audio VAE -> `Reference to Video` with the reference inputs (each `ref_*` input grows a new
+  slot as you connect one) -> `Sampler`. Without a VAE the references only condition the text
+  encoder.
+
+After the sampler (the sampler emits two latents, not a video):
+
+- `Sampler.video_latent` + video VAE -> `🍏 ASDX VAE Decode (MLX)` (accepts the 5D video latent)
+  -> images.
+- `Sampler.audio_latent` + audio VAE -> `🍏 ASDX VAE Decode Audio` -> AUDIO.
+- images + audio -> core `CreateVideo` with `fps` set to 24 (its default is 30) -> core `SaveVideo`.
+
+Known limits:
+
+- No PDD (the reference implementation's head bank) and no AddGuide conditioning.
+- The reference implementations select a distinct `ref2va` DiT checkpoint for the reference task. The
+  loader here loads the fl2va and ref2va files unchanged (same tensor structure), so use the `ref2va`
+  file for references.
+- References lengthen the packed token sequence (a warning is logged past the row threshold);
+  `ref_image_size = max` can be several times slower than `match`.
+
 ## Installation
 
 1. Clone this repo into your ComfyUI custom_nodes directory:

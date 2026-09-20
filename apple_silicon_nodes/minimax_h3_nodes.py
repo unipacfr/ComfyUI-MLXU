@@ -1,16 +1,12 @@
-"""MiniMax H3 nodes -- t2va only (see `native/minimax_h3/model.py`'s module
-docstring for the scope restriction this mirrors exactly: no reference
-conditioning, no keyframes/first_frame/last_frame, no VSA gate_compress, no
-PDD head bank).
+"""MiniMax H3 nodes: t2v, first/last-frame (fl2va) and reference (ref2va) conditioning,
+sampling.
 
-Ported from `comfy_extras/nodes_minimax_h3.py`'s `EmptyMiniMaxH3LatentAV` and
-`MiniMaxH3SigmaShift`. `MiniMaxH3ImageToVideo` (the reference's third
-in-scope node per this project's own workflow-derived node survey, see
-`docs/plan-multi-modeles-apple-silicon.md` §5 Phase 6) is NOT ported as-is --
-it accepts `first_frame`/`last_frame` keyframe conditioning that
-`native/minimax_h3/layout.py::PackedLayout` does not implement, so exposing
-those inputs would silently do nothing. Its t2va-only equivalent is
-`ASDX_MiniMaxH3TextEncode` below.
+Ported from `comfy_extras/nodes_minimax_h3.py`: `EmptyMiniMaxH3LatentAV`,
+`MiniMaxH3SigmaShift`, `MiniMaxH3ImageToVideo` (here `ASDX_MiniMaxH3ImageToVideo`, with
+`first_frame`/`last_frame` keyframes) and `MiniMaxH3ReferenceToVideo`
+(`ASDX_MiniMaxH3ReferenceToVideo`). Still not implemented: the VSA sparse-attention gate
+(`gate_compress`), the PDD head bank and `MiniMaxH3AddGuide` (extra guide frames); see
+`native/minimax_h3/model.py`. `ASDX_MiniMaxH3TextEncode` is the text-only encode node.
 
 Text tokenization: MiniMax H3's presentation is explicitly NOT chat-templated
 for plain t2va (`comfy/text_encoders/minimax.py`'s module docstring: "raw
@@ -612,7 +608,8 @@ class ASDX_MiniMaxH3Sampler(io.ComfyNode):
         if not isinstance(model, dict) or model.get("family") != "minimax_h3":
             raise RuntimeError("ASDX MiniMax H3 Sampler: expected the output of ASDX_MiniMaxH3ModelLoader.")
         if not isinstance(conditioning, dict) or conditioning.get("type") != "minimax_h3":
-            raise RuntimeError("ASDX MiniMax H3 Sampler: expected the output of ASDX_MiniMaxH3TextEncode.")
+            raise RuntimeError("ASDX MiniMax H3 Sampler: expected the output of ASDX_MiniMaxH3TextEncode, "
+                "ASDX_MiniMaxH3ImageToVideo or ASDX_MiniMaxH3ReferenceToVideo.")
         for name, latent in (("video_latent", video_latent), ("audio_latent", audio_latent)):
             if not isinstance(latent, dict) or "samples" not in latent:
                 raise RuntimeError(f"ASDX MiniMax H3 Sampler: expected LATENT input for '{name}'.")
@@ -640,11 +637,119 @@ class ASDX_MiniMaxH3Sampler(io.ComfyNode):
         return io.NodeOutput({"samples": video_torch}, {"samples": audio_torch})
 
 
+def _check_encoder(text_encoder: dict, who: str) -> None:
+    if not isinstance(text_encoder, dict) or text_encoder.get("type") != "asdx_minimax_h3_text_encoder":
+        raise RuntimeError(f"ASDX {who}: expected the output of ASDX_MiniMaxH3TextEncoderLoader.")
+
+
+class ASDX_MiniMaxH3ImageToVideo(io.ComfyNode):
+    """t2v and fl2va: prompt (+ optional first/last frame) -> conditioning + empty AV latents.
+
+    Mirrors ComfyUI's `MiniMaxH3ImageToVideo`. The first frame is stretched onto the canvas
+    and becomes frame 0; the last frame is cover-cropped and anchors the final frame. The
+    text encoder must have been loaded with `load_vision` when frames are connected."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        return io.Schema(
+            node_id="ASDX_MiniMaxH3ImageToVideo",
+            display_name="🍏 ASDX MiniMax H3 Image to Video",
+            category="ASDX/Conditioning",
+            inputs=[
+                io.Custom("asdx_minimax_h3_text_encoder").Input("text_encoder"),
+                io.Vae.Input("vae", optional=True, tooltip="Video VAE, needed when a frame is connected."),
+                io.String.Input("prompt", multiline=True, default=""),
+                io.Int.Input("width", default=1344, min=32, max=4096, step=32),
+                io.Int.Input("height", default=768, min=32, max=4096, step=32),
+                io.Int.Input("length", default=124, min=5, max=3600, step=17,
+                             tooltip="Frame count at 24 fps, snapped up to the model's 17k+5 grid (124 = ~5s)."),
+                io.Image.Input("first_frame", optional=True),
+                io.Image.Input("last_frame", optional=True),
+            ],
+            outputs=[
+                io.Custom("asdx_minimax_h3_conditioning").Output(display_name="conditioning"),
+                io.Latent.Output(display_name="video_latent"),
+                io.Latent.Output(display_name="audio_latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, text_encoder: dict, prompt: str, width: int, height: int, length: int,
+                vae=None, first_frame=None, last_frame=None) -> io.NodeOutput:
+        _check_encoder(text_encoder, "MiniMax H3 Image to Video")
+        from .minimax_h3_conditioning import build_i2v_conditioning
+
+        conditioning, video_latent, audio_latent = build_i2v_conditioning(
+            text_encoder, vae, prompt, width, height, length, first_frame, last_frame)
+        return io.NodeOutput(conditioning, video_latent, audio_latent)
+
+
+class ASDX_MiniMaxH3ReferenceToVideo(io.ComfyNode):
+    """ref2va: prompt + reference images / videos / audio -> conditioning + empty AV latents.
+
+    Mirrors ComfyUI's `MiniMaxH3ReferenceToVideo`. References enter the presentation in fixed
+    order (images, then videos with their soundtrack label first, then standalone audio),
+    ordinals are 1-based per type: use <Picture i> / <Video k> / <Audio j> in the prompt.
+    Reference tokens ride through every sampling step: 'max' can be several times slower.
+    Use the ref2va DiT checkpoint (the reference implementations select it for the reference task) and a text
+    encoder loaded with `load_vision` when images or videos are referenced."""
+
+    @classmethod
+    def define_schema(cls) -> io.Schema:
+        from .minimax_h3_conditioning import MAX_REF_AUDIOS, MAX_REF_IMAGES, MAX_REF_VIDEOS
+
+        def grow(name: str, prefix: str, item, cap: int):
+            return io.Autogrow.Input(name, optional=True, template=io.Autogrow.TemplatePrefix(
+                input=item, prefix=prefix, min=0, max=cap))
+
+        return io.Schema(
+            node_id="ASDX_MiniMaxH3ReferenceToVideo",
+            display_name="🍏 ASDX MiniMax H3 Reference to Video",
+            category="ASDX/Conditioning",
+            description="<Picture i> / <Video k> / <Audio j> reference conditioning for MiniMax H3. Use the same tags when prompting.",
+            inputs=[
+                io.Custom("asdx_minimax_h3_text_encoder").Input("text_encoder"),
+                io.Vae.Input("vae", optional=True, tooltip="Video VAE. Without it the reference images/videos only condition the text encoder."),
+                io.Vae.Input("audio_vae", optional=True, tooltip="Audio VAE. Without it the reference audio only conditions the text encoder."),
+                io.String.Input("prompt", multiline=True, default=""),
+                io.Int.Input("width", default=1344, min=32, max=4096, step=32),
+                io.Int.Input("height", default=768, min=32, max=4096, step=32),
+                io.Int.Input("length", default=124, min=5, max=3600, step=17,
+                             tooltip="Frame count at 24 fps, snapped up to the model's 17k+5 grid (124 = ~5s)."),
+                io.Combo.Input("ref_image_size", options=["match", "max"], default="match",
+                               tooltip="'match' scales each reference (down only, keeping the aspect) to the generation's pixel area; 'max' uses a 2048px short edge for the best identity fidelity but adds many rows."),
+                grow("ref_images", "ref_image_", io.Image.Input("ref_image"), MAX_REF_IMAGES),
+                grow("ref_videos", "ref_video_", io.Image.Input("ref_video", tooltip="Reference video frames at 24 fps (>= 5 frames)"), MAX_REF_VIDEOS),
+                grow("ref_video_audios", "ref_video_audio_", io.Audio.Input("ref_video_audio", tooltip="Soundtrack of the same-numbered reference video"), MAX_REF_VIDEOS),
+                grow("ref_audios", "ref_audio_", io.Audio.Input("ref_audio"), MAX_REF_AUDIOS),
+            ],
+            outputs=[
+                io.Custom("asdx_minimax_h3_conditioning").Output(display_name="conditioning"),
+                io.Latent.Output(display_name="video_latent"),
+                io.Latent.Output(display_name="audio_latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, text_encoder: dict, prompt: str, width: int, height: int, length: int,
+                ref_image_size: str = "match", vae=None, audio_vae=None, ref_images=None, ref_videos=None,
+                ref_video_audios=None, ref_audios=None) -> io.NodeOutput:
+        _check_encoder(text_encoder, "MiniMax H3 Reference to Video")
+        from .minimax_h3_conditioning import build_reference_conditioning
+
+        conditioning, video_latent, audio_latent = build_reference_conditioning(
+            text_encoder, vae, audio_vae, prompt, width, height, length, ref_image_size,
+            ref_images or {}, ref_videos or {}, ref_video_audios or {}, ref_audios or {})
+        return io.NodeOutput(conditioning, video_latent, audio_latent)
+
+
 NODE_LIST = [
     ASDX_MiniMaxH3EmptyLatentAV,
     ASDX_MiniMaxH3SigmaShift,
     ASDX_MiniMaxH3ModelLoader,
     ASDX_MiniMaxH3TextEncoderLoader,
     ASDX_MiniMaxH3TextEncode,
+    ASDX_MiniMaxH3ImageToVideo,
+    ASDX_MiniMaxH3ReferenceToVideo,
     ASDX_MiniMaxH3Sampler,
 ]

@@ -41,7 +41,7 @@ def test_rejects_wrong_model_type():
 
 
 def test_rejects_wrong_conditioning_type():
-    with pytest.raises(RuntimeError, match="ASDX_MiniMaxH3TextEncode"):
+    with pytest.raises(RuntimeError, match="ASDX_MiniMaxH3TextEncode.*ASDX_MiniMaxH3ImageToVideo.*ASDX_MiniMaxH3ReferenceToVideo"):
         ASDX_MiniMaxH3Sampler.execute(
             _minimax_model(), {"type": "clip"},
             {"samples": torch.zeros(1, 4, 1, 2, 2)}, {"samples": torch.zeros(1, 4, 2, 2)},

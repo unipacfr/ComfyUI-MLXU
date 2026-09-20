@@ -13,6 +13,7 @@ of the real package from the ComfyUI install, regardless of collection order.
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -74,3 +75,58 @@ def load_real_comfy_text_encoders():
     except ImportError as e:
         pytest.skip(f"comfy text-encoder modules not importable: {e}")
     return minimax, qwen_vl, llama, ops
+
+
+_COMFYUI_NAMESPACES = (
+    "comfy", "comfy_extras", "comfy_api", "comfy_execution", "comfy_aimdo", "comfy_kitchen",
+    "nodes", "folder_paths", "server", "execution", "app",
+)
+
+
+def _is_comfyui_module(name: str, mod: object) -> bool:
+    """A module of the ComfyUI tree: by NAME (namespace packages have no `__file__`) or by
+    a `__file__` under the ComfyUI root."""
+    if any(name == ns or name.startswith(ns + ".") for ns in _COMFYUI_NAMESPACES):
+        return True
+    return str(getattr(mod, "__file__", "") or "").startswith(str(_COMFYUI_ROOT))
+
+
+@contextlib.contextmanager
+def real_comfy_isolated():
+    """Context in which the REAL ComfyUI packages are importable. On exit `sys.path` is
+    restored exactly, every ComfyUI-tree module first imported inside the window is dropped
+    (see `_is_comfyui_module`) and the entries that were present before come back (e.g. the
+    stubs of `install_comfy_stubs`). Third-party and C-extension modules imported meanwhile
+    (torch attributes, transformers, PIL, ...) are deliberately left in `sys.modules`:
+    removing them is unsafe, they are harmless caches and NOT part of the restoration claim.
+    Skips when ComfyUI is absent."""
+    if not _COMFYUI_ROOT.exists() or not _COMFYUI_VENV_SITE_PACKAGES.exists():
+        pytest.skip("ComfyUI install not present on this machine")
+    saved_modules = dict(sys.modules)
+    saved_path = list(sys.path)
+    for name in list(sys.modules):
+        if name == "comfy" or name.startswith(("comfy.", "comfy_extras", "comfy_api")) or name == "nodes":
+            del sys.modules[name]
+    sys.path.insert(0, str(_COMFYUI_ROOT))
+    sys.path.insert(0, str(_COMFYUI_VENV_SITE_PACKAGES))
+    try:
+        yield
+    finally:
+        for name, mod in list(sys.modules.items()):
+            if name not in saved_modules and _is_comfyui_module(name, mod):
+                del sys.modules[name]
+        for name, mod in saved_modules.items():
+            if sys.modules.get(name) is not mod:
+                sys.modules[name] = mod
+        sys.path[:] = saved_path
+
+
+def assert_no_comfyui_leak(before_modules: dict, before_path: list) -> None:
+    """After a `real_comfy_isolated()` window: `sys.path` identical, no NEW module living in
+    the ComfyUI namespaces (by name, so namespace packages count), previous entries intact."""
+    assert sys.path == before_path
+    new = [n for n in sys.modules if n not in before_modules
+           and any(n == ns or n.startswith(ns + ".") for ns in _COMFYUI_NAMESPACES)]
+    assert new == []
+    assert all(sys.modules.get(k) is v for k, v in before_modules.items() if k in sys.modules)
+    assert all(k in sys.modules for k in before_modules if any(k == ns or k.startswith(ns + ".") for ns in _COMFYUI_NAMESPACES))
