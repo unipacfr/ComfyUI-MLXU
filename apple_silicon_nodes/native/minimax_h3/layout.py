@@ -4,15 +4,8 @@ packed sequence.
 
 Ported from `comfy/ldm/minimax/model.py::PackedLayout` and its helpers
 (`_frame_grid`, `_video_t_grid`, `_video_grid`, `_audio_grid`,
-`_axis_from_sqrt_area`), restricted to the minimal t2va path this project
-targets first: no reference blocks, no extra keyframes/guide frames, no
-inpainting denoise masks. Those add more segments (`cond`, `ref_img`,
-`ref_audio`) before the fixed trailing `(audio, video)` pair this module
-always produces -- deliberately not accepted as parameters here (rather than
-accepted and silently ignored) so the API is honest about what it covers;
-see `MiniMaxH3ReferenceToVideo`/`MiniMaxH3AddGuide` in
-`comfy_extras/nodes_minimax_h3.py` for the nodes that would need it, both
-out of scope per `docs/plan-multi-modeles-apple-silicon.md` §5 Phase 6.
+`_axis_from_sqrt_area`). Supports keyframe (fl2va) and reference (ref2va)
+condition segments; see PackedLayout. No denoise masks.
 
 Position coordinates are computed in float64 (matching the reference)
 since they encode fine-grained sub-pixel/sub-frame offsets that RoPE's
@@ -28,6 +21,7 @@ import mlx.core as mx
 
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 FRAME_RESCALE = 5.0 / 3.0
+_REF_KINDS = ("image", "audio", "video", "video_audio")
 
 
 def _axis_from_sqrt_area(dim: int, patch: int, sqrt_area: float) -> mx.array:
@@ -92,35 +86,132 @@ def audio_grid(cursor: float, t: int, w_low: float, w_high: float) -> mx.array:
         return mx.concatenate([t_col, h_col, w_col], axis=-1)
 
 
-class PackedLayout:
-    """Static packed-sequence structure for one `(text_len, latent_t,
-    latent_h, latent_w, audio_t)` shape signature: minimal t2va path only
-    (`[text | audio | video]`, see module docstring)."""
+def ref_t_span(blk) -> float:
+    """Time-axis span a reference block occupies ahead of the target streams
+    (`comfy/ldm/minimax/model.py::_ref_t_span`)."""
+    if blk.kind == "image":
+        return 1.0
+    if blk.kind == "audio":
+        return float(blk.ref_audio_t)
+    if blk.kind in ("video", "video_audio"):
+        return max(float(blk.ref_audio_t), sum(video_t_spans(blk.latent_t)))
+    raise ValueError(f"ASDX: unknown reference kind '{blk.kind}' (expected one of {_REF_KINDS})")
 
-    def __init__(self, text_len: int, latent_t: int, latent_h: int, latent_w: int, audio_t: int):
-        # float64 (needed for sub-pixel/sub-frame position precision, matching
-        # the reference) is CPU-only in MLX -- these are tiny, once-per-forward
-        # arrays, so the whole computation runs on the CPU stream.
+
+def _validate_conditions(keyframes, refs, latent_h: int, latent_w: int) -> None:
+    """Fail closed when a block's declared dims disagree with its latents: the layout
+    sizes segments from the declared dims while `prepare_condition` builds rows from the
+    latents, so a mismatch would silently shift every later block's rows. Blocks without
+    latents (text-only references) are legal."""
+    for i, kf in enumerate(keyframes):
+        if kf.latent is not None and tuple(kf.latent.shape[3:]) != (latent_h, latent_w):
+            raise ValueError(
+                f"ASDX: keyframe {i} latent grid {tuple(kf.latent.shape[3:])} must equal the target "
+                f"latent grid {(latent_h, latent_w)}"
+            )
+    for i, blk in enumerate(refs):
+        if blk.kind not in _REF_KINDS:
+            raise ValueError(f"ASDX: reference block {i} has unknown kind '{blk.kind}' (expected one of {_REF_KINDS})")
+        if blk.latent is not None:
+            declared = (blk.latent_t, blk.latent_h, blk.latent_w)
+            if tuple(blk.latent.shape[2:]) != declared:
+                raise ValueError(
+                    f"ASDX: reference block {i} latent dims {tuple(blk.latent.shape[2:])} "
+                    f"differ from declared (latent_t, latent_h, latent_w) {declared}"
+                )
+        if blk.audio_latent is not None:
+            actual = blk.audio_latent.shape[-1]
+            if actual <= 0 or actual != blk.ref_audio_t:
+                raise ValueError(
+                    f"ASDX: reference block {i} audio latent length {actual} differs from "
+                    f"declared ref_audio_t {blk.ref_audio_t} (must be > 0)"
+                )
+
+
+class PackedLayout:
+    """Static packed-sequence structure:
+    `[text | (keyframe cond rows) | (reference rows) | audio | video]`.
+    Depends on the target dims and on the keyframes/refs, so a layout built without
+    them must never be reused for a conditioned run (there is no cache key here).
+
+    Ported from `comfy/ldm/minimax/model.py::PackedLayout`. `keyframes` and
+    `refs` are the objects of `condition.py` (attribute access). Segment
+    kinds: text, cond, cond_audio, ref_img, ref_audio, audio, video. The
+    target audio then video are always the last two segments. Positions are
+    float64 and built on the CPU stream (float64 is CPU-only in MLX)."""
+
+    def __init__(
+        self,
+        text_len: int,
+        latent_t: int,
+        latent_h: int,
+        latent_w: int,
+        audio_t: int,
+        keyframes=(),
+        refs=(),
+    ):
+        _validate_conditions(keyframes, refs, latent_h, latent_w)
         with mx.stream(mx.cpu):
             frame, w_axis = frame_grid(latent_h, latent_w)
             frame_rows = frame.shape[0]
             target_audio_w = (float(w_axis[0].item()), float(w_axis[-1].item()))
-            cursor = float(text_len)
 
             text_pos = mx.zeros((text_len, 3), dtype=mx.float64)
             text_pos[:, 0] = mx.arange(text_len, dtype=mx.float64)
+            pos = [text_pos]
+            sizes: list[tuple[str, int]] = [("text", text_len)]
 
-            audio_pos = audio_grid(cursor, audio_t, *target_audio_w)
-            n_video = latent_t * frame_rows
-            video_pos = video_grid(latent_t, frame, cursor)
+            # references pack between text and the targets: the target timeline starts after their spans
+            cursor = float(text_len) + sum(ref_t_span(b) for b in refs)
 
-            self.position_ids = mx.concatenate([text_pos, audio_pos, video_pos], axis=0)
+            for kf in keyframes:
+                cond_t = cursor + FRAME_RESCALE * kf.resolved_frame_index
+                if kf.latent is not None:
+                    vt = kf.latent.shape[2]
+                    sizes.append(("cond", vt * frame_rows))
+                    pos.append(video_grid(vt, frame, cond_t))
+                if kf.audio_latent is not None:
+                    rt = kf.audio_latent.shape[-1]
+                    sizes.append(("cond_audio", rt * 2))
+                    pos.append(audio_grid(cond_t, rt, *target_audio_w))
+
+            ref_cursor = float(text_len)
+            for blk in refs:
+                if blk.kind == "image":
+                    r_frame, _ = frame_grid(blk.latent_h, blk.latent_w)
+                    n = r_frame.shape[0]
+                    g = mx.concatenate([mx.full((n, 1), ref_cursor, dtype=mx.float64), r_frame], axis=-1)
+                    sizes.append(("ref_img", n))
+                    pos.append(g)
+                    ref_cursor += 1.0
+                elif blk.kind == "audio":
+                    rt = blk.ref_audio_t
+                    if rt > 0:
+                        sizes.append(("ref_audio", rt * 2))
+                        pos.append(audio_grid(ref_cursor, rt, *target_audio_w))
+                    ref_cursor += float(rt)
+                elif blk.kind in ("video", "video_audio"):
+                    # the block's audio rows pack immediately before its video rows, sharing the cursor origin
+                    rt, vt = blk.ref_audio_t, blk.latent_t
+                    r_frame, r_w_axis = frame_grid(blk.latent_h, blk.latent_w)
+                    if rt > 0:
+                        sizes.append(("ref_audio", rt * 2))
+                        pos.append(audio_grid(ref_cursor, rt, float(r_w_axis[0].item()), float(r_w_axis[-1].item())))
+                    sizes.append(("ref_img", vt * r_frame.shape[0]))
+                    pos.append(video_grid(vt, r_frame, ref_cursor))
+                    ref_cursor += max(float(rt), sum(video_t_spans(vt)))
+
+            sizes.append(("audio", audio_t * 2))
+            pos.append(audio_grid(cursor, audio_t, *target_audio_w))
+            sizes.append(("video", latent_t * frame_rows))
+            pos.append(video_grid(latent_t, frame, cursor))
+
+            self.position_ids = mx.concatenate(pos, axis=0)
 
         row = 0
         segments: list[tuple[int, int, str]] = []
-        for kind, n in (("text", text_len), ("audio", audio_t * 2), ("video", n_video)):
+        for kind, n in sizes:
             segments.append((row, row + n, kind))
             row += n
         self.segments = segments
         self.seq_len = row
-        self.signature = (text_len, latent_t, latent_h, latent_w, audio_t)

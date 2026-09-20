@@ -96,6 +96,7 @@ def load_qwen3_text_encoder_checkpoint(
 
     model.update(tree_unflatten(list(model_flat.items())))
     mx.eval(model.parameters())
+    mx.clear_cache()  # return the freed load-time buffers MLX keeps cached (up to ~6 GB after the text encoder)
 
     print(f"[ASDX] Qwen3 text encoder ({path.suffix.lstrip(".").lower()}): matched {matched}/{len(model_flat)} params from checkpoint")
     _check_weight_match(matched, len(model_flat), "Qwen3 text encoder", path)

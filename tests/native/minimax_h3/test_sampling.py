@@ -132,3 +132,76 @@ def test_more_steps_reach_lower_final_sigma_same_endpoint_type():
         video_out, audio_out = run_minimax_h3_sampling(model, video_noise, audio_noise, context, steps=steps)
         assert bool(mx.all(mx.isfinite(video_out)).item())
         assert bool(mx.all(mx.isfinite(audio_out)).item())
+
+
+cond_mod = load_native_module("minimax_h3.condition")
+
+
+def test_payload_is_prepared_once_and_passed_every_step(monkeypatch):
+    seen = []
+
+    class FakeModel:
+        def __init__(self, cfg):
+            self.config = cfg
+
+        def __call__(self, video, audio, context, sigma_v, cond=None):
+            seen.append(cond)
+            return mx.zeros_like(video), mx.zeros_like(audio)
+
+    cfg = _tiny_config()
+    prepare_calls = []
+    real_prepare = sampling_mod.prepare_condition
+
+    def counting_prepare(payload, patch_size, noise_fn=cond_mod.default_noise):
+        prepare_calls.append(payload)
+        return real_prepare(payload, patch_size, noise_fn)
+
+    monkeypatch.setattr(sampling_mod, "prepare_condition", counting_prepare)
+    payload = cond_mod.ConditionPayload(seed=3)
+    video = mx.zeros((1, cfg.latents_dim, 1, 4, 4))
+    audio = mx.zeros((1, cfg.audio_latents_dim, 2, 2))
+    sampling_mod.run_minimax_h3_sampling(FakeModel(cfg), video, audio, mx.zeros((3, cfg.text_dim)), 3, payload=payload)
+    assert len(prepare_calls) == 1
+    assert len(seen) == 3 and all(c is seen[0] and c is not None for c in seen)
+
+
+def test_no_payload_keeps_the_old_model_call():
+    class OldStyleModel:  # no `cond` parameter at all
+        def __init__(self, cfg):
+            self.config = cfg
+
+        def __call__(self, video, audio, context, sigma_v):
+            return mx.zeros_like(video), mx.zeros_like(audio)
+
+    cfg = _tiny_config()
+    video = mx.zeros((1, cfg.latents_dim, 1, 4, 4))
+    audio = mx.zeros((1, cfg.audio_latents_dim, 2, 2))
+    sampling_mod.run_minimax_h3_sampling(OldStyleModel(cfg), video, audio, mx.zeros((3, cfg.text_dim)), 2)
+
+
+def test_tags_only_payload_equals_no_payload_and_real_conditions_change_the_result():
+    cfg = _tiny_config()
+    model = MiniMaxH3Model(cfg)
+    model.adaln_t_table = mx.random.normal(model.adaln_t_table.shape)
+    mx.eval(model.parameters())
+    video = mx.random.normal((1, cfg.latents_dim, 2, 4, 4))
+    audio = mx.random.normal((1, cfg.audio_latents_dim, 2, 2))
+    context = mx.random.normal((3, cfg.text_dim))
+    mx.eval(video, audio, context)
+
+    def run(payload):
+        with mx.stream(mx.cpu):
+            v, a = run_minimax_h3_sampling(model, video, audio, context, 2, payload=payload)
+            mx.eval(v, a)
+        return np.array(v), np.array(a)
+
+    base_v, base_a = run(None)
+    tags_v, tags_a = run(cond_mod.ConditionPayload(text_token_tags=np.ones(3, dtype=np.int64)))
+    assert np.array_equal(base_v, tags_v) and np.array_equal(base_a, tags_a)
+
+    zero_tag_v, _ = run(cond_mod.ConditionPayload(text_token_tags=np.array([1, 0, 1])))
+    assert not np.array_equal(base_v, zero_tag_v)
+
+    kf = cond_mod.KeyframeCond(0, mx.random.normal((1, cfg.latents_dim, 1, 4, 4)))
+    kf_v, _ = run(cond_mod.ConditionPayload(keyframes=(kf,), seed=1))
+    assert not np.array_equal(base_v, kf_v)

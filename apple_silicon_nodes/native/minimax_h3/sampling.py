@@ -49,6 +49,7 @@ import math
 
 import mlx.core as mx
 
+from .condition import ConditionPayload, default_noise, prepare_condition
 from .model import MiniMaxH3Model, time_shift_sigma
 
 
@@ -133,6 +134,8 @@ def run_minimax_h3_sampling(
     audio_latent: mx.array,
     context: mx.array,
     steps: int,
+    payload: ConditionPayload | None = None,
+    noise_fn=None,
 ) -> tuple[mx.array, mx.array]:
     """Denoise `video_latent`/`context`-conditioned pure Gaussian noise into
     a finished video+audio latent pair. `video_latent`/`audio_latent` are the
@@ -146,9 +149,16 @@ def run_minimax_h3_sampling(
     relationship `MiniMaxH3Model.__call__` uses internally for `t_a`), so it
     gets its own `res_multistep` step each iteration -- independent state
     from, but computed in the same forward pass as, the video stream's
-    step."""
+    step.
+
+    `payload`: keyframe/reference conditions, prepared once for the whole run
+    (the augmentation noise is identical at every step). `noise_fn` overrides
+    the augmentation noise source (defaults to `default_noise`)."""
     cfg = model.config
     sigmas = minimax_h3_sigma_schedule(cfg.sigma_shift_video, steps)
+    cond = (
+        prepare_condition(payload, cfg.patch_size, noise_fn or default_noise) if payload is not None else None
+    )
 
     video_state, audio_state = _ResMultistepState(), _ResMultistepState()
     video, audio = video_latent, audio_latent
@@ -163,7 +173,10 @@ def run_minimax_h3_sampling(
             else None
         )
 
-        video_v, audio_v = model(video, audio, context, sigma_v=sigma_v)
+        if cond is None:
+            video_v, audio_v = model(video, audio, context, sigma_v=sigma_v)
+        else:
+            video_v, audio_v = model(video, audio, context, sigma_v=sigma_v, cond=cond)
         video_denoised = video - video_v * sigma_v
         audio_denoised = audio - audio_v * sigma_a
 

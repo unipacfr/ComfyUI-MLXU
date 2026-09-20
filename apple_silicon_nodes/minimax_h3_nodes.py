@@ -485,6 +485,25 @@ class ASDX_MiniMaxH3TextEncoderLoader(io.ComfyNode):
         return io.NodeOutput(result)
 
 
+def payload_from_conditioning(conditioning: dict, seed: int):
+    """Build the DiT's `ConditionPayload` from a MiniMax H3 conditioning dict
+    (`token_tags`, `keyframes`, `refs` as written by the encode/i2v/ref nodes).
+    Returns None when the dict carries none of them (plain t2v)."""
+    import numpy as np
+
+    from .native.minimax_h3.condition import ConditionPayload
+
+    tags = conditioning.get("token_tags")
+    keyframes = tuple(conditioning.get("keyframes") or ())
+    refs = tuple(conditioning.get("refs") or ())
+    if tags is None and not keyframes and not refs:
+        return None
+    return ConditionPayload(
+        text_token_tags=None if tags is None else np.array(tags).astype(np.int64),
+        keyframes=keyframes, refs=refs, seed=int(seed),
+    )
+
+
 def encode_minimax_h3_prompt(
     text_encoder: dict, prompt: str, *, images: list | None = None, ref_items: list | None = None
 ) -> dict:
@@ -499,6 +518,7 @@ def encode_minimax_h3_prompt(
 
     import comfy.text_encoders.minimax
 
+    from .native.minimax_h3.text_encoder import refuse_if_degenerate
     from .native.minimax_h3.vision_conditioning import encode_with_vision
 
     tokenizer = comfy.text_encoders.minimax.MiniMaxH3Tokenizer()
@@ -506,11 +526,7 @@ def encode_minimax_h3_prompt(
         prompt, images=images or [], minimax_ref_items=ref_items
     )["qwen3vl_32b"][0]
     hidden_states, tags = encode_with_vision(text_encoder["encoder"], text_encoder.get("vision_tower"), entries)
-    if not bool(mx.all(mx.isfinite(hidden_states)).item()):
-        raise RuntimeError(
-            "ASDX MiniMax H3 Text Encode: produced a non-finite (NaN/Inf) "
-            "embedding -- aborting before the expensive sampling pass."
-        )
+    refuse_if_degenerate(hidden_states, "text encoder output")
     print(f"[ASDX] MiniMax H3 Text Encode: {len(prompt)} chars, {hidden_states.shape[0]} rows")
     return {
         "type": "minimax_h3",
@@ -612,6 +628,7 @@ class ASDX_MiniMaxH3Sampler(io.ComfyNode):
 
         video_out, audio_out = run_minimax_h3_sampling(
             model["transformer"], video_noise, audio_noise, conditioning["hidden_states"], steps,
+            payload=payload_from_conditioning(conditioning, seed),
         )
         mx.eval(video_out, audio_out)
 

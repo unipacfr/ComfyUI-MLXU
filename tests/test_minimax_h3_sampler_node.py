@@ -61,7 +61,7 @@ def test_rejects_non_latent_input():
 def test_generates_noise_matching_latent_shapes_and_bridges_to_torch(monkeypatch):
     captured = {}
 
-    def fake_run(model, video_noise, audio_noise, hidden_states, steps):
+    def fake_run(model, video_noise, audio_noise, hidden_states, steps, payload=None):
         captured["video_shape"] = video_noise.shape
         captured["audio_shape"] = audio_noise.shape
         captured["steps"] = steps
@@ -93,7 +93,7 @@ def test_generates_noise_matching_latent_shapes_and_bridges_to_torch(monkeypatch
 def test_same_seed_produces_same_starting_noise(monkeypatch):
     seen_noise = []
 
-    def fake_run(model, video_noise, audio_noise, hidden_states, steps):
+    def fake_run(model, video_noise, audio_noise, hidden_states, steps, payload=None):
         seen_noise.append(np_copy(video_noise))
         return video_noise, audio_noise
 
@@ -114,3 +114,40 @@ def test_same_seed_produces_same_starting_noise(monkeypatch):
 def np_copy(arr: mx.array):
     import numpy as np
     return np.array(arr).copy()
+
+
+def _run_capturing_payload(monkeypatch, conditioning, seed):
+    captured = {}
+
+    def fake_run(model, video_noise, audio_noise, hidden_states, steps, payload=None):
+        captured["payload"] = payload
+        return video_noise, audio_noise
+
+    sampling_stub = types.ModuleType("apple_silicon_nodes.native.minimax_h3.sampling")
+    sampling_stub.run_minimax_h3_sampling = fake_run
+    monkeypatch.setitem(sys.modules, "apple_silicon_nodes.native.minimax_h3.sampling", sampling_stub)
+    ASDX_MiniMaxH3Sampler.execute(
+        _minimax_model(), conditioning,
+        {"samples": torch.zeros(1, 4, 1, 2, 2)}, {"samples": torch.zeros(1, 4, 2, 2)}, steps=1, seed=seed,
+    )
+    return captured["payload"]
+
+
+def test_sampler_passes_seed_and_token_tags_to_the_run(monkeypatch):
+    conditioning = {**_minimax_conditioning(), "token_tags": mx.array([1, 1, 0])}
+    payload = _run_capturing_payload(monkeypatch, conditioning, seed=1234)
+    assert payload.seed == 1234
+    assert payload.text_token_tags.tolist() == [1, 1, 0]
+
+
+def test_sampler_passes_keyframes_and_refs_to_the_run(monkeypatch):
+    keyframe, ref = object(), object()
+    conditioning = {**_minimax_conditioning(), "keyframes": [keyframe], "refs": [ref]}
+    payload = _run_capturing_payload(monkeypatch, conditioning, seed=5)
+    assert payload.keyframes == (keyframe,) and payload.keyframes[0] is keyframe
+    assert payload.refs == (ref,) and payload.refs[0] is ref
+    assert payload.text_token_tags is None
+
+
+def test_sampler_passes_no_payload_for_plain_conditioning(monkeypatch):
+    assert _run_capturing_payload(monkeypatch, _minimax_conditioning(), seed=5) is None

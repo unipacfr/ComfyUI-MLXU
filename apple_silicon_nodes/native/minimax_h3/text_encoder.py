@@ -114,6 +114,27 @@ class VisionInputs:
     rope_dims: tuple[int, int, int] = (24, 20, 20)
 
 
+def refuse_if_degenerate(x: mx.array, producer: str) -> None:
+    """Raise `RuntimeError` if `x` is all exactly zero or holds NaN/Inf.
+
+    A failed lazy weight read can yield an all-zero token-embedding table, and
+    vision rows spliced over the pad positions then mask it, so a NaN/Inf-only
+    guard never fires. Forces evaluation of the reductions it needs."""
+    xf = x.astype(mx.float32)
+    finite, peak = mx.all(mx.isfinite(xf)), mx.max(mx.abs(xf))
+    mx.eval(finite, peak)
+    if not bool(finite.item()):
+        defect = "non-finite (NaN/Inf) values"
+    elif float(peak.item()) == 0.0:
+        defect = "all-zero values"
+    else:
+        return
+    raise RuntimeError(
+        f"ASDX MiniMax H3: degenerate conditioning from {producer}: {defect}, "
+        f"shape={tuple(x.shape)}, max|x|={float(peak.item())}"
+    )
+
+
 class _Qwen3Backbone(nn.Module):
     """Embedding + `num_hidden_layers` `TransformerBlock`s. No final norm, no
     lm_head (matches `final_norm=False`/`lm_head=False` in the reference
@@ -128,6 +149,13 @@ class _Qwen3Backbone(nn.Module):
 
     def __call__(self, input_ids: mx.array, vision: VisionInputs | None = None) -> mx.array:
         x = self.embed_tokens(input_ids)
+        # Screen the text-position embeddings BEFORE vision rows can mask a bad table.
+        if vision is None:
+            refuse_if_degenerate(x, "token embedding")
+        else:
+            text_idx = np.setdiff1d(np.arange(x.shape[0]), np.asarray(vision.row_indices))
+            if text_idx.size:
+                refuse_if_degenerate(x[mx.array(text_idx.astype(np.int32))], "token embedding")
         if vision is None:
             cos, sin = qwen3_rope_cos_sin(x.shape[0], self.config.head_dim, self.config.rope_theta)
         else:

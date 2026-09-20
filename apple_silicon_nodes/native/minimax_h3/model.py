@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
+from .condition import AUDIO_COND_TIMESTEP, VISUAL_COND_TIMESTEP, PreparedCondition
 from .config import MiniMaxH3Config
 from .layout import PackedLayout
 from .patchify import pack_audio, patchify_video, unpack_audio, unpatchify_video
@@ -291,24 +293,50 @@ class FinalLayer(nn.Module):
         return self.video_out(mod(video_seg)), self.audio_out(mod(audio_seg))
 
 
+_SEG_TAG = {"video": 0, "text": 1, "audio": 2, "cond": 0, "ref_img": 0, "cond_audio": 2, "ref_audio": 2}
+
+
 def build_mod_segments(
-    segments: list[tuple[int, int, str]], t_video: float, t_audio: float
+    segments: list[tuple[int, int, str]],
+    t_video: float,
+    t_audio: float,
+    *,
+    vis_aug: float = 0.999,
+    aud_aug: float = 1.0,
+    text_tags: np.ndarray | None = None,
 ) -> tuple[list[tuple[int, int, int]], list[float]]:
     """Assigns each packed-sequence segment a modulation row `t_row[t] * 3 +
-    tag` (`tag`: video=0, text=1, audio=2 -- fixed, matching every real
-    caller in the reference) and returns the sorted list of unique timestep
-    values those rows index into (feed to `curve_time_embedding`/
-    `AdalnProj` as `t_emb`'s `M` rows).
+    tag` and returns the sorted unique timestep values those rows index into
+    (feed to `curve_time_embedding`/`AdalnProj` as `t_emb`'s `M` rows).
 
-    Minimal-path restriction (see module docstring): no denoise masks, no
-    mixed text-token tags -- every row of a given segment shares one
-    timestep, matching `comfy/ldm/minimax/model.py::MiniMaxH3Model._forward`'s
-    `seg_t = {"text": t_v, "video": t_v, "audio": t_a}` for the same case."""
-    seg_t = {"text": t_video, "video": t_video, "audio": t_audio}
-    seg_tag = {"video": 0, "text": 1, "audio": 2}
-    unique_t = sorted({t_video, t_audio})
+    Timestep per kind (`comfy/ldm/minimax/model.py::_forward`): text and
+    video follow `t_video`, audio `t_audio`; keyframe/reference video rows
+    are pinned at `max(t_video, vis_aug)` and their audio rows at
+    `max(t_audio, aud_aug)`. Tags: video 0, text 1, audio 2 (condition
+    rows carry their modality's tag). `text_tags` (`[text_len]`, 0 = vision
+    row) splits the text segment into runs, vision rows taking tag 0.
+    No denoise masks."""
+    seg_t = {
+        "text": t_video, "video": t_video, "audio": t_audio,
+        "cond": max(t_video, vis_aug), "ref_img": max(t_video, vis_aug),
+        "cond_audio": max(t_audio, aud_aug), "ref_audio": max(t_audio, aud_aug),
+    }
+    unique_t = sorted({t_video, t_audio} | {seg_t[k] for _, _, k in segments})
     t_row = {t: i for i, t in enumerate(unique_t)}
-    mod_segments = [(a, b, t_row[seg_t[kind]] * 3 + seg_tag[kind]) for a, b, kind in segments]
+    mod_segments: list[tuple[int, int, int]] = []
+    for a, b, kind in segments:
+        base = t_row[seg_t[kind]] * 3
+        if kind == "text" and text_tags is not None:
+            tags = np.asarray(text_tags).reshape(-1).tolist()
+            if len(tags) != b - a:
+                raise ValueError(f"ASDX: text_token_tags has {len(tags)} entries, the text segment has {b - a} rows")
+            run = 0
+            for i in range(1, len(tags) + 1):
+                if i == len(tags) or tags[i] != tags[run]:
+                    mod_segments.append((a + run, a + i, base + int(tags[run])))
+                    run = i
+        else:
+            mod_segments.append((a, b, base + _SEG_TAG[kind]))
     return mod_segments, unique_t
 
 
@@ -400,6 +428,7 @@ class MiniMaxH3Model(nn.Module):
         audio_latent: mx.array,
         context: mx.array,
         sigma_v: float,
+        cond: PreparedCondition | None = None,
     ) -> tuple[mx.array, mx.array]:
         """`video_latent`: `[1, latents_dim, T, H, W]`. `audio_latent`:
         `[1, audio_latents_dim, 2, T_audio]`. `context`: `[L, text_dim]`
@@ -408,34 +437,66 @@ class MiniMaxH3Model(nn.Module):
         video stream's flow-matching sigma in `[0, 1]` (this port's
         interface takes it directly rather than the reference's
         `timestep = sigma * 1000` ComfyUI convention, which is pure
-        sampler-plumbing with no effect on the math below)."""
+        sampler-plumbing with no effect on the math below).
+        `cond`: prepared keyframe/reference rows (`condition.prepare_condition`,
+        computed once per sampling run); `None` = plain t2va. Returns the
+        NEGATED velocities of the target streams (the reference's outer
+        `forward()` sign flip)."""
         cfg = self.config
         shift_v, shift_a = cfg.sigma_shift_video, cfg.sigma_shift_audio
         t_v = 1.0 - sigma_v
         t_a = 1.0 - time_shift_sigma(sigma_v, shift_v, shift_a)
 
+        payload = cond.payload if cond is not None else None
         text_len = context.shape[0]
         latent_t, lat_h, lat_w = video_latent.shape[2], video_latent.shape[3], video_latent.shape[4]
         audio_t = audio_latent.shape[-1]
 
-        layout = PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t)
-        mod_segments, unique_t = build_mod_segments(layout.segments, t_v, t_a)
+        layout = PackedLayout(
+            text_len, latent_t, lat_h, lat_w, audio_t,
+            keyframes=payload.keyframes if payload else (), refs=payload.refs if payload else (),
+        )
+        mod_segments, unique_t = build_mod_segments(
+            layout.segments, t_v, t_a,
+            vis_aug=payload.visual_cond_noise_aug if payload else VISUAL_COND_TIMESTEP,
+            aud_aug=payload.audio_cond_noise_aug if payload else AUDIO_COND_TIMESTEP,
+            text_tags=payload.text_token_tags if payload else None,
+        )
         t_emb = curve_time_embedding(self.adaln_t_table, mx.array(unique_t, dtype=mx.float32))
 
-        video_rows = patchify_video(video_latent, cfg.patch_size)
-        audio_rows = pack_audio(audio_latent)
-        video_embed = self.video_patch_proj(video_rows)
-        audio_embed = self.audio_patch_proj(audio_rows)
+        video_embed = self.video_patch_proj(patchify_video(video_latent, cfg.patch_size))
+        audio_embed = self.audio_patch_proj(pack_audio(audio_latent))
+        cond_video = self.video_patch_proj(cond.video_rows) if cond is not None and cond.video_rows is not None else None
+        cond_audio = self.audio_patch_proj(cond.audio_rows) if cond is not None and cond.audio_rows is not None else None
 
         text_states = context
         if text_states.shape[-1] != cfg.hidden_size:
             text_states = self.token_refiner(self.condition_proj(text_states))
 
-        # segments are (text, audio, video) in that fixed order for this
-        # minimal layout, matching the embed pieces below exactly -- no
-        # per-segment gather needed (unlike the reference's general case,
-        # which also handles cond/ref segments interleaved with these).
-        h = mx.concatenate([text_states, audio_embed, video_embed], axis=0)
+        # Assemble in the layout's segment order (condition rows interleaved with the target).
+        pieces: list[mx.array] = []
+        voff = aoff = 0
+        for a, b, kind in layout.segments:
+            n = b - a
+            if kind == "text":
+                pieces.append(text_states)
+            elif kind in ("cond", "ref_img"):
+                pieces.append(cond_video[voff:voff + n])
+                voff += n
+            elif kind in ("cond_audio", "ref_audio"):
+                pieces.append(cond_audio[aoff:aoff + n])
+                aoff += n
+            elif kind == "audio":
+                pieces.append(audio_embed)
+            else:
+                pieces.append(video_embed)
+        h = mx.concatenate(pieces, axis=0)
+        for name, used, rows in (("video", voff, cond.video_rows if cond else None), ("audio", aoff, cond.audio_rows if cond else None)):
+            available = 0 if rows is None else rows.shape[0]
+            if used != available:
+                raise ValueError(
+                    f"ASDX: layout consumed {used} {name} condition rows but the prepared condition has {available}"
+                )
 
         angles = _rope_freqs(layout.position_ids, self.rope.inv_freq)
         cos, sin = rope_cos_sin(angles)
@@ -445,9 +506,9 @@ class MiniMaxH3Model(nn.Module):
 
         va, vb, _ = next(s for s in layout.segments if s[2] == "video")
         aa, ab, _ = next(s for s in layout.segments if s[2] == "audio")
-        video_row = unique_t.index(t_v)
-        audio_row = unique_t.index(t_a)
-        v, a = self.final_layer(h, t_emb, (va, vb, video_row), (aa, ab, audio_row))
+        v, a = self.final_layer(
+            h, t_emb, (va, vb, unique_t.index(t_v)), (aa, ab, unique_t.index(t_a))
+        )
 
         video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, cfg.latents_dim, cfg.patch_size)
         audio_out = unpack_audio(a)

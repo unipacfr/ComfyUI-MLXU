@@ -217,3 +217,23 @@ def test_zero_matches_raises():
         path.write_bytes(_write_gguf_from_tensors(bogus))
         with pytest.raises((ValueError, RuntimeError)):
             load_minimax_h3_from_gguf(path)
+
+
+def _record_mx_calls(monkeypatch, mod) -> list[str]:
+    """Wrap `mx.eval` and `mx.clear_cache` on `mod.mx`, returning the ordered call log."""
+    events: list[str] = []
+    real_eval = mod.mx.eval
+    monkeypatch.setattr(mod.mx, "eval", lambda *a, **k: (events.append("eval"), real_eval(*a, **k))[1])
+    monkeypatch.setattr(mod.mx, "clear_cache", lambda: events.append("clear_cache"))
+    return events
+
+
+def test_loader_clears_mlx_cache_once_after_final_eval(tmp_path, monkeypatch):
+    cfg = _tiny_config()
+    flat = dict(tree_flatten(MiniMaxH3Model(cfg).parameters()))
+    path = tmp_path / "tiny.gguf"
+    path.write_bytes(_write_gguf_from_tensors(flat))
+    events = _record_mx_calls(monkeypatch, weight_map_mod)
+    load_minimax_h3_from_gguf(path, dtype="float32", group_size=64, bits=4)
+    assert events.count("clear_cache") == 1
+    assert events[-1] == "clear_cache" and "eval" in events[:-1]

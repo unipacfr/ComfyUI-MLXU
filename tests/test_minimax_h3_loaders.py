@@ -365,3 +365,33 @@ def test_encode_prompt_helper_forwards_images_and_ref_items(monkeypatch):
 
     nodes_module.encode_minimax_h3_prompt(desc, "p")
     assert calls[-1] == {"images": [], "minimax_ref_items": None}
+
+
+def test_encode_prompt_helper_aborts_on_all_zero_hidden_states(monkeypatch):
+    import mlx.core as mx
+    import numpy as np
+
+    _install_fake_minimax_tokenizer(monkeypatch, [11])
+    stub = types.ModuleType("apple_silicon_nodes.native.minimax_h3.vision_conditioning")
+    stub.encode_with_vision = lambda enc, tower, entries: (mx.zeros((2, 4)), np.array([1, 1]))
+    monkeypatch.setitem(sys.modules, "apple_silicon_nodes.native.minimax_h3.vision_conditioning", stub)
+    desc = {"type": "asdx_minimax_h3_text_encoder", "encoder": Mock(), "vision_tower": None}
+    with pytest.raises(RuntimeError, match="degenerate conditioning from text encoder output"):
+        nodes_module.encode_minimax_h3_prompt(desc, "x")
+
+
+def test_payload_from_conditioning_reads_tags_keyframes_and_refs():
+    import mlx.core as mx
+
+    from tests.support.minimax_h3_module_loader import load_native_module
+
+    cond_mod = load_native_module("minimax_h3.condition")
+    KeyframeCond, RefBlock = cond_mod.KeyframeCond, cond_mod.RefBlock
+
+    assert nodes_module.payload_from_conditioning({"type": "minimax_h3", "hidden_states": mx.zeros((2, 3))}, 5) is None
+    kf, ref = KeyframeCond(0, mx.zeros((1, 4, 1, 4, 4))), RefBlock(kind="image", latent_t=1, latent_h=4, latent_w=4)
+    payload = nodes_module.payload_from_conditioning(
+        {"type": "minimax_h3", "token_tags": mx.array([1, 0, 1]), "keyframes": [kf], "refs": [ref]}, 11
+    )
+    assert payload.seed == 11 and payload.keyframes == (kf,) and payload.refs == (ref,)
+    assert payload.text_token_tags.tolist() == [1, 0, 1]

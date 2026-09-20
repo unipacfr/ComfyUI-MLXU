@@ -180,3 +180,42 @@ def test_loads_real_text_encoder_gguf_checkpoint():
     out = model(input_ids)
     assert out.shape == (5, 5120)
     assert bool(mx.all(mx.isfinite(out)).item())
+
+
+def _record_mx_calls(monkeypatch, mod) -> list[str]:
+    """Wrap `mx.eval` and `mx.clear_cache` on `mod.mx`, returning the ordered call log."""
+    events: list[str] = []
+    real_eval = mod.mx.eval
+    monkeypatch.setattr(mod.mx, "eval", lambda *a, **k: (events.append("eval"), real_eval(*a, **k))[1])
+    monkeypatch.setattr(mod.mx, "clear_cache", lambda: events.append("clear_cache"))
+    return events
+
+
+def test_loader_clears_mlx_cache_once_after_final_eval(tmp_path, monkeypatch):
+    flat = dict(tree_flatten(Qwen3TextEncoder(_tiny_config()).parameters()))
+    path = tmp_path / "tiny_qwen3.gguf"
+    path.write_bytes(_write_gguf_from_tensors(flat))
+    events = _record_mx_calls(monkeypatch, weight_map_mod)
+    load_qwen3_text_encoder_from_gguf(path, dtype="float32", group_size=64, bits=4)
+    assert events.count("clear_cache") == 1
+    assert events[-1] == "clear_cache" and "eval" in events[:-1]
+
+
+_MINIMAX_H3_TEXT_ENCODER_INT8 = Path(
+    "/Volumes/X10Pro/Images/models/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+)
+
+
+@pytest.mark.skipif(
+    os.environ.get("ASDX_FULL_GGUF_TEST") != "1",
+    reason="loads the real ~20GB Qwen3 text encoder checkpoint; set ASDX_FULL_GGUF_TEST=1 to run",
+)
+def test_real_text_encoder_load_returns_freed_buffers_to_the_system():
+    if not _MINIMAX_H3_TEXT_ENCODER_INT8.exists():
+        pytest.skip("no local MiniMax H3 int8 text encoder safetensors")
+    mx.clear_cache()
+    model = weight_map_mod.load_qwen3_text_encoder_checkpoint(_MINIMAX_H3_TEXT_ENCODER_INT8, dtype="float16")
+    active, cache = mx.get_active_memory(), mx.get_cache_memory()
+    print(f"[measured] active={active / 1e9:.2f} GB cache={cache / 1e9:.2f} GB")
+    assert cache < 0.5e9
+    del model

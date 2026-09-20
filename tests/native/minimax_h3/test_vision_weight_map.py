@@ -136,3 +136,61 @@ def test_real_weights_match_comfyui_on_a_real_image():
     print(f"\nREAL-WEIGHTS COSINE (gpu): merged={values[0]:.7f} deepstack={[f'{v:.7f}' for v in values[1:]]}")
     assert len(values) == 4
     assert all(v > 0.9999 for v in values), values
+
+
+def _record_mx_calls(monkeypatch, mod) -> list[str]:
+    """Wrap `mx.eval` and `mx.clear_cache` on `mod.mx`, returning the ordered call log."""
+    events: list[str] = []
+    real_eval = mod.mx.eval
+    monkeypatch.setattr(mod.mx, "eval", lambda *a, **k: (events.append("eval"), real_eval(*a, **k))[1])
+    monkeypatch.setattr(mod.mx, "clear_cache", lambda: events.append("clear_cache"))
+    return events
+
+
+def test_assign_clears_mlx_cache_once_after_final_eval(monkeypatch):
+    model = tower_mod.VisionTower(TINY)
+    events = _record_mx_calls(monkeypatch, map_mod)
+    map_mod.assign_vision_weights(model, _tensors_for(model))
+    assert events.count("clear_cache") == 1
+    assert events[-1] == "clear_cache" and "eval" in events[:-1]
+
+
+def test_load_vision_tower_drops_raw_tensors_before_the_last_cache_clear(monkeypatch):
+    """The raw checkpoint tensors must be released BEFORE the final `mx.clear_cache()`, or
+    their buffers stay live (~1.2 GB on the real tower) and are not returned."""
+    import weakref
+
+    donor = tower_mod.VisionTower(TINY)
+    flat = _tensors_for(donor)
+    refs: dict[str, weakref.ref] = {}
+
+    class FakeSource:
+        def shapes(self):
+            return {"visual." + k: tuple(v.shape) for k, v in flat.items()}
+
+        def get(self, name):
+            arr = flat[name[len("visual."):]] + 0  # a fresh array the loader's dict alone will own
+            refs[name] = weakref.ref(arr)
+            return arr
+
+    monkeypatch.setattr(map_mod, "open_checkpoint", lambda path: FakeSource())
+    monkeypatch.setattr(map_mod, "VisionConfig", lambda: TINY)
+    events: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        map_mod.mx, "clear_cache", lambda: events.append(("clear_cache", sum(r() is not None for r in refs.values())))
+    )
+    map_mod.load_vision_tower("model.safetensors")
+    assert [name for name, _ in events] == ["clear_cache", "clear_cache"]  # assign's, then the loader's
+    assert events[-1][1] == 0, "raw tensors still alive at the loader's clear_cache"
+
+
+@_FULL
+def test_real_load_vision_tower_returns_its_buffers_to_the_system():
+    if not _ST.exists():
+        pytest.skip("real TE checkpoint not present")
+    mx.clear_cache()
+    before = mx.get_cache_memory()
+    model = map_mod.load_vision_tower(_ST)  # held: the tower's own weights are live, not cache
+    after = mx.get_cache_memory()
+    print(f"\nMLX cache before load {before / 1e9:.3f} GB, after load_vision_tower {after / 1e9:.3f} GB, active {mx.get_active_memory() / 1e9:.3f} GB")
+    assert model is not None and after < 0.2e9

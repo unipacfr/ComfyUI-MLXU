@@ -109,6 +109,7 @@ def load_minimax_h3_checkpoint(
 
     model.update(tree_unflatten(list(model_flat.items())))
     mx.eval(model.parameters())
+    mx.clear_cache()  # return the freed load-time buffers MLX keeps cached (up to ~6 GB after the text encoder)
 
     print(f"[ASDX] MiniMax H3 DiT ({path.suffix.lstrip(".").lower()}): matched {matched}/{len(model_flat)} params from checkpoint")
     _check_weight_match(matched, len(model_flat), "MiniMax H3 DiT", path)

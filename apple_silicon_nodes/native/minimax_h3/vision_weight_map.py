@@ -69,6 +69,7 @@ def assign_vision_weights(model: VisionTower, tensors: dict[str, mx.array]) -> i
         new[name] = tensor.reshape(current.shape).astype(mx.float32)
     model.update(tree_unflatten(list(new.items())))
     mx.eval(model.parameters())
+    mx.clear_cache()  # return the freed load-time buffers MLX keeps cached (up to ~6 GB after the text encoder)
     return len(new)
 
 
@@ -81,5 +82,7 @@ def load_vision_tower(path: str | Path) -> VisionTower:
     tensors = {name: source.get(_PREFIX + name) for name in shapes}
     model = VisionTower(config)
     assigned = assign_vision_weights(model, tensors)
+    del tensors  # the raw checkpoint buffers are only freed once this dict drops them; then return them to the system
+    mx.clear_cache()
     print(f"[ASDX] MiniMax H3 vision tower ({Path(path).suffix.lstrip('.').lower()}): assigned {assigned} params")
     return model

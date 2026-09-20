@@ -9,6 +9,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+import pytest
 from mlx.utils import tree_unflatten
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -127,3 +128,56 @@ def test_gpu_stream_agrees_with_cpu_stream():
         no_deepstack = np.array(enc(IDS, vision=dataclasses.replace(vision, deepstack=[])))
     assert np.abs(gpu - far).max() > bound  # null case: different weights (measured 0.40)
     assert np.abs(gpu - no_deepstack).max() > bound  # subtler null: same weights, no DeepStack (measured 6.4)
+
+
+def _zero_embedding_encoder():
+    enc = _seeded_encoder()
+    enc.model.embed_tokens.weight = mx.zeros_like(enc.model.embed_tokens.weight)
+    return enc
+
+
+def test_zero_embedding_table_is_refused_even_with_vision_rows():
+    # A failed lazy read yields an all-zero table; vision rows written over the
+    # pad positions used to mask it. The screen must run before the splice.
+    with pytest.raises(RuntimeError, match="token embedding"):
+        _zero_embedding_encoder()(IDS, vision=_vision())
+
+
+def test_zero_embedding_table_is_refused_text_only():
+    with pytest.raises(RuntimeError, match="token embedding"):
+        _zero_embedding_encoder()(IDS, vision=None)
+
+
+def test_screen_skips_when_every_position_is_a_vision_row():
+    enc = _zero_embedding_encoder()
+    v = _vision()
+    all_idx = np.arange(SEQ)
+    n = SEQ
+    rng = np.random.default_rng(1)
+    full = enc_mod.VisionInputs(
+        rows=mx.array(rng.standard_normal((n, HIDDEN)).astype(np.float32)),
+        row_indices=all_idx,
+        deepstack=[],
+        position_ids=v.position_ids,
+        rope_dims=ROPE_DIMS,
+    )
+    assert enc(IDS, vision=full).shape == (SEQ, HIDDEN)
+
+
+def test_normal_encoder_passes_and_text_only_output_is_reference_identical():
+    enc = _seeded_encoder()
+    backbone = enc.model
+    x = backbone.embed_tokens(IDS)
+    cos, sin = enc_mod.qwen3_rope_cos_sin(SEQ, HEAD_DIM, 5000000.0)
+    for layer in backbone.layers:
+        x = layer(x, cos, sin)
+    assert np.array_equal(np.array(enc(IDS, vision=None)), np.array(x))
+
+
+def test_refuse_if_degenerate_rejects_zeros_and_non_finite_but_not_normal():
+    with pytest.raises(RuntimeError, match=r"^ASDX MiniMax H3: degenerate conditioning from probe:.*shape"):
+        enc_mod.refuse_if_degenerate(mx.zeros((2, 3)), "probe")
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(RuntimeError, match="non-finite"):
+            enc_mod.refuse_if_degenerate(mx.array([[1.0, bad]]), "probe")
+    enc_mod.refuse_if_degenerate(mx.array([[0.0, 1e-3], [2.0, -3.0]]), "probe")
