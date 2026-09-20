@@ -105,3 +105,11 @@ In the MiniMax H3 loaders, `mx.quantize` results are lazy, so the graph keeps ev
 ## MiniMax H3 memory gate is calibrated on measured peaks, not file size
 kind: choice | date: 2026-09-19 | status: canon
 memory_calibration._FAMILY_HEURISTIC_MULTIPLIER sets `minimax_h3_dit` and `minimax_h3_text_encoder` to 1.0 instead of the 2.3 default. Because: every big linear is requantized to MLX 4-bit at load, so resident size follows the parameter count and not the source format (measured peaks: DiT 14.1GB from a 20GB INT8 safetensors, 13.4GB from Q5_0 GGUF; text encoder 16.8GB from 26GB safetensors, 16.2GB from Q4_K_M GGUF). Activation memory at full video resolution is NOT covered by these numbers.
+
+## MLX GPU fp32 matmul is not exact: parity tests run on the CPU stream
+kind: gotcha | date: 2026-09-19 | status: canon
+MLX 0.32 GPU float32 matmul has ~7.5e-4 relative error (measured 3e-3 to 1.4e-2 absolute on 96x64 to 1536x1152 shapes, against 2e-6 to 3e-5 on the CPU stream). On the real Qwen3-VL vision weights the GPU forward has min per-row cosine 0.99966 and relative L2 0.67% against ComfyUI, versus 9e-6 on the CPU stream, while the flattened cosine reads 0.99998. Because: architecture parity tests must run under `mx.stream(mx.cpu)` with tight tolerances, a separate GPU-vs-CPU self-consistency test (with a null case) covers the production stream, and thresholds are set on per-row cosine and relative L2, never on a flattened cosine that averages the error away.
+
+## A parity test must be proven by mutation before it is trusted
+kind: convention | date: 2026-09-19 | status: canon
+Break the thing under test on purpose and confirm the test fails. The first MiniMax H3 encoder parity test (tiny config, head_dim 8, bound 1e-3) still passed with M-RoPE disabled: true residual 2.4e-7, mutant delta 5.3e-6, both far under the bound. It only gained teeth with the real head_dim 128 and rope_dims (24,20,20) and a 1e-5 bound (mutant delta 3.7e-4, failing). Because: tiny random-weight models are insensitive to subtle wiring errors, and a metric that cannot separate "correct" from "broken" measures nothing.

@@ -103,6 +103,8 @@ aléatoires, avec et sans keyframes/refs.
 - Les entrées du tokenizer qui ne sont ni un id ni un dict vision (tenseur nu, `{"type": "embedding"}`) ne sont pas gérées (le tokenizer n'en émet pas sans répertoire d'embeddings).
 - Le pic de la tour (3,6 Go) est ajouté après l'appel du gate mémoire du loader de l'encodeur (le gate du DiT le voit via `_predicted_peak_bytes`).
 - `encode_minimax_h3_prompt` est le point d'intégration unique pour les nœuds i2v/ref (images des keyframes, `ref_items` dans l'ordre de la requête).
+- Contrat du DiT (brique 3) que les nœuds doivent respecter : ne créer un `RefBlock` que lorsque le VAE est présent (ComfyUI n'en crée pas sans latent ; un bloc sans latent passe le layout mais échoue au forward) ; `latent_h`/`latent_w` en unités latentes (pixels / 16, avant le patch 2x2) ; les latents de keyframe partagent la grille spatiale de la cible (`ValueError` sinon) ; `resolved_frame_index` est une image en pixels sur la grille 17k+5 à 24 fps (un index négatif n'est pas contrôlé) ; le dict de conditioning porte `token_tags`, `keyframes` (liste de `KeyframeCond`) et `refs` (liste de `RefBlock`), et le sampler transmet sa graine comme graine du bruit d'augmentation.
+- Le gate mémoire de la brique 4 doit compter les lignes de condition (le layout coûte 0,3 ms par forward à 130 000 lignes, sans enjeu) : la projection SwiGLU dépasse `i32::MAX` éléments à partir de ~74 900 lignes (référence Rust `cost.rs`), à vérifier chez nous.
 
 ## Mémoire
 
