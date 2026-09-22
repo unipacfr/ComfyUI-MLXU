@@ -35,7 +35,7 @@ def test_mlx_dtype_rejects_unknown():
         _ = cfg.mlx_dtype
 
 
-def _fake_state_dict(num_layers=2, inner_dim=16, head_dim=4, context_dim=32, in_ch=8):
+def _fake_state_dict(num_layers=2, inner_dim=16, head_dim=4, context_dim=32, in_ch=8, mlp_ratio=3):
     heads = inner_dim // head_dim
     sd = {
         "img_in.weight": np.zeros((inner_dim, in_ch), dtype=np.float32),
@@ -46,6 +46,8 @@ def _fake_state_dict(num_layers=2, inner_dim=16, head_dim=4, context_dim=32, in_
         p = f"transformer_blocks.{i}."
         sd[p + "attn.to_q.weight"] = np.zeros((inner_dim, inner_dim), dtype=np.float32)
         sd[p + "attn.norm_q.weight"] = np.zeros((head_dim,), dtype=np.float32)
+        # gate_up fuses [gate; up] (SwiGLUFeedForward), so its output dim is 2 * mlp_hidden_dim.
+        sd[p + "img_mlp.gate_up.weight"] = np.zeros((2 * inner_dim * mlp_ratio, inner_dim), dtype=np.float32)
     return sd
 
 
@@ -59,6 +61,7 @@ def test_detect_from_real_shapes():
     assert cfg.context_in_dim == 32
     assert cfg.in_channels == 8
     assert cfg.out_channels == 8
+    assert cfg.mlp_ratio == 3
 
 
 def test_detect_raises_on_missing_keys():

@@ -46,11 +46,14 @@ def detect_qwen_image21_config(state_dict: dict[str, Any], dtype: str = "float16
     proj_out_w = state_dict.get("proj_out.weight")
     q_w = state_dict.get("transformer_blocks.0.attn.to_q.weight")
     q_norm_w = state_dict.get("transformer_blocks.0.attn.norm_q.weight")
-    if img_in_w is None or txt_in_w is None or proj_out_w is None or q_w is None or q_norm_w is None:
+    gate_up_w = state_dict.get("transformer_blocks.0.img_mlp.gate_up.weight")
+    if (img_in_w is None or txt_in_w is None or proj_out_w is None or q_w is None
+            or q_norm_w is None or gate_up_w is None):
         raise ValueError(
             "ASDX: cannot detect Qwen Image 2.1 DiT config -- checkpoint is missing "
             "img_in.weight / txt_in.in_layer.weight / proj_out.weight / "
-            "transformer_blocks.0.attn.{to_q,norm_q}.weight after key normalization."
+            "transformer_blocks.0.attn.{to_q,norm_q}.weight / "
+            "transformer_blocks.0.img_mlp.gate_up.weight after key normalization."
         )
 
     layer_indices = set()
@@ -64,11 +67,16 @@ def detect_qwen_image21_config(state_dict: dict[str, Any], dtype: str = "float16
     out_channels = proj_out_w.shape[0]
     attention_head_dim = q_norm_w.shape[0]
     num_attention_heads = inner_dim // attention_head_dim
+    # gate_up fuses [gate; up] (SwiGLUFeedForward, model.py), so its output dim is
+    # 2 * mlp_hidden_dim; mlp_hidden_dim = inner_dim * mlp_ratio.
+    mlp_hidden_dim = gate_up_w.shape[0] // 2
+    mlp_ratio = mlp_hidden_dim // inner_dim
 
     return QwenImage21Config(
         in_channels=in_channels,
         out_channels=out_channels,
         num_layers=num_layers,
+        mlp_ratio=mlp_ratio,
         attention_head_dim=attention_head_dim,
         num_attention_heads=num_attention_heads,
         context_in_dim=context_in_dim,

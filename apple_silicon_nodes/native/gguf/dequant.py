@@ -58,9 +58,11 @@ the exact bit-packing of those scales into 12 bytes (`Q4_K.get_scale_min`)
 is llama.cpp's own space-saving trick, ported as-is rather than re-derived.
 
 F32/F16/BF16/Q5_0/Q4_K/Q6_K cover both real MiniMax H3 GGUF checkpoints on
-this machine. Other K-quant/legacy types (Q4_0, Q5_K, Q2_K/Q3_K/Q8_K, the
-IQ*/TQ*/NVFP4 families) are not implemented; unsupported types raise
-rather than guess.
+this machine. Q8_0 (ported the same way, bit-for-bit from
+`gguf_connector/quant.py::Q8_0.dequantize_blocks`) covers the real Qwen
+Image 2.1 DiT GGUF checkpoint. Other K-quant/legacy types (Q4_0, Q5_K,
+Q2_K/Q3_K/Q8_K, the IQ*/TQ*/NVFP4 families) are not implemented;
+unsupported types raise rather than guess.
 """
 
 from __future__ import annotations
@@ -74,6 +76,9 @@ from .reader import GGMLQuantizationType, GGUFHeader, GGUFTensorInfo
 
 _Q5_0_BLOCK_ELEMENTS = 32
 _Q5_0_BLOCK_BYTES = 22
+
+_Q8_0_BLOCK_ELEMENTS = 32
+_Q8_0_BLOCK_BYTES = 34
 
 _QK_K = 256
 _K_SCALE_SIZE = 12
@@ -113,6 +118,28 @@ def _dequantize_q5_0(raw: bytes, n_elements: int) -> np.ndarray:
 
     quantized = (low_nibbles | (high_bits << np.uint8(4))).astype(np.int8) - np.int8(16)
     return (d * quantized.astype(np.float32)).reshape(-1)
+
+
+def _dequantize_q8_0(raw: bytes, n_elements: int) -> np.ndarray:
+    """Q8_0 block layout (34 bytes for 32 values), no zero-point: `[d: f16][qs: 32 int8]`,
+    `x[i] = d * qs[i]`. Ported bit-for-bit from `gguf_connector/quant.py::Q8_0.
+    dequantize_blocks`, matching upstream llama.cpp's `dequantize_row_q8_0`. Needed for the
+    Qwen Image 2.1 DiT GGUF (`qwen_image_2.1_Q8.gguf`), whose linear weights are Q8_0 --
+    verified against the real checkpoint in `weight_map.py`'s own tests (dequantized Q8_0
+    tensor matches the same tensor read from the bf16 safetensors checkpoint within Q8_0's
+    quantization tolerance)."""
+    if n_elements % _Q8_0_BLOCK_ELEMENTS != 0:
+        raise ValueError(
+            f"ASDX: Q8_0 tensor has {n_elements} elements, not a multiple of "
+            f"the block size ({_Q8_0_BLOCK_ELEMENTS})"
+        )
+    n_blocks = n_elements // _Q8_0_BLOCK_ELEMENTS
+    blocks = np.frombuffer(raw, dtype=np.uint8).reshape(n_blocks, _Q8_0_BLOCK_BYTES)
+
+    d = blocks[:, :2].copy().view(np.float16).astype(np.float32)  # (n_blocks, 1)
+    qs = blocks[:, 2:].copy().view(np.int8).astype(np.float32)  # (n_blocks, 32)
+
+    return (d * qs).reshape(-1)
 
 
 def _get_scale_min_k4(scales: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -195,6 +222,7 @@ _DEQUANTIZERS = {
     GGMLQuantizationType.F16: lambda raw, n: _dequantize_f16(raw),
     GGMLQuantizationType.BF16: lambda raw, n: _dequantize_bf16(raw),
     GGMLQuantizationType.Q5_0: _dequantize_q5_0,
+    GGMLQuantizationType.Q8_0: _dequantize_q8_0,
     GGMLQuantizationType.Q4_K: _dequantize_q4_k,
     GGMLQuantizationType.Q6_K: _dequantize_q6_k,
 }
