@@ -50,6 +50,9 @@ class ASDX_EmptyLatent(io.ComfyNode):
         "zimage": (16, 8),
         "flux2": (128, 16),
         "sdxl": (4, 8),
+        # 64ch/16x VAE, no patchify (see bridge.py::QWEN_IMAGE21_LATENT_CHANNELS/
+        # QWEN_IMAGE21_VAE_DOWNSCALE) -- confirmed via real comfy.sd.VAE.
+        "qwen_image21": (64, 16),
     }
 
     @classmethod
