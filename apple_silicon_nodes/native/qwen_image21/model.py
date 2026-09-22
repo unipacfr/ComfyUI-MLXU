@@ -304,7 +304,11 @@ class QwenImage21Transformer2DModel(nn.Module):
         hidden_states, pe, segments = self._build_sequence(x, context)
         prefix_len = hidden_states.shape[1] - H * W
 
-        t = timestep.astype(dtype)
+        # Reference: "pipeline rounds t*1000 and t to the compute dtype" -- round-trips
+        # through the compute dtype's precision (matters for fp16, where the sampler's
+        # float32 timestep would otherwise carry more precision than the model saw
+        # during training/quantized inference).
+        t = ((timestep * 1000).astype(dtype) / 1000).astype(dtype)
         temb = self.time_text_embed(mx.concatenate([t, mx.zeros((1,), dtype=dtype)]))
         mod_out = temb
         for layer in self.modulation:
