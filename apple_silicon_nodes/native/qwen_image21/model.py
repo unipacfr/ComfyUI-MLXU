@@ -319,7 +319,7 @@ class QwenImage21Transformer2DModel(nn.Module):
         mod = (
             _split_rows(scale1), _split_rows(mx.tanh(gate1)),
             _split_rows(scale2), _split_rows(mx.tanh(gate2)),
-            mx.zeros((1, 1, scale1.shape[-1])),
+            mx.zeros((1, 1, scale1.shape[-1]), dtype=dtype),
         )
 
         attn_fn = block_causal_attention(segments)
