@@ -544,8 +544,17 @@ def mlx_to_comfy_latent_qwen_image21(latents: mx.array, template: dict[str, Any]
 
     The DiT operates on the latent grid directly in NCHW (matching ComfyUI's own
     LATENT convention) -- no patch packing, no NHWC transpose (unlike SDXL's
-    native-MLX channel-last convention)."""
-    latents = latents.astype(mx.float32)
+    native-MLX channel-last convention). The denoising loop runs entirely in the
+    model's normalized ("whitened") latent space -- must apply
+    `process_qwen_image21_latent_out` (matching `comfy/samplers.py:1238`'s
+    `process_latent_out`, applied once at this exact sampling boundary) before
+    VAE decode, same bug class as `_unpack_krea2_latents`'s Wan21 de-whitening
+    (see `native/config.py::process_wan21_latent_out`) -- missing this step
+    feeds the VAE decoder out-of-distribution latent values, producing a
+    systematic grid/mesh artifact from the decoder's upsampling layers."""
+    from .native.config import process_qwen_image21_latent_out
+
+    latents = process_qwen_image21_latent_out(latents.astype(mx.float32))
     mx.eval(latents)
     samples = torch.from_numpy(np.array(latents, dtype=np.float32))
     out = dict(template)

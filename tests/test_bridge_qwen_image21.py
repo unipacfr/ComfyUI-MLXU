@@ -51,6 +51,22 @@ def test_mlx_to_comfy_latent_qwen_image21_shape():
     assert tuple(out["samples"].shape) == (1, 64, 8, 8)
 
 
+def test_mlx_to_comfy_latent_qwen_image21_applies_per_channel_denormalization():
+    """The DiT samples in QwenImage21's normalized ("whitened") latent space --
+    `mlx_to_comfy_latent_qwen_image21` must apply the per-channel `* std + mean`
+    de-whitening (matching `comfy/samplers.py`'s `process_latent_out`) before
+    VAE decode, same bug class as Wan21/Krea2 (see `native/config.py::
+    process_wan21_latent_out`). A zero-valued DiT output must come out as
+    exactly `latents_mean` per channel, not zero."""
+    from apple_silicon_nodes.native.config import QWEN_IMAGE21_LATENTS_MEAN
+
+    latents = mx.zeros((1, 64, 4, 4))
+    out = bridge_mod.mlx_to_comfy_latent_qwen_image21(latents, {"samples": None})
+    samples = out["samples"]
+    expected = torch.tensor(QWEN_IMAGE21_LATENTS_MEAN, dtype=torch.float32).view(1, 64, 1, 1)
+    assert torch.allclose(samples, expected.expand_as(samples), atol=1e-4)
+
+
 def test_prepare_noise_from_latent_qwen_image21_shape_and_dims():
     samples = torch.zeros((1, 64, 8, 8))
     latent = {"samples": samples}
