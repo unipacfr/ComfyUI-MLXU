@@ -135,3 +135,104 @@ class Attention(nn.Module):
         else:
             out = attn_fn(q, k, v, self.heads)
         return self.to_out[0](out)
+
+
+def _split_rows(p: mx.array) -> tuple[mx.array, mx.array]:
+    """Shared modulation rows: (t=0 row for the text prefix, sampled-t rows for the
+    target). `p`: [seq, dim] -> (prefix [1, 1, dim], target [1, seq-1, dim])."""
+    return p[-1:][None], p[:-1][None]
+
+
+def _modulated_norm(norm: nn.Module, x: mx.array, scale: tuple[mx.array, mx.array], prefix_len: int) -> mx.array:
+    """LayerNorm (no affine) * (1 + scale), the target scale for every row, the prefix
+    rows (if any) redone with the t=0 scale. Plain-math equivalent of the reference's
+    `comfy.quant_ops.ck.adaln` fused-kernel branch."""
+    s_prefix, s_target = scale
+    out = norm(x)
+    if prefix_len:
+        prefix_out = out[:, :prefix_len] * (1 + s_prefix)
+        target_out = out[:, prefix_len:] * (1 + s_target)
+        return mx.concatenate([prefix_out, target_out], axis=1)
+    return out * (1 + s_target)
+
+
+def _gated_residual(x: mx.array, y: mx.array, gate: tuple[mx.array, mx.array], prefix_len: int) -> mx.array:
+    g_prefix, g_target = gate
+    if prefix_len:
+        prefix_out = x[:, :prefix_len] + y[:, :prefix_len] * g_prefix
+        target_out = x[:, prefix_len:] + y[:, prefix_len:] * g_target
+        return mx.concatenate([prefix_out, target_out], axis=1)
+    return x + y * g_target
+
+
+class LayerNormNoAffine(nn.Module):
+    """LayerNorm with elementwise_affine=False: normalizes, no learned scale/bias."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x32 = x.astype(mx.float32)
+        mean = mx.mean(x32, axis=-1, keepdims=True)
+        var = mx.var(x32, axis=-1, keepdims=True)
+        return ((x32 - mean) * mx.rsqrt(var + self.eps)).astype(x.dtype)
+
+
+def block_causal_attention(segments: list[tuple[int, int, mx.array | None]]):
+    """`segments`: list of `(start, end, mask)`. Each segment's query rows `[start:end]`
+    attend over key/value rows `[0:end]` (everything up to and including this segment),
+    with `mask` applied if given (a `[n, end]` boolean mask, `True` = attend) or full
+    attention over `[0:end]` if `mask` is `None`. Matches the reference's
+    `block_causal_attention` exactly, minus the prefix-cache `cache.put` call (cache
+    disabled in this brick -- see the brick 2 design's Risques section)."""
+
+    def attn(q: mx.array, k: mx.array, v: mx.array, heads: int) -> mx.array:
+        B, N, H, D = q.shape
+        outs = []
+        for start, end, mask in segments:
+            qs = q[:, start:end].reshape(B, end - start, H, D).transpose(0, 2, 1, 3)
+            ks = k[:, :end].reshape(B, end, H, D).transpose(0, 2, 1, 3)
+            vs = v[:, :end].reshape(B, end, H, D).transpose(0, 2, 1, 3)
+            scale = 1.0 / (D**0.5)
+            attn_mask = None
+            if mask is not None:
+                attn_mask = mx.where(mask, mx.array(0.0), mx.array(-mx.inf)).astype(qs.dtype)
+            out = mx.fast.scaled_dot_product_attention(qs, ks, vs, scale=scale, mask=attn_mask)
+            outs.append(out.transpose(0, 2, 1, 3).reshape(B, end - start, H * D))
+        return mx.concatenate(outs, axis=1) if len(outs) > 1 else outs[0]
+
+    return attn
+
+
+class QwenImage21TransformerBlock(nn.Module):
+    def __init__(self, dim: int, num_attention_heads: int, attention_head_dim: int,
+                 mlp_ratio: int = 3, eps: float = 1e-6):
+        super().__init__()
+        self.img_norm1 = LayerNormNoAffine(dim, eps=eps)
+        self.attn = Attention(dim, num_attention_heads, attention_head_dim, eps=eps)
+        self.img_norm2 = LayerNormNoAffine(dim, eps=eps)
+        self.img_mlp = SwiGLUFeedForward(dim, dim * mlp_ratio)
+
+    def __call__(self, x: mx.array, mod, pe: mx.array, attn_fn, prefix_len: int) -> mx.array:
+        scale1, gate1, scale2, gate2, _zero = mod
+        x = _gated_residual(
+            x, self.attn(_modulated_norm(self.img_norm1, x, scale1, prefix_len), pe, attn_fn), gate1, prefix_len
+        )
+        x = _gated_residual(x, self.img_mlp(_modulated_norm(self.img_norm2, x, scale2, prefix_len)), gate2, prefix_len)
+        if x.dtype == mx.float16:
+            x = mx.clip(x, -65504, 65504)
+        return x
+
+
+class LastLayer(nn.Module):
+    """Scale only, no shift."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.linear = nn.Linear(dim, dim, bias=False)
+        self.norm = LayerNormNoAffine(dim, eps=eps)
+
+    def __call__(self, x: mx.array, temb: mx.array) -> mx.array:
+        scale = self.linear(nn.silu(temb))[:, None]
+        return self.norm(x) * (1 + scale)
