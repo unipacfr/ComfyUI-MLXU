@@ -113,3 +113,47 @@ def test_loads_real_gguf_checkpoint():
     out = model(x, timestep, context)
     assert out.shape == (1, 64, 8, 8)
     assert bool(mx.all(mx.isfinite(out)).item())
+
+
+@pytest.mark.skipif(
+    os.environ.get("ASDX_FULL_GGUF_TEST") != "1",
+    reason="loads both real DiT checkpoints (~14GB + ~7.7GB); set ASDX_FULL_GGUF_TEST=1 to run",
+)
+def test_q8_0_dequant_matches_bf16_checkpoint():
+    """The verification `native/gguf/dequant.py::_dequantize_q8_0`'s own docstring
+    claims: dequantized Q8_0 tensors matched against the same tensor read from the
+    real bf16 checkpoint, within Q8_0's quantization tolerance. That claim previously
+    had no committed test -- this is it."""
+    if not _DIT_BF16_REAL.exists() or not _DIT_GGUF_REAL.exists():
+        pytest.skip("real bf16/GGUF DiT checkpoints not both present locally")
+
+    reader_mod = load_native_module("gguf.reader")
+    dequant_mod = load_native_module("gguf.dequant")
+    read_gguf_header = reader_mod.read_gguf_header
+    dequantize_tensor = dequant_mod.dequantize_tensor
+
+    bf16_state = mx.load(str(_DIT_BF16_REAL))
+    gguf_header = read_gguf_header(_DIT_GGUF_REAL)
+
+    probe_keys = [
+        "transformer_blocks.0.attn.to_q.weight",
+        "transformer_blocks.15.img_mlp.gate_up.weight",
+        "transformer_blocks.31.attn.to_out.0.weight",
+    ]
+    for key in probe_keys:
+        bf16_tensor = bf16_state[key].astype(mx.float32)
+        q8_tensor = dequantize_tensor(_DIT_GGUF_REAL, gguf_header, key).astype(mx.float32)
+        assert q8_tensor.shape == bf16_tensor.shape, key
+
+        rel_err = float(mx.mean(mx.abs(q8_tensor - bf16_tensor)).item()) / float(
+            mx.mean(mx.abs(bf16_tensor)).item()
+        )
+        # Q8_0 is a per-32-value-block 8-bit quantization (~1/127 relative step);
+        # a few percent mean relative error is expected and healthy, not a bug.
+        assert rel_err < 0.05, f"{key}: relative error {rel_err:.4f} exceeds Q8_0 tolerance"
+
+        cos = float(
+            mx.sum(q8_tensor.flatten() * bf16_tensor.flatten())
+            / (mx.linalg.norm(q8_tensor.flatten()) * mx.linalg.norm(bf16_tensor.flatten()))
+        )
+        assert cos > 0.999, f"{key}: cosine similarity {cos:.5f} too low for a real Q8_0 match"

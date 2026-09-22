@@ -69,7 +69,17 @@ def detect_qwen_image21_config(state_dict: dict[str, Any], dtype: str = "float16
     num_attention_heads = inner_dim // attention_head_dim
     # gate_up fuses [gate; up] (SwiGLUFeedForward, model.py), so its output dim is
     # 2 * mlp_hidden_dim; mlp_hidden_dim = inner_dim * mlp_ratio.
+    if gate_up_w.shape[0] % 2 != 0:
+        raise ValueError(
+            f"ASDX: transformer_blocks.0.img_mlp.gate_up.weight has an odd output dim "
+            f"({gate_up_w.shape[0]}) -- cannot split into [gate; up] halves."
+        )
     mlp_hidden_dim = gate_up_w.shape[0] // 2
+    if mlp_hidden_dim % inner_dim != 0:
+        raise ValueError(
+            f"ASDX: cannot derive an integer mlp_ratio -- mlp_hidden_dim ({mlp_hidden_dim}) "
+            f"is not a multiple of inner_dim ({inner_dim})."
+        )
     mlp_ratio = mlp_hidden_dim // inner_dim
 
     return QwenImage21Config(

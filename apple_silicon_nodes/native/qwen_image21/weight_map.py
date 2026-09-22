@@ -47,10 +47,17 @@ def _assign_from_state_dict(model: QwenImage21Transformer2DModel, config, state_
         )
 
     weights = []
-    for key, _ in _flatten_module_params(model):
+    for key, module_param in _flatten_module_params(model):
         if key not in state_dict:
             raise ValueError(f"ASDX: checkpoint is missing required key {key!r} for QwenImage21Transformer2DModel.")
-        weights.append((key, state_dict[key].astype(config.mlx_dtype)))
+        checkpoint_tensor = state_dict[key]
+        if tuple(checkpoint_tensor.shape) != tuple(module_param.shape):
+            raise ValueError(
+                f"ASDX: checkpoint key {key!r} has shape {tuple(checkpoint_tensor.shape)}, "
+                f"expected {tuple(module_param.shape)} -- checkpoint does not match the "
+                "detected config (a config-detection bug or a genuinely different checkpoint)."
+            )
+        weights.append((key, checkpoint_tensor.astype(config.mlx_dtype)))
 
     print(f"[ASDX] Qwen Image 2.1 DiT: matched {len(weights)}/{len(expected_keys)} weights.")
     model.update(tree_unflatten(weights))
