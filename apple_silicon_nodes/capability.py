@@ -233,6 +233,28 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         latent_channels=16,
         supports_controlnet=False,
     ),
+    # ── Qwen Image 2.1 (7B DiT, ~14GB bf16 on disk, 265/265 weights matched
+    # against the real checkpoint in brick 2) ──────────────────────────────
+    "qwen_image21_base": CapabilityProfile(
+        family="qwen_image21",
+        name="Qwen-Image-2.1",
+        generate_params={
+            "width": "int",
+            "height": "int",
+            "steps": "int",
+        },
+        requires=frozenset(),
+        # No guidance-embedding tensor in the checkpoint's own weight map
+        # (config.py::QwenImage21Config has no guidance_embed field) --
+        # block it like SDXL/Z-Image rather than leaving it a silent no-op.
+        hard_block=frozenset({"guidance"}),
+        # DiT's own in_channels=64 is the packed (2x2-patchified) input; the
+        # unpacked VAE latent is 16 channels, same convention as FLUX/Krea2/
+        # Z-Image's latent_channels field here.
+        latent_channels=16,
+        # No ControlNet-QwenImage21 architecture ported yet.
+        supports_controlnet=False,
+    ),
 }
 
 

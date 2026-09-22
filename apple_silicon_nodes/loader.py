@@ -163,6 +163,18 @@ _FLUX2_HINTS = {
     "flux_2": "flux2",
 }
 
+_QWEN_IMAGE21_HINTS = {
+    "qwen_image_2.1": "qwen_image21",
+    "qwen-image-2.1": "qwen_image21",
+    "qwen_image21": "qwen_image21",
+}
+
+# Distinctive tensor key for the DiT (verified against the real checkpoint header in
+# brick 2: `transformer_blocks.0.img_mlp.gate_up.weight`, unique to this family's fused
+# SwiGLU MLP naming -- SDXL/Z-Image/Flux2/Krea2 use their own distinct markers, none of
+# which contain or are contained in this string).
+_QWEN_IMAGE21_STRUCTURAL_KEY = "transformer_blocks.0.img_mlp.gate_up."
+
 
 def _detect_model_type(path: Path) -> str:
     """Detect model type from filename, falling back to checkpoint key
@@ -194,6 +206,22 @@ def _detect_model_type(path: Path) -> str:
     """
     name = path.name.lower()
 
+    if path.suffix.lower() == ".gguf":
+        # `_detect_model_type_from_keys` opens the file via `safe_open(path,
+        # framework="pt")`, which only understands safetensors -- it can't
+        # read a GGUF file's keys at all, so the structural fallback below is
+        # unreachable for this branch. No other family in this generic
+        # dispatch has a GGUF variant yet, so an unrecognized `.gguf` name
+        # must raise rather than silently default to "dev".
+        for hint in _QWEN_IMAGE21_HINTS:
+            if hint in name:
+                return "qwen_image21"
+        raise RuntimeError(
+            f"ASDX: {path.name} is a .gguf file but its name doesn't match any known "
+            "GGUF-supporting family (qwen_image21) -- no other family in this dispatch "
+            "supports GGUF yet."
+        )
+
     hint_type: str | None = None
     for hint in _KREA2_HINTS:
         if hint in name:
@@ -208,6 +236,11 @@ def _detect_model_type(path: Path) -> str:
         for hint in _ZIMAGE_HINTS:
             if hint in name:
                 hint_type = "zimage_turbo" if "turbo" in name else "zimage"
+                break
+    if hint_type is None:
+        for hint in _QWEN_IMAGE21_HINTS:
+            if hint in name:
+                hint_type = "qwen_image21"
                 break
     if hint_type is None:
         for hint in _FLUX2_HINTS:
@@ -256,6 +289,8 @@ def _detect_model_type_from_keys(path: Path) -> str:
         return "flux2"
     if any("txtfusion." in k for k in keys):
         return "krea2"
+    if any(_QWEN_IMAGE21_STRUCTURAL_KEY in k for k in keys):
+        return "qwen_image21"
     return "dev"
 
 
@@ -398,6 +433,16 @@ def _load_transformer_for_type(
         # and Flux2-D) — reuse the config load_flux2_transformer already
         # derived, don't construct a fresh default one.
         return transformer, transformer.config
+    elif model_type == "qwen_image21":
+        from .native.qwen_image21 import (
+            load_qwen_image21_dit_checkpoint,
+            load_qwen_image21_dit_from_gguf,
+        )
+        if path.suffix.lower() == ".gguf":
+            transformer = load_qwen_image21_dit_from_gguf(path, dtype=dtype)
+        else:
+            transformer = load_qwen_image21_dit_checkpoint(path, dtype=dtype)
+        return transformer, transformer.config
     else:
         # FLUX.1 path
         guidance_embed = model_type == "dev"
@@ -421,6 +466,7 @@ _MODEL_TYPE_CAPABILITY = {
     # detection is added -- noted, not fixed here, to keep this a minimal
     # unblock rather than a redesign of Krea2 turbo/raw detection.
     "krea2": "krea2_base",
+    "qwen_image21": "qwen_image21_base",
 }
 
 
