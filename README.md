@@ -204,6 +204,32 @@ Known limits:
 - References lengthen the packed token sequence (a warning is logged past the row threshold);
   `ref_image_size = max` can be several times slower than `match`.
 
+## Qwen Image 2.1 (Apple Silicon native)
+
+Text-to-image, run on the native MLX Qwen Image 2.1 DiT and its Qwen3-VL-8B text encoder.
+
+| Node | Description |
+|------|-------------|
+| `🍏 ASDX Qwen Image 2.1 Text Encoder Loader` | Load the Qwen3-VL-8B text encoder |
+| `🍏 ASDX Qwen Image 2.1 Text Encode` | Prompt to conditioning |
+
+Accepted DiT checkpoint formats: bf16 safetensors and GGUF Q8_0, via the standard
+`🍏 ASDX Diffusion Loader`. Load the VAE with `🍏 ASDX VAE Loader`. `🍏 ASDX Empty Latent`
+needs `latent_format = "qwen_image21"` (64ch, 16x VAE downscale — do not use the `flux`
+default, it produces a 16ch latent and the sampler will refuse it). Text-to-image only:
+`🍏 ASDX MLX Native Sampler`'s `positive` takes the text encode node's output directly, no
+negative/CFG (the model has no guidance embedding).
+
+Minimal graph: `Text Encoder Loader` -> `Text Encode` -> `Sampler` (with `Diffusion Loader`'s
+`model` and `Empty Latent`'s `latent` as the other two required inputs) -> `VAE Decode (MLX)`
+(with `VAE Loader`'s `vae`) -> `SaveImage`.
+
+**Known issue:** live end-to-end testing (bf16 and GGUF Q8, both seed=42) produces a
+systematic grid/mesh artifact across the whole image, confirmed absent from reference images
+generated with ComfyUI's native Qwen Image 2.1 nodes on the same machine. The pipeline runs
+end-to-end and images are structurally correct (not noise), but this quality regression is
+unresolved — root cause (DiT port vs. VAE decode bridge) not yet isolated.
+
 ## Installation
 
 1. Clone this repo into your ComfyUI custom_nodes directory:
