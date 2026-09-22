@@ -38,3 +38,14 @@ def test_structural_fallback_key_does_not_collide_with_other_families():
 
 def test_capability_entry_present():
     assert "qwen_image21" in loader_mod._MODEL_TYPE_CAPABILITY
+
+
+def test_capability_profile_has_real_latent_channels():
+    # Qwen Image 2.1 does not patchify (unlike FLUX.1's 2x2 packing to 64=16*4) --
+    # the DiT's in_channels=64 IS the raw VAE latent channel count, confirmed by
+    # loading the real checkpoint's VAE directly. Locks this down after an initial
+    # implementation guessed 16 (FLUX/Krea2/Z-Image's own value) by analogy rather
+    # than checking.
+    from apple_silicon_nodes.capability import CAPABILITY_PROFILES
+    profile_key = loader_mod._MODEL_TYPE_CAPABILITY["qwen_image21"]
+    assert CAPABILITY_PROFILES[profile_key].latent_channels == 64

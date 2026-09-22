@@ -248,10 +248,12 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         # (config.py::QwenImage21Config has no guidance_embed field) --
         # block it like SDXL/Z-Image rather than leaving it a silent no-op.
         hard_block=frozenset({"guidance"}),
-        # DiT's own in_channels=64 is the packed (2x2-patchified) input; the
-        # unpacked VAE latent is 16 channels, same convention as FLUX/Krea2/
-        # Z-Image's latent_channels field here.
-        latent_channels=16,
+        # Qwen Image 2.1 does NOT patchify (unlike FLUX.1's 2x2 packing to
+        # 64=16*4) -- the DiT's in_channels=64 IS the raw VAE latent channel
+        # count directly (confirmed by loading the real qwen_image_2.1_vae_
+        # bf16.safetensors via comfy.sd.VAE: latent_channels=64, latent_dim=2,
+        # downscale_ratio=16 -- see the brick 3 design spec).
+        latent_channels=64,
         # No ControlNet-QwenImage21 architecture ported yet.
         supports_controlnet=False,
     ),
