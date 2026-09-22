@@ -17,7 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import QwenImage21Config
-from .dit_rope import embed_nd, timestep_embedding
+from .dit_rope import apply_rope, embed_nd, timestep_embedding
 
 
 def _rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
@@ -124,7 +124,6 @@ class Attention(nn.Module):
 
         q, k = self.norm_q(q), self.norm_k(k)
         # apply_rope expects [B,H,N,D]; Attention's own layout is [B,N,H,D] (see docstring)
-        from .dit_rope import apply_rope
         q = apply_rope(q.transpose(0, 2, 1, 3), pe).transpose(0, 2, 1, 3)
         k = apply_rope(k.transpose(0, 2, 1, 3), pe).transpose(0, 2, 1, 3)
 

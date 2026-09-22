@@ -77,6 +77,12 @@ def test_transformer_block_output_shape_and_finite():
     # mod: (scale1, gate1, scale2, gate2, zero), each (prefix_row, target_rows)
     zero = mx.zeros((1, 1, dim))
     def split(t):
+        # NOT a copy of the real _split_rows (see model.py) -- this is a standalone
+        # probe that only needs broadcastable scale/gate tensors for a B=1 block-level
+        # test, indexed by sequence position here rather than by batch. The real
+        # _split_rows's batch-dim contract (fixed in commit 5ee9e00 after a B>1 bug) is
+        # covered separately by test_model.py's batch tests, which exercise the actual
+        # function through the assembled model.
         return t[-1:][None], t[:-1][None]
     scale1 = split(mx.random.normal((seq + 1, dim)))
     gate1 = split(mx.random.normal((seq + 1, dim)))
