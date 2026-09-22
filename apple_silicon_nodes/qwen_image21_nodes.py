@@ -110,7 +110,7 @@ class ASDX_QwenImage21TextEncode(io.ComfyNode):
                 io.String.Input("prompt", multiline=True),
             ],
             outputs=[
-                io.Custom("asdx_qwen_image21_conditioning").Output(display_name="conditioning"),
+                io.Custom("mlx_conditioning").Output(display_name="conditioning"),
             ],
         )
 

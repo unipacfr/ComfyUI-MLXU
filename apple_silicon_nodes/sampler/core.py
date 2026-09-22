@@ -158,6 +158,14 @@ class _SamplerCore:
         if model_type == "flux2":
             return self._run_flux2(steps, seed)
 
+        # ── Qwen Image 2.1 routing ──────────────────────────────────────
+        # Registers as ModelType.FLUX in ComfyUI (comfy/model_base.py::QwenImage21),
+        # same family as Krea2, but its DiT computes RoPE internally and consumes/
+        # returns x as [B,C,H,W] directly (no packed-token flattening) -- route
+        # before any FLUX.1-specific calls below that assume packed tokens.
+        if model_type == "qwen_image21":
+            return self._run_qwen_image21(steps, seed)
+
         # ── SDXL routing ──────────────────────────────────────────────
         # SDXL is an EPS-prediction conv UNet on a discrete DDPM schedule,
         # not a flow-matching DiT — completely different noise shape (NHWC
@@ -2012,6 +2020,103 @@ class _SamplerCore:
             f"[ASDX] Flux2 Sampling complete: {total_time:.1f}s total, "
             f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak, {accel}, "
             f"guidance={effective_guidance:.1f}"
+        )
+
+        if self.memory_shape is not None:
+            record_observation(self.memory_shape, mx.get_peak_memory())
+
+        bridge.clear_mlx_cache()
+
+        return out_latent
+
+    def _run_qwen_image21(self, steps: int, seed: int) -> dict:
+        """Run the Qwen Image 2.1 DiT sampling loop.
+
+        Flow-matching, single conditional pass per step (no CFG -- the model has
+        no guidance embedding, unlike FLUX-dev/Flux2). Registers as ModelType.FLUX
+        in ComfyUI (comfy/model_base.py::QwenImage21), same family as Krea2 -- NOT
+        ModelType.FLOW like Flux2/Z-Image -- so its sigma schedule uses
+        flux_time_shift (ModelSamplingFlux), not time_snr_shift
+        (ModelSamplingDiscreteFlow). Fixed shift=0.69
+        (comfy/supported_models.py::QwenImage21.sampling_settings), handled by
+        scheduling.py's "qwen_image21" branch via _flux_fixed_shift_sigmas.
+
+        Unlike Flux2, the DiT has no `.predict()`/external `rope` --
+        `QwenImage21Transformer2DModel.__call__(x, timestep, context)` computes
+        RoPE internally (`_build_sequence`) and consumes/returns `x` as `[B,C,H,W]`
+        (NCHW) directly -- no token-grid flattening at this call site, unlike
+        Flux2's packed-token `img` parameter.
+        """
+        precision = self.config.mlx_dtype
+        model_type = self.model_type
+
+        context = bridge.conditioning_qwen_image21_to_mlx(self.positive, precision)
+
+        sigmas = calculate_sigmas(model_type, self.scheduler_name, steps, self.width, self.height)
+        solver_state: dict[str, Any] = {}
+
+        mx.reset_peak_memory()
+        step_times: list[float] = []
+        t_sampling_start = time.perf_counter()
+
+        for t in range(steps):
+            step_start = time.perf_counter()
+            sigma_t = sigmas[t]
+            sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
+
+            if self.lora_schedule is not None:
+                self.lora_schedule["step"] = t
+                self.transformer = self._update_lora_schedule(
+                    self.transformer, self.config, self.lora_schedule, t, steps
+                )
+
+            timestep = mx.array([sigma_t], dtype=mx.float32)
+            noise_pred = self.transformer(self.noise, timestep, context)
+            mx.eval(noise_pred)
+
+            denoised = self.noise - noise_pred * sigma_t
+
+            def _model_call(x_at, sigma_at):
+                timestep_at = mx.array([sigma_at], dtype=mx.float32)
+                out = self.transformer(x_at, timestep_at, context)
+                mx.eval(out)
+                return x_at - out * sigma_at
+
+            self.noise, solver_state = solvers.step(
+                self.sampler_name,
+                x=self.noise,
+                sigma=sigma_t,
+                sigma_next=sigma_next,
+                denoised=denoised,
+                state=solver_state,
+                seed=seed,
+                step_index=t,
+                is_flow_matching=self._is_flow_matching,
+                model_call=_model_call,
+            )
+            mx.eval(self.noise)
+
+            step_time = time.perf_counter() - step_start
+            step_times.append(step_time)
+
+            if (t + 1) % 5 == 0 or t == 0:
+                print(f"[ASDX] Qwen Image 2.1 Step {t + 1}/{steps} - {step_time:.3f}s")
+
+        total_time = time.perf_counter() - t_sampling_start
+
+        if self.low_memory_mode:
+            from ..loader import clear_model_cache
+            clear_model_cache()
+            self.transformer = None
+            print("[ASDX] Low memory: model cache evicted, next load will read from disk")
+
+        out_latent = bridge.mlx_to_comfy_latent_qwen_image21(self.noise, {"samples": self.noise})
+
+        mem = bridge.collect_mlx_memory()
+        avg_step = sum(step_times) / len(step_times) if step_times else 0
+        print(
+            f"[ASDX] Qwen Image 2.1 Sampling complete: {total_time:.1f}s total, "
+            f"{avg_step:.3f}s/step, {mem['peak_gb']:.1f}GB peak"
         )
 
         if self.memory_shape is not None:

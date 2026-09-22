@@ -474,6 +474,16 @@ def generate_sigmas(
         sigmas = _flux_fixed_shift_sigmas(shift, steps)
         return sigmas
 
+    if model_type == "qwen_image21":
+        # Registers as ModelType.FLUX in ComfyUI (comfy/model_base.py::QwenImage21),
+        # same family as Krea2 above -- flux_time_shift/ModelSamplingFlux, NOT
+        # time_snr_shift/ModelSamplingDiscreteFlow like Flux2/Z-Image below, despite
+        # sharing their "fixed shift, not resolution-dependent" simplicity. Fixed
+        # shift=0.69 (comfy/supported_models.py::QwenImage21.sampling_settings).
+        shift = 0.69
+        sigmas = _flux_fixed_shift_sigmas(shift, steps)
+        return sigmas
+
     if model_type in ("zimage", "zimage_turbo"):
         # Flow matching with a FIXED shift (not resolution-dependent like
         # FLUX-dev's mu) — comfy/supported_models.py::ZImage.sampling_settings.
@@ -532,6 +542,8 @@ def _flow_shift_fn(model_type: str, width: int = 1024, height: int = 1024):
         return lambda t: t
     if model_type in ("krea2", "krea2_turbo"):
         return lambda t: flux_time_shift(1.15, 1.0, t)
+    if model_type == "qwen_image21":
+        return lambda t: flux_time_shift(0.69, 1.0, t)
     if model_type in ("zimage", "zimage_turbo"):
         return lambda t: time_snr_shift(3.0, t)
     if model_type == "flux2":

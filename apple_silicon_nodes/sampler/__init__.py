@@ -266,6 +266,10 @@ class ASDX_MLXSampler(io.ComfyNode):
             noise, height, width, output_shape = bridge.prepare_noise_from_latent_zimage(
                 latent_image, int(seed), config.mlx_dtype
             )
+        elif model_type == "qwen_image21":
+            noise, height, width, output_shape = bridge.prepare_noise_from_latent_qwen_image21(
+                latent_image, int(seed), config.mlx_dtype
+            )
         else:
             noise, height, width, output_shape = bridge.prepare_noise_from_latent(
                 latent_image, int(seed), config.mlx_dtype
