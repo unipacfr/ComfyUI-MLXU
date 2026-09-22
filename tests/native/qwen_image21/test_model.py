@@ -62,3 +62,35 @@ def test_different_timestep_changes_output():
     out_a = model(x, mx.array([0.1]), context)
     out_b = model(x, mx.array([0.9]), context)
     assert not bool(mx.allclose(out_a, out_b, atol=1e-4).item())
+
+
+def test_batch_greater_than_one_forward_shape_and_finite():
+    # Regression test: _split_rows used `[None]` (insert axis 0) instead of
+    # `[:, None]` (insert axis 1, matching the reference's `.unsqueeze(1)`), which
+    # coincidentally produced the same shape as the correct form at B == 1 but broke
+    # broadcasting against hidden_states [B, seq, dim] for any B > 1.
+    cfg = _tiny_config()
+    model = QwenImage21Transformer2DModel(cfg)
+    B, H, W = 3, 4, 4
+    x = mx.random.normal((B, cfg.in_channels, H, W))
+    timestep = mx.random.uniform(shape=(B,))
+    context = mx.random.normal((B, 6, cfg.context_in_dim))
+    out = model(x, timestep, context)
+    assert out.shape == (B, cfg.out_channels, H, W)
+    assert bool(mx.all(mx.isfinite(out)).item())
+
+
+def test_batch_rows_are_independent():
+    # Each batch row's output must depend only on its own context/timestep, not on
+    # other rows in the batch (a mixed-up broadcast would leak rows into each other).
+    cfg = _tiny_config()
+    model = QwenImage21Transformer2DModel(cfg)
+    H, W = 4, 4
+    x = mx.random.normal((2, cfg.in_channels, H, W))
+    context = mx.concatenate([
+        mx.random.normal((1, 6, cfg.context_in_dim)),
+        mx.random.normal((1, 6, cfg.context_in_dim)),
+    ], axis=0)
+    timestep = mx.array([0.2, 0.2])
+    out = model(x, timestep, context)
+    assert float(mx.max(mx.abs(out[0] - out[1])).item()) > 1e-3

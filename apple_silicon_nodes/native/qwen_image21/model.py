@@ -140,8 +140,13 @@ class Attention(nn.Module):
 
 def _split_rows(p: mx.array) -> tuple[mx.array, mx.array]:
     """Shared modulation rows: (t=0 row for the text prefix, sampled-t rows for the
-    target). `p`: [seq, dim] -> (prefix [1, 1, dim], target [1, seq-1, dim])."""
-    return p[-1:][None], p[:-1][None]
+    target). `p`: [B+1, dim] -> (prefix [1, 1, dim], target [B, 1, dim]) -- matches the
+    reference's `.unsqueeze(1)` (insert an axis at position 1, batch stays at position
+    0), which broadcasts correctly against `hidden_states` `[B, seq, dim]` for B > 1.
+    A leading `[None]` (insert axis at position 0 instead) gives target shape
+    `[1, B, dim]` -- coincidentally identical to the correct `[B, 1, dim]` only when
+    B == 1, which is why this was invisible until tested at B > 1."""
+    return p[-1:][:, None], p[:-1][:, None]
 
 
 def _modulated_norm(norm: nn.Module, x: mx.array, scale: tuple[mx.array, mx.array], prefix_len: int) -> mx.array:
