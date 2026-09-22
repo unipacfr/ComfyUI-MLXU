@@ -31,16 +31,23 @@ C'est la référence de portage, conformément à CLAUDE.md.
   multi-images, pas de masques locaux — ce sont des features phares du
   modèle mais hors brique 1)
 - Les deux formats DiT : bf16 safetensors et GGUF Q8
-- Les deux architectures de text encoder : Qwen3.5-9B et Qwen3-VL-8B,
-  sélectionnables comme le fait déjà `ASDX_CLIPLoader`/`ASDX_DualCLIPLoader`
+- Qwen3-VL-8B comme text encoder — c'est le seul câblé par la référence
+  ComfyUI native (`comfy/text_encoders/qwen_image21.py`, commit `6bfaacc6`,
+  2026-09-19 : `QwenImage21TEModel` fixe `model_type="qwen3vl_8b"` en dur,
+  aucune référence à `qwen35.py`)
 - Le VAE Qwen Image 2.1 (layout Wan 2.2 / RGBA) via le chemin générique
   `ASDX_VAELoader`/`ASDX_VAEDecode`/`ASDX_VAEEncode` existant
 
 **Hors périmètre (briques futures)** :
 - Édition d'image, références multi-images, édition locale par masque/cercle
 - Transparence RGBA native (le modèle la supporte, pas cette brique)
-- INT8_convrot pour les text encoders (formats disponibles sur disque mais
-  non traités ici — bf16/défaut d'abord, quantization en suivi si besoin)
+- INT8_convrot pour le text encoder (fichier disponible sur disque mais non
+  traité ici — bf16 d'abord, quantization en suivi si besoin)
+- **Qwen3.5-9B comme text encoder** (`qwen3.5_9b_qwen_image_2.1_pe_t2i/i2i`
+  sur disque) : aucune implémentation de référence trouvée dans la ComfyUI
+  locale (voir Risques). Abandonné pour cette spec sauf découverte d'une
+  référence réelle ; le champ `clip_type` reste ouvert à une extension
+  future si une référence apparaît.
 
 ## Architecture
 
@@ -62,13 +69,23 @@ Nouveau package `apple_silicon_nodes/native/qwen_image21/`, même schéma que
   qui ne couvre que les marqueurs safetensors FP8_SCALED/FP4_PACKED/
   INT8_TENSORWISE — le bf16 n'a pas besoin de classification, c'est un
   dtype direct)
-- `text_encoder_qwen3vl.py` — port MLX Qwen3-VL-8B, adapte le pattern déjà
-  validé par `native/minimax_h3/text_encoder.py` (port complet Qwen3-VL-32B)
-  à la taille 8B
-- `text_encoder_qwen35.py` — port MLX Qwen3.5-9B. Architecture neuve dans ce
-  projet : attention linéaire hybride (GatedDeltaNet), aucun code réutilisable
-  existant. Référence : `comfy/text_encoders/qwen35.py` (1122 lignes),
-  classes clés `GatedDeltaNet`, `Qwen35TransformerBlock`, `GatedAttention`.
+- `text_encoder.py` — port MLX Qwen3-VL-8B, adapte le pattern déjà validé
+  par `native/minimax_h3/text_encoder.py` (port complet Qwen3-VL-32B, backbone
+  `comfy/text_encoders/llama.py::Llama2_`/`Attention`/`MLP`/`TransformerBlock`
+  générique, configuré par `Qwen3VL_8BConfig`) à la taille 8B. Différence clé
+  avec MiniMax H3 : ici le modèle est utilisé jusqu'à sa dernière couche avec
+  gabarit T2I dédié (`comfy/text_encoders/qwen_image21.py::T2I_TEMPLATE`), pas
+  de tour vision à porter pour cette brique (pas de conditionnement image de
+  référence en scope).
+
+  **Décision explicite contre le canon par défaut** : le canon
+  `Porting CLIP/T5/Qwen text encoders to MLX has weak memory ROI, except FP8
+  sources` recommande par défaut le bridge CLIP réel ComfyUI (pattern
+  `krea2_grounded_encode.py`) plutôt qu'un portage natif, et qualifie le port
+  MiniMax H3 de "one-off, not a reversal of the general guidance". Choix
+  utilisateur, en connaissance de cause, de faire un deuxième one-off plutôt
+  que de suivre le bridge — pas une mesure de ROI nouvelle, une préférence
+  explicite de garder Qwen Image 2.1 sur pipeline MLX natif.
 
 ## Intégration
 
@@ -78,10 +95,11 @@ Nouveau package `apple_silicon_nodes/native/qwen_image21/`, même schéma que
   le pattern `_FLUX2_HINTS`/`_KREA2_HINTS`/`_SDXL_HINTS`/`_ZIMAGE_HINTS` déjà
   en place. Câblé sur `ASDX_DiffusionLoader` et `ASDX_CheckpointLoader`
   existants — pas de nouveau nœud loader.
-- **`ASDX_CLIPLoader`/`ASDX_DualCLIPLoader`** : ajout des `clip_type`
-  `qwen35` et `qwen3vl_8b`. Canon existant : le `clip_type` générique par
-  défaut charge silencieusement le mauvais encodeur — donc valeur explicite
-  obligatoire, documentée dans le nœud, pas de détection auto ambiguë.
+- **`ASDX_CLIPLoader`/`ASDX_DualCLIPLoader`** : ajout du `clip_type`
+  `qwen_image21` (Qwen3-VL-8B, gabarit T2I). Canon existant : le `clip_type`
+  générique par défaut charge silencieusement le mauvais encodeur — donc
+  valeur explicite obligatoire, documentée dans le nœud, pas de détection
+  auto ambiguë.
 - **`sampler/bridge.py`** : nouvelles fonctions
   `conditioning_qwen_image21_to_mlx`, `mlx_to_comfy_latent_qwen_image21`,
   `prepare_noise_from_latent_qwen_image21`, plus les constantes de latent
@@ -137,10 +155,14 @@ Suit le protocole déjà établi dans ce projet :
 - **Prefix KV cache / block-causal attention** : mécanisme neuf, aucune
   famille existante du projet ne l'a. Porter la math exacte avant
   vérification numérique (règle CLAUDE.md #6).
-- **Qwen3.5 GatedDeltaNet** : attention linéaire hybride, architecture la
-  plus complexe jamais portée dans ce projet pour un text encoder. Risque de
-  sous-estimation du temps de portage.
 - **VAE Wan 2.2 layout** : supposé compatible avec le chemin générique
   existant (comme Krea2), mais non vérifié sur un checkpoint Qwen Image 2.1
   réel — premier test du protocole doit confirmer avant de considérer ce
   point acquis.
+- **Qwen3.5-9B abandonné pour cette spec** : `qwen3.5_9b_qwen_image_2.1_pe_t2i/
+  i2i.int8_convrot.safetensors` (Civitai, 2026-09-21) n'a aucune
+  implémentation de référence dans la ComfyUI locale (commit `6bfaacc6`,
+  2026-09-19, câble uniquement `qwen3vl_8b`). Ne pas porter à l'aveugle sans
+  référence vérifiable (règle CLAUDE.md #6 : "port the exact math from a real
+  reference implementation... verify numerically... do not trust a formula
+  derived by inspection alone").
