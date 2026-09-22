@@ -54,6 +54,12 @@ def load_qwen_image21_text_encoder_checkpoint(path: str | Path, dtype: str = "fl
             raise ValueError(f"ASDX: {path.name} is missing required key {key!r} for Qwen3VL8BTextEncoder.")
         weights.append((key, state_dict[key].astype(config.mlx_dtype)))
 
+    # This project's `verify-checkpoint` convention: every family's loader logs how many
+    # of the model's own parameter keys were found in the checkpoint. The loop above
+    # already raises on any miss, so this is always matched == total on success -- logged
+    # anyway for the same audit trail every other family's loader produces.
+    print(f"[ASDX] Qwen Image 2.1 text encoder: matched {len(weights)}/{len(expected_keys)} weights.")
+
     model.update(tree_unflatten(weights))
     mx.eval(model.parameters())
     mx.clear_cache()
