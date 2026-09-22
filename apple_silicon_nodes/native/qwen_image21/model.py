@@ -267,7 +267,9 @@ class QwenImage21Transformer2DModel(nn.Module):
         self.norm_out = LastLayer(inner_dim, eps=config.eps)
         self.proj_out = nn.Linear(inner_dim, config.out_channels, bias=False)
 
-    def _build_sequence(self, x: mx.array, context: mx.array) -> tuple[mx.array, mx.array, list]:
+    def _build_sequence(
+        self, x: mx.array, context: mx.array
+    ) -> tuple[mx.array, mx.array, list[tuple[int, int, mx.array | None]]]:
         """T2I reduction of the reference's `build_sequence`: one text segment (causal),
         one image segment (full attention over text + itself). Returns
         (hidden_states [B, txt_len+H*W, inner_dim], pe [txt_len+H*W, head_dim/2, 2, 2] per

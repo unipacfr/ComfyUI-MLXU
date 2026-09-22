@@ -94,3 +94,29 @@ def test_batch_rows_are_independent():
     timestep = mx.array([0.2, 0.2])
     out = model(x, timestep, context)
     assert float(mx.max(mx.abs(out[0] - out[1])).item()) > 1e-3
+
+
+def test_build_sequence_ids_match_reference_formula():
+    # Locks down the position-id math against a hand-computed reference (per the
+    # spec design doc's stated T2I reduction: text ids sequential (i,i,i) on all 3
+    # RoPE axes; image ids (txt_len constant t-axis, h-centered, w-centered)), with
+    # an odd H so the centering formula's `- (H - H // 2)` term is actually exercised
+    # (an even H can't distinguish it from a naive `- H // 2`).
+    cfg = _tiny_config()
+    model = QwenImage21Transformer2DModel(cfg)
+    txt_len, H, W = 4, 3, 2
+    context = mx.random.normal((1, txt_len, cfg.context_in_dim))
+    x = mx.random.normal((1, cfg.in_channels, H, W))
+    hidden_states, pe, segments = model._build_sequence(x, context)
+
+    assert segments[0][0] == 0 and segments[0][1] == txt_len
+    assert segments[1] == (txt_len, txt_len + H * W, None)
+
+    dit_rope_mod = load_native_module("qwen_image21.dit_rope")
+    txt_ids = [[i, i, i] for i in range(txt_len)]
+    hh = [h - (H - H // 2) for h in range(H)]
+    ww = [w - (W - W // 2) for w in range(W)]
+    img_ids = [[float(txt_len), hh[h], ww[w]] for h in range(H) for w in range(W)]
+    expected_ids = mx.array(txt_ids + img_ids, dtype=mx.float32)
+    expected_pe = dit_rope_mod.embed_nd(expected_ids, cfg.axes_dims_rope, 10000.0)
+    assert bool(mx.allclose(pe, expected_pe, atol=1e-5).item())
