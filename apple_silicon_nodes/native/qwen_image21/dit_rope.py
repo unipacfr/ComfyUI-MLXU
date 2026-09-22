@@ -31,12 +31,20 @@ def embed_nd(ids: mx.array, axes_dim: tuple[int, ...], theta: float) -> mx.array
 
 
 def apply_rope(x: mx.array, freqs: mx.array) -> mx.array:
-    """Apply the [...,2,2] rotation-matrix RoPE to Q or K. x: [B,H,N,D]."""
+    """Apply the [...,2,2] rotation-matrix RoPE to Q or K. x: [B,H,N,D].
+
+    Restores `x`'s own dtype on return: `freqs` is float32 (from `rope_freqs`), so the
+    multiply upconverts an fp16/bf16 `x` to float32 unless cast back explicitly --
+    matching the reference's `_apply_rope1` (`comfy/ldm/flux/math.py:40`), which ends
+    with `.type_as(x)`. Without this, the model silently runs its attention path in
+    float32 regardless of its configured dtype (2x activation memory, and
+    `QwenImage21TransformerBlock`'s fp16 overflow clip guard never fires since nothing
+    downstream is fp16 anymore)."""
     B, H, N, D = x.shape
     x_pairs = x.reshape(B, H, N, D // 2, 1, 2)
     f = freqs[None, None]
     out = (f[..., 0] * x_pairs[..., 0]) + (f[..., 1] * x_pairs[..., 1])
-    return out.reshape(B, H, N, D)
+    return out.reshape(B, H, N, D).astype(x.dtype)
 
 
 def timestep_embedding(t: mx.array, dim: int, max_period: float = 10000.0,
