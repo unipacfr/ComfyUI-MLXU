@@ -71,3 +71,16 @@ def test_apply_rope_output_finite():
     out = dit_rope_mod.apply_rope(x, freqs)
     assert out.shape == x.shape
     assert bool(mx.all(mx.isfinite(out)).item())
+
+
+def test_apply_rope_preserves_input_dtype():
+    # Regression test: apply_rope's multiply against `freqs` (always float32, from
+    # rope_freqs) silently upconverted fp16/bf16 inputs to float32 with nothing
+    # casting back -- the reference's _apply_rope1 ends with .type_as(x) for exactly
+    # this reason.
+    ids = mx.arange(6, dtype=mx.float32)[:, None] * mx.ones((1, 3))
+    freqs = dit_rope_mod.embed_nd(ids, (16, 56, 56), 10000.0)
+    for dtype in (mx.float16, mx.bfloat16, mx.float32):
+        x = mx.random.normal((1, 2, 6, 128)).astype(dtype)
+        out = dit_rope_mod.apply_rope(x, freqs)
+        assert out.dtype == dtype
