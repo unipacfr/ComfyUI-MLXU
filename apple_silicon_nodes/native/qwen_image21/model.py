@@ -16,7 +16,8 @@ from __future__ import annotations
 import mlx.core as mx
 import mlx.nn as nn
 
-from .dit_rope import timestep_embedding
+from .config import QwenImage21Config
+from .dit_rope import embed_nd, timestep_embedding
 
 
 def _rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
@@ -236,3 +237,84 @@ class LastLayer(nn.Module):
     def __call__(self, x: mx.array, temb: mx.array) -> mx.array:
         scale = self.linear(nn.silu(temb))[:, None]
         return self.norm(x) * (1 + scale)
+
+
+class QwenImage21Transformer2DModel(nn.Module):
+    """T2I only: `build_sequence` below is the reference's ref-loop reduced to its
+    single-iteration case (`ref_latents=[]`, so the loop over `ref_latents + [x]` runs
+    exactly once, for the target image `x`) -- verified against the reference's general
+    form by hand-tracing that reduction (see the brick 2 design doc's Risques section),
+    not re-derived from scratch. No `image_slots`/multi-reference support."""
+
+    def __init__(self, config: QwenImage21Config):
+        super().__init__()
+        self.config = config
+        inner_dim = config.inner_dim
+        self.time_text_embed = TimestepProjEmbeddings(inner_dim)
+        self.txt_in = TextProjection(config.context_in_dim, inner_dim, eps=config.eps)
+        self.img_in = nn.Linear(config.in_channels, inner_dim, bias=False)
+        self.modulation = [nn.SiLU(), nn.Linear(inner_dim, 4 * inner_dim, bias=False)]
+        self.transformer_blocks = [
+            QwenImage21TransformerBlock(inner_dim, config.num_attention_heads, config.attention_head_dim,
+                                         mlp_ratio=config.mlp_ratio, eps=config.eps)
+            for _ in range(config.num_layers)
+        ]
+        self.norm_out = LastLayer(inner_dim, eps=config.eps)
+        self.proj_out = nn.Linear(inner_dim, config.out_channels, bias=False)
+
+    def _build_sequence(self, x: mx.array, context: mx.array) -> tuple[mx.array, mx.array, list]:
+        """T2I reduction of the reference's `build_sequence`: one text segment (causal),
+        one image segment (full attention over text + itself). Returns
+        (hidden_states [B, txt_len+H*W, inner_dim], pe [txt_len+H*W, head_dim/2, 2, 2] per
+        dit_rope.embed_nd's layout -- un-batched, matching Attention's contract (see Attention's
+        own docstring) --, segments [(0, txt_len, causal_mask), (txt_len, total, None)])."""
+        B, C, H, W = x.shape
+        txt = self.txt_in(context)
+        txt_len = txt.shape[1]
+
+        causal = mx.tril(mx.ones((txt_len, txt_len), dtype=mx.bool_))
+        segments = [(0, txt_len, causal), (txt_len, txt_len + H * W, None)]
+
+        txt_ids = mx.arange(txt_len, dtype=mx.float32)[:, None] * mx.ones((1, 3))
+
+        img = self.img_in(x.reshape(B, C, H * W).transpose(0, 2, 1))  # [B, H*W, inner_dim]
+        hh = mx.arange(H, dtype=mx.float32) - (H - H // 2)
+        ww = mx.arange(W, dtype=mx.float32) - (W - W // 2)
+        t_axis = mx.full((H, W), float(txt_len))
+        img_ids = mx.stack([t_axis, mx.broadcast_to(hh[:, None], (H, W)), mx.broadcast_to(ww[None, :], (H, W))], axis=-1)
+        img_ids = img_ids.reshape(H * W, 3)
+
+        ids = mx.concatenate([txt_ids, img_ids], axis=0)
+        # No [None]: Attention's `pe` contract (dit_rope.apply_rope) is the un-batched
+        # embed_nd output [total, head_dim/2, 2, 2] -- see Attention's own docstring.
+        pe = embed_nd(ids, self.config.axes_dims_rope, 10000.0)
+
+        hidden_states = mx.concatenate([txt, img], axis=1)
+        return hidden_states, pe, segments
+
+    def __call__(self, x: mx.array, timestep: mx.array, context: mx.array) -> mx.array:
+        B, C, H, W = x.shape
+        dtype = x.dtype
+
+        hidden_states, pe, segments = self._build_sequence(x, context)
+        prefix_len = hidden_states.shape[1] - H * W
+
+        t = timestep.astype(dtype)
+        temb = self.time_text_embed(mx.concatenate([t, mx.zeros((1,), dtype=dtype)]))
+        mod_out = temb
+        for layer in self.modulation:
+            mod_out = layer(mod_out)
+        scale1, gate1, scale2, gate2 = mx.split(mod_out, 4, axis=-1)
+        mod = (
+            _split_rows(scale1), _split_rows(mx.tanh(gate1)),
+            _split_rows(scale2), _split_rows(mx.tanh(gate2)),
+            mx.zeros((1, 1, scale1.shape[-1])),
+        )
+
+        attn_fn = block_causal_attention(segments)
+        for block in self.transformer_blocks:
+            hidden_states = block(hidden_states, mod, pe, attn_fn, prefix_len)
+
+        hidden_states = self.norm_out(hidden_states[:, prefix_len:], temb[:-1])
+        hidden_states = self.proj_out(hidden_states)
+        return hidden_states.transpose(0, 2, 1).reshape(B, self.config.out_channels, H, W)

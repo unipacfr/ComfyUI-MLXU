@@ -1,0 +1,64 @@
+"""End-to-end test for QwenImage21Transformer2DModel: reduced random-weight config, checks
+shapes flow through and output is NaN/Inf-free (verify-checkpoint step 2)."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import mlx.core as mx
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from support.qwen_image21_module_loader import load_native_module
+
+config_mod = load_native_module("qwen_image21.config")
+model_mod = load_native_module("qwen_image21.model")
+
+QwenImage21Config = config_mod.QwenImage21Config
+QwenImage21Transformer2DModel = model_mod.QwenImage21Transformer2DModel
+
+
+def _tiny_config(**overrides):
+    base = dict(
+        in_channels=8, out_channels=8, num_layers=2, attention_head_dim=8,
+        num_attention_heads=2, context_in_dim=16, mlp_ratio=2,
+        axes_dims_rope=(2, 4, 2), eps=1e-6, dtype="float32",
+    )
+    base.update(overrides)
+    return QwenImage21Config(**base)
+
+
+def test_forward_shape_and_finite():
+    cfg = _tiny_config()
+    model = QwenImage21Transformer2DModel(cfg)
+    B, H, W = 1, 4, 4
+    x = mx.random.normal((B, cfg.in_channels, H, W))
+    timestep = mx.array([0.5])
+    context = mx.random.normal((B, 6, cfg.context_in_dim))
+    out = model(x, timestep, context)
+    assert out.shape == (B, cfg.out_channels, H, W)
+    assert bool(mx.all(mx.isfinite(out)).item())
+
+
+def test_different_prompt_changes_output():
+    cfg = _tiny_config()
+    model = QwenImage21Transformer2DModel(cfg)
+    B, H, W = 1, 4, 4
+    x = mx.random.normal((B, cfg.in_channels, H, W))
+    timestep = mx.array([0.5])
+    context_a = mx.random.normal((B, 6, cfg.context_in_dim))
+    context_b = mx.random.normal((B, 6, cfg.context_in_dim))
+    out_a = model(x, timestep, context_a)
+    out_b = model(x, timestep, context_b)
+    assert not bool(mx.allclose(out_a, out_b, atol=1e-4).item())
+
+
+def test_different_timestep_changes_output():
+    cfg = _tiny_config()
+    model = QwenImage21Transformer2DModel(cfg)
+    B, H, W = 1, 4, 4
+    x = mx.random.normal((B, cfg.in_channels, H, W))
+    context = mx.random.normal((B, 6, cfg.context_in_dim))
+    out_a = model(x, mx.array([0.1]), context)
+    out_b = model(x, mx.array([0.9]), context)
+    assert not bool(mx.allclose(out_a, out_b, atol=1e-4).item())
