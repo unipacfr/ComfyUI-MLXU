@@ -30,6 +30,10 @@ SDXL_LATENT_CHANNELS = 4
 # comfy/latent_formats.py::Flux2 (spacial_downscale_ratio=16).
 FLUX2_LATENT_CHANNELS = 128
 FLUX2_VAE_DOWNSCALE = 16
+# Qwen Image 2.1: 64 latent channels, VAE downscales 16x spatially, DiT
+# operates on the latent grid directly (no patch packing) — comfy/latent_formats.py.
+QWEN_IMAGE21_LATENT_CHANNELS = 64
+QWEN_IMAGE21_VAE_DOWNSCALE = 16
 
 # ComfyUI image format: [B, H, W, C] range [0, 1] float32
 # FLUX VAE input/output expects [B, C, H, W] range [-1, 1] float16
@@ -451,6 +455,27 @@ def conditioning_flux2_to_mlx(
     return cond_mlx, guidance
 
 
+def conditioning_qwen_image21_to_mlx(conditioning: Any, precision: mx.Dtype) -> mx.array:
+    """Extract the Qwen3-VL-8B hidden states for Qwen Image 2.1's DiT.
+
+    Unlike Flux2/SDXL (which route through ComfyUI's real CLIP pipeline and a
+    standard conditioning list), Qwen Image 2.1's text encoder is a native MLX
+    module wired through a dedicated pair of nodes
+    (`ASDX_QwenImage21TextEncoderLoader`/`ASDX_QwenImage21TextEncode`, same pattern
+    as MiniMax H3) -- `conditioning` here is that pair's own dict output, not a
+    ComfyUI CONDITIONING list. `hidden_states` is `[S, hidden_size]` (no batch dim,
+    brick 1's convention); this adds one."""
+    if not isinstance(conditioning, dict) or conditioning.get("type") != "qwen_image21":
+        raise RuntimeError(
+            "ASDX: Qwen Image 2.1 sampler expected the output of ASDX_QwenImage21TextEncode "
+            f"(dict with type='qwen_image21'), got {conditioning!r}."
+        )
+    hidden_states = conditioning["hidden_states"]
+    cond = hidden_states[None].astype(precision)
+    mx.eval(cond)
+    return cond
+
+
 def mlx_to_comfy_latent_flux2(
     latents: mx.array,
     height: int,
@@ -512,6 +537,20 @@ def _unpack_sdxl_latents(latents: mx.array) -> torch.Tensor:
     unpacked = process_sdxl_latent_out(unpacked)
     mx.eval(unpacked)
     return torch.from_numpy(np.array(unpacked, dtype=np.float32))
+
+
+def mlx_to_comfy_latent_qwen_image21(latents: mx.array, template: dict[str, Any]) -> dict[str, Any]:
+    """Convert MLX Qwen Image 2.1 DiT output to a ComfyUI LATENT dict.
+
+    The DiT operates on the latent grid directly in NCHW (matching ComfyUI's own
+    LATENT convention) -- no patch packing, no NHWC transpose (unlike SDXL's
+    native-MLX channel-last convention)."""
+    latents = latents.astype(mx.float32)
+    mx.eval(latents)
+    samples = torch.from_numpy(np.array(latents, dtype=np.float32))
+    out = dict(template)
+    out["samples"] = samples
+    return out
 
 
 # ── Noise preparation ────────────────────────────────────────────────
@@ -711,6 +750,39 @@ def prepare_noise_from_latent_flux2(
 
     output_shape = (int(samples.shape[-2]), int(samples.shape[-1]))
     return noise_mlx, height, width, output_shape
+
+
+def prepare_noise_from_latent_qwen_image21(
+    latent: dict[str, Any], seed: int, precision: mx.Dtype
+) -> tuple[mx.array, int, int, tuple[int, int]]:
+    """Prepare unit-gaussian noise from a Comfy latent for Qwen Image 2.1, in MLX.
+
+    NCHW throughout, matching the DiT's own input convention -- no layout
+    conversion needed, unlike SDXL's NCHW->NHWC bridge.
+
+    Returns (noise, height, width, output_shape)."""
+    if "samples" not in latent:
+        raise RuntimeError("ASDX: latent must be a Comfy LATENT with 'samples'.")
+
+    samples = latent["samples"]
+    if tuple(samples.shape)[1] != QWEN_IMAGE21_LATENT_CHANNELS:
+        raise RuntimeError(
+            f"ASDX: needs {QWEN_IMAGE21_LATENT_CHANNELS}-channel Qwen Image 2.1 latent, "
+            f"got {tuple(samples.shape)}"
+        )
+
+    import comfy.sample
+    batch_inds = latent.get("batch_index") if "batch_index" in latent else None
+    noise = comfy.sample.prepare_noise(samples, int(seed), batch_inds)
+    noise_np = _to_numpy(noise)
+
+    batch, channels, latent_h, latent_w = noise_np.shape
+    height = latent_h * QWEN_IMAGE21_VAE_DOWNSCALE
+    width = latent_w * QWEN_IMAGE21_VAE_DOWNSCALE
+
+    noise_mlx = mx.array(noise_np).astype(precision)
+    mx.eval(noise_mlx)
+    return noise_mlx, height, width, (latent_h, latent_w)
 
 
 # ── Memory management ────────────────────────────────────────────────
