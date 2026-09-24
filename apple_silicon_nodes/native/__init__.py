@@ -541,7 +541,6 @@ class FluxTransformer(nn.Module):
         guidance: mx.array | None = None,  # [B] guidance scale
         pooled: mx.array | None = None,    # [B, 768] pooled CLIP
         rope: mx.array | None = None,      # precomputed 3-axis RoPE table
-        control: dict[str, list[mx.array | None]] | None = None,
         ref_img: mx.array | None = None,   # packed Kontext reference tokens [B, N_ref, 64]
     ) -> mx.array:
         """Forward pass.
@@ -553,9 +552,6 @@ class FluxTransformer(nn.Module):
             guidance: guidance scale [B] (FLUX dev)
             pooled: pooled CLIP output [B, 768]
             rope: precomputed RoPE table [N_txt+N_img+N_ref, head_dim/2, 2, 2]
-            control: optional ControlNet residuals, {"input": [...], "output": [...]},
-                     one entry per double/single block (None entries are skipped).
-                     Matches comfy.ldm.flux.model.Flux's `control` dict convention.
             ref_img: optional packed Kontext reference tokens [B, N_ref, 64],
                      same raw patch space as `img` (pre-`img_in`). Concatenated
                      onto `img` before the input projection, matching comfy's
@@ -586,25 +582,14 @@ class FluxTransformer(nn.Module):
                 "height/width before calling predict()/__call__."
             )
 
-        control_input = control.get("input") if control is not None else None
-        for i, block in enumerate(self.double_blocks):
+        for block in self.double_blocks:
             img, txt = block(img, txt, vec, rope)
-            if control_input is not None and i < len(control_input):
-                add = control_input[i]
-                if add is not None:
-                    img = img.at[:, :add.shape[1]].add(add)
 
         # Concatenate for single blocks: txt first, matching RoPE id order
         x = mx.concatenate([txt, img], axis=1)
 
-        control_output = control.get("output") if control is not None else None
-        for i, block in enumerate(self.single_blocks):
+        for block in self.single_blocks:
             x = block(x, vec, rope)
-            if control_output is not None and i < len(control_output):
-                add = control_output[i]
-                if add is not None:
-                    start = txt.shape[1]
-                    x = x.at[:, start:start + add.shape[1]].add(add)
 
         # Split back: image tokens are after the text tokens. Kontext reference
         # tokens (if any) trail the target image tokens — drop them here,
@@ -621,7 +606,6 @@ class FluxTransformer(nn.Module):
         guidance: float = 3.5,
         pooled: mx.array | None = None,
         rope: mx.array | None = None,
-        control: dict[str, list[mx.array | None]] | None = None,
         ref_img: mx.array | None = None,
     ) -> mx.array:
         """Convenience method for one denoising step.
@@ -633,7 +617,6 @@ class FluxTransformer(nn.Module):
             guidance: guidance scale
             pooled: [B, 768] pooled CLIP
             rope: optional precomputed rope
-            control: optional ControlNet residuals (see __call__)
             ref_img: optional packed Kontext reference tokens (see __call__)
 
         Returns:
@@ -641,7 +624,7 @@ class FluxTransformer(nn.Module):
         """
         t = mx.array([timestep], dtype=mx.float32)
         g = mx.array([guidance], dtype=mx.float32) if guidance is not None else None
-        return self(img, txt, t, guidance=g, pooled=pooled, rope=rope, control=control,
+        return self(img, txt, t, guidance=g, pooled=pooled, rope=rope,
                     ref_img=ref_img)
 
 

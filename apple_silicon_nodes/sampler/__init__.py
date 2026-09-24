@@ -159,7 +159,6 @@ class ASDX_MLXSampler(io.ComfyNode):
         config = model["config"]
         model_type = model.get("model_type", "dev")
         capability = model.get("capability")
-        controlnet = model.get("controlnet")
         memory_shape = model.get("memory_shape")
         # ASDX_LoraSchedule stores its config in the model dict.
         lora_schedule = model.get("lora_schedule")
@@ -318,7 +317,6 @@ class ASDX_MLXSampler(io.ComfyNode):
             vae=vae,
             ref_boost=ref_boost,
             krea2_enhancer_strength=krea2_enhancer_strength,
-            controlnet=controlnet,
             memory_shape=memory_shape,
         )
 

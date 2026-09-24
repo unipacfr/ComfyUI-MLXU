@@ -47,7 +47,6 @@ class CapabilityProfile:
     supports_img2img: bool = False
     supports_inpainting: bool = False
     supports_depth: bool = False
-    supports_controlnet: bool = True
     supports_mask_preserve: bool = False
 
 
@@ -65,7 +64,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         },
         requires=frozenset(),
         latent_channels=16,
-        supports_controlnet=True,
     ),
     "flux1_schnell": CapabilityProfile(
         family="flux1",
@@ -79,7 +77,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         # schnell doesn't use guidance
         hard_block=frozenset({"guidance"}),
         latent_channels=16,
-        supports_controlnet=False,
     ),
     "flux1_fill": CapabilityProfile(
         family="flux1_fill",
@@ -101,7 +98,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         supports_inpainting=True,
         supports_mask_preserve=True,
         latent_channels=16,
-        supports_controlnet=False,
     ),
     "flux1_depth": CapabilityProfile(
         family="flux1_depth",
@@ -116,7 +112,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         },
         requires=frozenset(),
         supports_depth=True,
-        supports_controlnet=False,
         # latent_channels=16 is the OUTPUT latent (what ASDX_VAEDecode expects
         # back), not the transformer's img_in input width. The transformer's
         # in_channels is 32 unpacked / 128 packed (16 noise + 16 depth-latent
@@ -145,8 +140,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         },
         requires=frozenset(),
         latent_channels=128,
-        # No ControlNet-Flux2 architecture ported yet (Phase E, optional).
-        supports_controlnet=False,
     ),
     # ── Krea2 ──────────────────────────────────────────────────────
     "krea2_base": CapabilityProfile(
@@ -162,7 +155,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         },
         requires=frozenset(),
         latent_channels=16,
-        supports_controlnet=False,
         supports_inpainting=True,
         supports_depth=True,
     ),
@@ -180,7 +172,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         # Turbo uses CFG=1, guidance is blocked
         hard_block=frozenset({"guidance"}),
         latent_channels=16,
-        supports_controlnet=False,
         supports_inpainting=True,
         supports_depth=True,
     ),
@@ -202,7 +193,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         # SDXL has no guidance-embedding mechanism (unlike FLUX-dev/Krea2-raw)
         hard_block=frozenset({"guidance"}),
         latent_channels=4,
-        supports_controlnet=False,
     ),
     # ── Z-Image (NextDiT/Lumina2 family) ──────────────────────────────
     "zimage_base": CapabilityProfile(
@@ -218,7 +208,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         # in _run_zimage() yet — see sampler/core.py::_run_zimage docstring.
         hard_block=frozenset({"guidance"}),
         latent_channels=16,
-        supports_controlnet=False,
     ),
     "zimage_turbo": CapabilityProfile(
         family="zimage",
@@ -231,7 +220,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         requires=frozenset(),
         hard_block=frozenset({"guidance"}),
         latent_channels=16,
-        supports_controlnet=False,
     ),
     # ── Qwen Image 2.1 (7B DiT, ~14GB bf16 on disk, 265/265 weights matched
     # against the real checkpoint in brick 2) ──────────────────────────────
@@ -254,8 +242,6 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         # bf16.safetensors via comfy.sd.VAE: latent_channels=64, latent_dim=2,
         # downscale_ratio=16 -- see the brick 3 design spec).
         latent_channels=64,
-        # No ControlNet-QwenImage21 architecture ported yet.
-        supports_controlnet=False,
     ),
 }
 

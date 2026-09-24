@@ -84,7 +84,6 @@ class _SamplerCore:
         vae: Any | None = None,
         ref_boost: float = 1.0,
         krea2_enhancer_strength: float = 1.0,
-        controlnet: dict | None = None,
         sampler_name: str = "euler",
         scheduler_name: str = "normal",
         memory_shape: Any | None = None,
@@ -129,7 +128,6 @@ class _SamplerCore:
         self.vae = vae
         self.ref_boost = ref_boost
         self.krea2_enhancer_strength = krea2_enhancer_strength
-        self.controlnet = controlnet
         self.sampler_name = sampler_name
         self.scheduler_name = scheduler_name
         self.memory_shape = memory_shape
@@ -269,14 +267,6 @@ class _SamplerCore:
             ref_grids=[kontext_ref_grid] if kontext_ref_grid is not None else None,
         )
 
-        # ControlNet: VAE-encode + pack the control image once (the model's
-        # own weights are fixed across steps; only the residuals it produces
-        # depend on the current noisy latent, so they're recomputed per step)
-        controlnet_model = self.controlnet.get("control_net") if self.controlnet else None
-        controlnet_latent = self._prepare_controlnet_latent(precision) if controlnet_model else None
-        controlnet_strength = self.controlnet.get("strength", 1.0) if self.controlnet else 1.0
-        controlnet_type = self.controlnet.get("control_type") if self.controlnet else None
-
         # Setup sigmas for the model type (adapted from DiffusionKit)
         sigmas = calculate_sigmas(model_type, self.scheduler_name, steps, self.width, self.height)
         solver_state: dict[str, Any] = {}
@@ -316,29 +306,6 @@ class _SamplerCore:
                     self.transformer, self.config, self.lora_schedule, t, steps
                 )
 
-            # ControlNet: recompute residuals each step (they depend on the
-            # current noisy latent, unlike the frozen ControlNet weights).
-            # Do NOT reuse the base model's `rope`: when control_type is set,
-            # ControlNetFlux prefixes a control-mode token to txt, shifting
-            # the sequence length — let it compute its own RoPE table.
-            control = None
-            if controlnet_model is not None and controlnet_latent is not None:
-                control = controlnet_model(
-                    img=self.noise,
-                    control_latent=controlnet_latent,
-                    txt=prompt_embeds,
-                    t=mx.array([sigma_t], dtype=mx.float32),
-                    img_h=img_h,
-                    img_w=img_w,
-                    guidance=mx.array([effective_guidance], dtype=mx.float32),
-                    pooled=pooled_embeds,
-                    control_type=controlnet_type,
-                )
-                if controlnet_strength != 1.0:
-                    control = {
-                        k: [r * controlnet_strength for r in v] for k, v in control.items()
-                    }
-
             # --- Compute transformer output ---
             if teacache_state is not None:
                 current_output = self.transformer.predict(
@@ -348,7 +315,6 @@ class _SamplerCore:
                     guidance=effective_guidance,
                     pooled=pooled_embeds,
                     rope=rope,
-                    control=control,
                     ref_img=kontext_ref_packed,
                 )
                 mx.eval(current_output)
@@ -369,7 +335,6 @@ class _SamplerCore:
                     guidance=effective_guidance,
                     pooled=pooled_embeds,
                     rope=rope,
-                    control=control,
                     ref_img=kontext_ref_packed,
                 )
                 mx.eval(current_output)
@@ -398,12 +363,11 @@ class _SamplerCore:
 
             def _model_call(x_at, sigma_at):
                 # Second model evaluation for multi-eval solvers (e.g.
-                # dpmpp_2s_ancestral). Reuses this step's ControlNet residuals
-                # rather than recomputing them at the intermediate point.
+                # dpmpp_2s_ancestral).
                 out = self.transformer.predict(
                     img=self._img_tokens(x_at), txt=prompt_embeds, timestep=sigma_at,
                     guidance=effective_guidance, pooled=pooled_embeds, rope=rope,
-                    control=control, ref_img=kontext_ref_packed,
+                    ref_img=kontext_ref_packed,
                 )
                 mx.eval(out)
                 return x_at - out * sigma_at
@@ -724,7 +688,7 @@ class _SamplerCore:
         an MLX VAE placeholder with no real weights (same class of bug fixed
         in `vae.py`'s `ASDX_VAEEncode`, and in `_prepare_inpainting_noise`),
         and also skipped the model-space scale/shift (`process_in`) that the
-        noise/Kontext-reference/ControlNet paths all apply. `latent_image` is
+        noise/Kontext-reference paths all apply. `latent_image` is
         a required node input and is always a real VAE-encoded latent (e.g.
         via the now-fixed `ASDX_VAEEncode`), and `_detect_mode()` only calls
         this method when img2img was actually requested (image connected or
@@ -746,8 +710,8 @@ class _SamplerCore:
             else np.asarray(samples, dtype=np.float32)
         )
 
-        # Model-space scale/shift, matching how the noise/Kontext-reference/
-        # ControlNet paths all enter the transformer.
+        # Model-space scale/shift, matching how the noise/Kontext-reference
+        # paths all enter the transformer.
         model_space = comfy.latent_formats.Flux().process_in(torch.from_numpy(latent_np))
         latent_np = model_space.numpy().astype(np.float32, copy=False)
 
@@ -799,7 +763,7 @@ class _SamplerCore:
         )
 
         # Model-space scale/shift, matching how the noise/Kontext-reference/
-        # ControlNet/img2img paths all enter the transformer.
+        # img2img paths all enter the transformer.
         model_space = comfy.latent_formats.Flux().process_in(torch.from_numpy(latent_np))
         latent_np = model_space.numpy().astype(np.float32, copy=False)
 
@@ -887,8 +851,8 @@ class _SamplerCore:
 
         Matches comfy/model_base.py::Flux.concat_cond: the depth latent is
         concatenated onto the noise along the channel axis, before img_in,
-        once per generation -- it does NOT modify the noise itself (unlike
-        ControlNet, there is no per-step signal to recompute; only the
+        once per generation -- it does NOT modify the noise itself (there is
+        no per-step signal to recompute; only the
         transformer's own (depth-trained) weights make the result
         depth-aware). Sets `self._depth_concat`, consumed by `_img_tokens()`
         on every `predict()` call this run.
@@ -936,45 +900,6 @@ class _SamplerCore:
         if getattr(self, "_depth_concat", None) is not None:
             return mx.concatenate([x, self._depth_concat], axis=-1)
         return x
-
-    def _prepare_controlnet_latent(self, precision: mx.Dtype) -> mx.array | None:
-        """VAE-encode and pack the ControlNet control image into FLUX tokens.
-
-        Matches the reference (comfy/controlnet.py's ControlNet.get_control):
-        the control hint is VAE-encoded, then run through the base latent
-        format's process_in (same scale/shift as the noisy latent), then
-        packed into 2x2 patches exactly like the noise/img input.
-        """
-        if self.controlnet is None:
-            return None
-        try:
-            vae = self.controlnet.get("vae")
-            image = self.controlnet.get("image")
-            if vae is None or image is None:
-                print("[ASDX] ControlNet: missing vae or image, skipping")
-                return None
-
-            # ComfyUI's VAE.encode expects [B,H,W,C] pixels and returns the
-            # latent tensor directly (not wrapped in a dict).
-            samples = vae.encode(image)
-            ctrl_np = (
-                samples.detach().cpu().float().numpy().astype(np.float32, copy=False)
-                if hasattr(samples, "detach")
-                else np.asarray(samples, dtype=np.float32)
-            )
-            ctrl_np = (ctrl_np - FLUX_LATENT_SHIFT) * FLUX_LATENT_SCALE
-
-            batch, channels, ctrl_h, ctrl_w = ctrl_np.shape
-            packed = ctrl_np.reshape(batch, channels, ctrl_h // 2, 2, ctrl_w // 2, 2)
-            packed = np.transpose(packed, (0, 2, 4, 1, 3, 5))
-            packed = packed.reshape(batch, (ctrl_h // 2) * (ctrl_w // 2), channels * 4)
-
-            ctrl_mlx = mx.array(packed).astype(precision)
-            mx.eval(ctrl_mlx)
-            return ctrl_mlx
-        except Exception as e:
-            print(f"[ASDX] ControlNet latent prep failed: {e}")
-            return None
 
     @staticmethod
     def _fit_source_latent(source: np.ndarray, tgt_h: int, tgt_w: int) -> np.ndarray:
@@ -1559,7 +1484,7 @@ class _SamplerCore:
           - `self.guidance` is reused as the CFG scale (no separate node
             input) — same pattern as Krea2 reusing it for its own guidance.
 
-        Scope: txt2img only. img2img/inpainting/depth/ControlNet mode
+        Scope: txt2img only. img2img/inpainting/depth mode
         routing (`_detect_mode()` and friends) is FLUX-specific and not
         wired up for SDXL in this phase — `run()` dispatches here before
         reaching that code.

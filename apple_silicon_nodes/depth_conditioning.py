@@ -6,9 +6,7 @@ model-dict-priority pattern already used for `lora_schedule`/`identity_edit`:
 this node validates and stores the raw ingredients (`depth_image`, `vae`,
 `strength`) in `model["depth_cond"]`; the actual VAE-encode + 2x2 pack stays
 in `_SamplerCore._prepare_depth_noise` (it needs `self.noise`'s shape to
-resize against, same reason `_prepare_controlnet_latent` reads
-`self.controlnet["image"]`/`self.controlnet["vae"]` lazily instead of
-pre-encoding at the ControlNet loader node).
+resize against, so encoding can't happen upstream in this node).
 
 Only meaningful for `flux1_depth` checkpoints (Task C1's dynamically
 detected wide `img_in`) — a non-depth model is refused with an explicit

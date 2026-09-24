@@ -16,8 +16,8 @@ Advanced features:
   - SeaCache acceleration (residual-based step skipping)
   - Kontext KV cache (reference image conditioning)
 
-Note: the WIP ControlNet Union and IP-Adapter (incl. CLIP Vision Encode)
-nodes were removed; no node currently produces ASDX_CONTROLNET.
+Note: ControlNet and IP-Adapter are not supported (WIP nodes and their
+sampler plumbing were removed).
 """
 
 from __future__ import annotations

@@ -99,9 +99,6 @@ _MODEL_CACHE = _InactivityCache(
     idle_timeout_s=float(os.environ.get("ASDX_MODEL_CACHE_IDLE_TIMEOUT_S", "900"))
 )
 
-# Composite cache key components (set by LoRA/ControlNet nodes)
-_MODEL_EXTRA_KEYS: dict[str, str] = {}
-
 
 def clear_model_cache() -> None:
     """Evict every cached diffusion model, freeing its memory.
@@ -119,19 +116,6 @@ def clear_model_cache() -> None:
         bridge.clear_mlx_cache()
 
 
-def _build_cache_key(base_key: str, extra: dict[str, str] | None = None) -> str:
-    """Build a composite cache key matching mflux-AnyModel pattern.
-
-    Combines the base model key with optional LoRA, ControlNet, and
-    base model identifiers for fine-grained cache management.
-    """
-    if extra:
-        parts = [base_key]
-        for k in ("lora", "controlnet", "base_model"):
-            if k in extra and extra[k]:
-                parts.append(f"{k}:{extra[k]}")
-        return ":".join(parts)
-    return base_key
 _TYPE_HINTS = {
     "schnell": "schnell",
     "dev": "dev",
@@ -501,9 +485,6 @@ class ASDX_DiffusionLoader(io.ComfyNode):
             inputs=[
                 io.Combo.Input("model_name", options=cls._get_models()),
                 io.Combo.Input("precision", options=["float16", "bfloat16"], default="float16"),
-                io.Custom("ASDX_LORA").Input("lora", optional=True),
-                io.Custom("ASDX_CONTROLNET").Input("controlnet", optional=True),
-                io.Custom("ASDX_MODEL").Input("base_model", optional=True),
                 io.Boolean.Input("low_memory_mode", default=False, optional=True),
             ],
             outputs=[
@@ -535,24 +516,12 @@ class ASDX_DiffusionLoader(io.ComfyNode):
         cls,
         model_name: str,
         precision: str,
-        lora: str | None = None,
-        controlnet: str | None = None,
-        base_model: str | None = None,
         low_memory_mode: bool = False,
     ) -> io.NodeOutput:
         metadata_extractors.ensure_registered()
         t0 = time.perf_counter()
 
-        # Build composite cache key
-        extra: dict[str, str] = {}
-        if lora:
-            extra["lora"] = lora
-        if controlnet:
-            extra["controlnet"] = controlnet
-        if base_model:
-            extra["base_model"] = base_model
-        base_key = f"{model_name}:{precision}"
-        cache_key = _build_cache_key(base_key, extra if extra else None)
+        cache_key = f"{model_name}:{precision}"
 
         if cache_key in _MODEL_CACHE:
             cached = _MODEL_CACHE[cache_key]

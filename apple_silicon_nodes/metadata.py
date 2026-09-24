@@ -24,8 +24,6 @@ def build_generation_metadata(
     cfg: float = 3.5,
     lora_names: list[str] | None = None,
     lora_scales: list[float] | None = None,
-    controlnet_name: str | None = None,
-    controlnet_strength: float = 1.0,
     mode: str = "text2img",
     **extra: Any,
 ) -> dict[str, Any]:
@@ -44,8 +42,6 @@ def build_generation_metadata(
         cfg: CFG scale.
         lora_names: List of LoRA filenames used.
         lora_scales: List of corresponding LoRA scales.
-        controlnet_name: ControlNet filename used.
-        controlnet_strength: ControlNet conditioning scale.
         mode: Sampling mode (text2img, img2img, inpainting, etc.).
         **extra: Additional metadata fields to include.
 
@@ -77,12 +73,6 @@ def build_generation_metadata(
         meta["lora"] = {
             "names": lora_names,
             "scales": lora_scales or [],
-        }
-
-    if controlnet_name:
-        meta["controlnet"] = {
-            "name": controlnet_name,
-            "strength": controlnet_strength,
         }
 
     if extra:

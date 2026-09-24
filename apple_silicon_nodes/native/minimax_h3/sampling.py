@@ -3,7 +3,7 @@ video+audio latent.
 
 Deliberately NOT wired into `apple_silicon_nodes/sampler/core.py`'s shared
 `_SamplerCore` (2000+ lines, used live by every other family: teacache,
-kontext, LoRA schedules, identity edit, ControlNet, CFG variants). None of
+kontext, LoRA schedules, identity edit, CFG variants). None of
 that applies to MiniMax H3's single conditional forward pass over two
 latent streams with no CFG (the reference workflow uses `BasicGuider`, not
 `CFGGuider`) -- reusing the shared class would mean carrying its full
