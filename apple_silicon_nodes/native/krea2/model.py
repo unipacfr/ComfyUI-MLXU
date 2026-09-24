@@ -426,7 +426,7 @@ def krea2t_enhance_conditioning(
 
     # The amplified branch can overflow to NaN/Inf on out-of-distribution
     # inputs (e.g. a degenerate stacked-layer input where all 12 "layers"
-    # are identical, from the tiling fallback in sampler/bridge.py when the
+    # are identical, from the tiling fallback in bridge.py::conditioning_krea2_to_mlx when the
     # CLIP encode doesn't produce genuine per-layer taps). Without this
     # guard, a NaN/Inf `candidate_out` propagates through `post_delta`/
     # `token_scale` below and corrupts the final output even though
@@ -664,18 +664,6 @@ class SingleStreamDiT(nn.Module):
         t_embed = self.tmlp(emb.astype(self.dtype))  # [B, hidden]
         tvec = self.tproj(t_embed)  # [B, 6*hidden]
         return t_embed, tvec
-
-    def get_rope(
-        self,
-        seq_len: int,
-        txt_len: int = 0,
-        src_len: int = 0,
-    ) -> tuple[mx.array, mx.array]:
-        raise NotImplementedError(
-            "get_rope(seq_len, txt_len, src_len) is deprecated: it cannot express a "
-            "2D image grid from a flat token count. Use get_rope_grid(img_h, img_w, "
-            "txt_len, src_grids) instead."
-        )
 
     def get_rope_grid(
         self,

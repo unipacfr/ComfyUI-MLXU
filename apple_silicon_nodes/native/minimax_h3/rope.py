@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import mlx.core as mx
 
+from ..common import rms_norm
+
 
 def rope_freqs(position_ids: mx.array, inv_freq: mx.array) -> mx.array:
     """Port of `MiniMaxH3Model.rope_freqs`: `[S, 3]` (t, h, w) position ids and
@@ -65,14 +67,6 @@ def rope_cos_sin(angles: mx.array) -> tuple[mx.array, mx.array]:
     ang = angles[:, :half]
     return mx.cos(ang), mx.sin(ang)
 
-
-def rms_norm(x: mx.array, weight: mx.array, eps: float) -> mx.array:
-    """Standard RMSNorm over the last axis, matching
-    `torch.nn.functional.rms_norm(x, (x.shape[-1],), weight=weight, eps=eps)`."""
-    x32 = x.astype(mx.float32)
-    variance = mx.mean(x32 * x32, axis=-1, keepdims=True)
-    normed = x32 * mx.rsqrt(variance + eps)
-    return (normed.astype(x.dtype)) * weight
 
 
 def apply_rope_split_half(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:

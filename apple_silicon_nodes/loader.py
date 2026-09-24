@@ -482,14 +482,6 @@ def _capability_for_model_type(model_type: str, path: Path) -> CapabilityProfile
     return _resolve_capability_from_path(path)
 
 
-def _model_type_from_path(path: Path) -> str:
-    """Infer model type from filename."""
-    name = path.name.lower()
-    for hint, model_type in _TYPE_HINTS.items():
-        if hint in name:
-            return model_type
-    return "dev"  # default
-
 
 # ── Node ──────────────────────────────────────────────────────────────
 

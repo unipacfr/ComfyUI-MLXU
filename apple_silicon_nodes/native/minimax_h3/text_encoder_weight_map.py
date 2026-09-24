@@ -26,17 +26,8 @@ from .checkpoint_source import open_checkpoint
 from .quantized_linear import DEFAULT_BITS, DEFAULT_GROUP_SIZE, requantize
 from .text_encoder import Qwen3TextEncoder
 from .text_encoder_config import detect_qwen3_text_encoder_config
+from ..common import _check_weight_match
 
-
-def _check_weight_match(matched: int, total: int, label: str, path: str | Path) -> None:
-    """Same guard as `weight_map.py::_check_weight_match` -- reimplemented
-    locally for the same reason (avoid pulling in
-    `apple_silicon_nodes/native/__init__.py`'s unrelated family imports)."""
-    if matched == 0:
-        raise RuntimeError(
-            f"ASDX: {label} matched 0/{total} params from checkpoint "
-            f"'{Path(path).name}' -- its keys don't match the expected architecture at all."
-        )
 
 
 def _is_quantizable(path: str, module: nn.Module) -> bool:

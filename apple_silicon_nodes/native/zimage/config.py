@@ -13,6 +13,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from ..common import to_mlx_dtype
+
 
 @dataclass(frozen=True)
 class ZImageConfig:
@@ -69,15 +71,7 @@ class ZImageConfig:
 
     @property
     def mlx_dtype(self) -> mx.Dtype:
-        """Convert dtype string to mlx.core dtype."""
-        dtype_map = {
-            "float16": mx.float16,
-            "bfloat16": mx.bfloat16,
-            "float32": mx.float32,
-        }
-        if self.dtype not in dtype_map:
-            raise ValueError(f"ASDX: unsupported dtype '{self.dtype}'. Use float16, bfloat16, or float32.")
-        return dtype_map[self.dtype]
+        return to_mlx_dtype(self.dtype, "Z-Image")
 
     @property
     def head_dim(self) -> int:

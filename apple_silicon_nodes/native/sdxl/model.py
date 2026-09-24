@@ -28,25 +28,10 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import SDXLConfig
+from ..common import timestep_embedding
 
 
 # ── Timestep / ADM embedding ────────────────────────────────────────────
-
-def timestep_embedding(t: mx.array, dim: int, max_period: float = 10000.0) -> mx.array:
-    """Sinusoidal timestep embedding, matching comfy's `timestep_embedding`.
-
-    Unlike FLUX/Krea2's helper, SDXL timesteps are already raw discrete
-    values in [0, 999] (no *1000 time_factor scaling) — comfy's own
-    `openaimodel.py` calls `timestep_embedding(timesteps, model_channels,
-    repeat_only=False)` with no extra scaling.
-    """
-    half = dim // 2
-    freqs = mx.exp(-math.log(max_period) * mx.arange(half, dtype=mx.float32) / half)
-    args = t[:, None].astype(mx.float32) * freqs[None, :]
-    emb = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
-    if dim % 2:
-        emb = mx.concatenate([emb, mx.zeros((emb.shape[0], 1), dtype=emb.dtype)], axis=-1)
-    return emb
 
 
 def encode_adm(
@@ -84,7 +69,7 @@ def encode_adm(
     parts = [pooled_clip_g]
     for s in scalars:
         t = mx.full((1,), float(s), dtype=mx.float32)
-        parts.append(mx.broadcast_to(timestep_embedding(t, 256), (batch, 256)))
+        parts.append(mx.broadcast_to(timestep_embedding(t, 256, time_factor=1.0), (batch, 256)))
     return mx.concatenate(parts, axis=-1)
 
 
@@ -370,7 +355,7 @@ class UNetModel(nn.Module):
         Returns:
             [B, H, W, 4] predicted noise (NHWC).
         """
-        t_emb = timestep_embedding(timesteps, self.config.model_channels).astype(self.dtype)
+        t_emb = timestep_embedding(timesteps, self.config.model_channels, time_factor=1.0).astype(self.dtype)
         emb = self.time_embed(t_emb)
         emb = emb + self.label_emb(y.astype(self.dtype))
 

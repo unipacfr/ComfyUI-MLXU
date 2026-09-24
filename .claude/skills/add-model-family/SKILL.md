@@ -52,6 +52,8 @@ apple_silicon_nodes/native/<x>/
 Use `native/krea2/` as the direct template for style (frozen dataclass config with a
 `validate()` + `__post_init__`, `mlx_dtype`/derived-shape `@property`s, latent
 scale/shift module-level constants + `process_<x>_latent_in/out()` helpers).
+Reuse `native/common.py` (`to_mlx_dtype`, `timestep_embedding`, `rms_norm`,
+`_check_weight_match`) instead of copying them into the new family.
 
 `config.py` skeleton:
 
@@ -75,10 +77,7 @@ class <X>Config:
 
     @property
     def mlx_dtype(self) -> mx.Dtype:
-        dtype_map = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}
-        if self.dtype not in dtype_map:
-            raise ValueError(f"ASDX: unsupported dtype '{self.dtype}'.")
-        return dtype_map[self.dtype]
+        return to_mlx_dtype(self.dtype, "<X>")  # from ..common import to_mlx_dtype
 
     def validate(self) -> None:
         # TODO: cross-field assertions (e.g. hidden_dim % num_heads == 0,

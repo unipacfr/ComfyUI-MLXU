@@ -192,12 +192,6 @@ def _half_log_snr(sigma: float, is_flow_matching: bool) -> float:
     return -math.log(sigma)
 
 
-def _sigma_from_half_log_snr(half_log_snr: float, is_flow_matching: bool) -> float:
-    """Matches k_diffusion/sampling.py:160-165::half_log_snr_to_sigma."""
-    if is_flow_matching:
-        return 1.0 / (1.0 + math.exp(half_log_snr))
-    return math.exp(-half_log_snr)
-
 
 def step_dpmpp_2m_sde(
     x: mx.array,

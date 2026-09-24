@@ -34,6 +34,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import ZImageConfig
+from ..common import timestep_embedding
 
 
 # ── RoPE (paired-interleave, matches native/__init__.py exactly) ────────
@@ -62,16 +63,6 @@ def apply_rope(x: mx.array, freqs: mx.array) -> mx.array:
     out = (f[..., 0] * x_pairs[..., 0]) + (f[..., 1] * x_pairs[..., 1])
     return out.reshape(B, H, N, D)
 
-
-def timestep_embedding(t: mx.array, dim: int, max_period: float = 10000.0) -> mx.array:
-    """Sinusoidal embedding matching comfy's `timestep_embedding` (repeat_only=False)."""
-    half = dim // 2
-    freqs = mx.exp(-math.log(max_period) * mx.arange(half, dtype=mx.float32) / half)
-    args = t[:, None].astype(mx.float32) * freqs[None, :]
-    emb = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
-    if dim % 2:
-        emb = mx.concatenate([emb, mx.zeros((emb.shape[0], 1), dtype=emb.dtype)], axis=-1)
-    return emb
 
 
 # ── JointAttention (full MHA for Z-Image: n_kv_heads == n_heads) ────────
@@ -333,7 +324,7 @@ class NextDiT(nn.Module):
         # t_input = (1 - sigma) * time_scale, matching comfy's `t = 1.0 - timesteps`
         # then `t_embedder(t * self.time_scale, ...)`.
         t_input = (1.0 - t) * self.config.time_scale
-        adaln_input = self.t_embedder(timestep_embedding(t_input, 256).astype(self.dtype))
+        adaln_input = self.t_embedder(timestep_embedding(t_input, 256, time_factor=1.0).astype(self.dtype))
 
         # ── Image: embed, position (real grid, before padding), pad ──────
         img_emb = self.x_embedder(img.astype(self.dtype))

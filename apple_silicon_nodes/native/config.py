@@ -11,6 +11,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from .common import to_mlx_dtype
+
 
 @dataclass(frozen=True)
 class FluxConfig:
@@ -38,15 +40,7 @@ class FluxConfig:
 
     @property
     def mlx_dtype(self) -> mx.Dtype:
-        """Convert dtype string to mlx.core dtype."""
-        dtype_map = {
-            "float16": mx.float16,
-            "bfloat16": mx.bfloat16,
-            "float32": mx.float32,
-        }
-        if self.dtype not in dtype_map:
-            raise ValueError(f"ASDX: unsupported dtype '{self.dtype}'. Use float16, bfloat16, or float32.")
-        return dtype_map[self.dtype]
+        return to_mlx_dtype(self.dtype, "FLUX.1")
 
     @property
     def head_dim(self) -> int:
@@ -75,17 +69,6 @@ FLUX_LATENT_SCALE: float = 0.3611
 FLUX_LATENT_SHIFT: float = 0.1159
 """Shift factor for FLUX latent space transformation."""
 
-
-def process_flux_latent_in(latent: Any) -> Any:
-    """Process latent for model input: (latent - shift) * scale.
-
-    Args:
-        latent: Input latent tensor (any array-like).
-
-    Returns:
-        Processed latent tensor.
-    """
-    return (latent - FLUX_LATENT_SHIFT) * FLUX_LATENT_SCALE
 
 
 def process_flux_latent_out(latent: Any) -> Any:

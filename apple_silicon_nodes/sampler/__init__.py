@@ -19,7 +19,8 @@ import torch
 from comfy_api.latest import io
 
 from .. import metadata as metadata_util
-from . import bridge, solvers
+from .. import bridge
+from . import solvers
 from .core import _SamplerCore
 from .scheduling import SCHEDULER_NAMES
 
@@ -105,8 +106,6 @@ class ASDX_MLXSampler(io.ComfyNode):
                             "the full effect at strength=1.0. No effect on "
                             "non-Krea2 models.",
                 ),
-                # Legacy
-                io.Custom("ASDX_LORA_SCHEDULE").Input("lora_schedule", optional=True),
             ],
             outputs=[
                 io.Latent.Output(display_name="latent"),
@@ -147,8 +146,6 @@ class ASDX_MLXSampler(io.ComfyNode):
         source_latent: dict | None = None,
         ref_boost: float = 1.0,
         krea2_enhancer_strength: float = 1.0,
-        # Legacy
-        lora_schedule: dict | None = None,
         # Krea2 Identity Edit pixel path: the source IMAGE + the VAE used to
         # encode it. When both are wired, the sampler fits the image in pixel
         # space and VAE-encodes it itself (the blur-proof path the reference
@@ -164,10 +161,8 @@ class ASDX_MLXSampler(io.ComfyNode):
         capability = model.get("capability")
         controlnet = model.get("controlnet")
         memory_shape = model.get("memory_shape")
-        # ASDX_LoraSchedule stores its config in the model dict, not through
-        # the legacy ASDX_LORA_SCHEDULE input above (no node produces that
-        # type) -- read it from there, keeping the legacy param as a fallback.
-        lora_schedule = model.get("lora_schedule") or lora_schedule
+        # ASDX_LoraSchedule stores its config in the model dict.
+        lora_schedule = model.get("lora_schedule")
         # ASDX_Krea2Edit (Task A1) pre-computes the Identity Edit source and
         # stores it in the model dict. Read it from there, in priority over the
         # legacy source_latent / source_image inputs below (which stay as a

@@ -35,6 +35,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .config import Flux2Config
+from ..common import timestep_embedding
 
 
 # ── RoPE (4-axis, paired-interleave convention) ─────────────────────────
@@ -91,18 +92,6 @@ class QKNorm(nn.Module):
     def __call__(self, q: mx.array, k: mx.array) -> tuple[mx.array, mx.array]:
         return self.query_norm(q), self.key_norm(k)
 
-
-def timestep_embedding(t: mx.array, dim: int, max_period: float = 10000.0,
-                        time_factor: float = 1000.0) -> mx.array:
-    """Sinusoidal timestep embedding, matching comfy.ldm.flux.layers.timestep_embedding."""
-    t = time_factor * t
-    half = dim // 2
-    freqs = mx.exp(-math.log(max_period) * mx.arange(half, dtype=mx.float32) / half)
-    args = t[:, None].astype(mx.float32) * freqs[None, :]
-    emb = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
-    if dim % 2:
-        emb = mx.concatenate([emb, mx.zeros((emb.shape[0], 1), dtype=emb.dtype)], axis=-1)
-    return emb
 
 
 class MLPEmbedder(nn.Module):

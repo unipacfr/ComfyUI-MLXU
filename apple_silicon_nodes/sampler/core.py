@@ -18,7 +18,7 @@ import torch
 from .. import capability as cap_module
 from ..memory_calibration import record_observation
 from ..native.config import FLUX_LATENT_SCALE, FLUX_LATENT_SHIFT
-from . import bridge
+from .. import bridge
 from .cache import TeaCacheState
 from . import solvers
 from .scheduling import SDXLSampling, calculate_sigmas
@@ -1299,15 +1299,13 @@ class _SamplerCore:
           - SwiGLU MLP
           - Same Euler update: noise += output * (sigma_next - sigma_t)
         """
-        from .bridge import conditioning_krea2_to_mlx
-
         precision = self.config.mlx_dtype
         model_type = self.model_type
 
         # ── Krea2 conditioning ──────────────────────────────────────
         # Krea2 expects fused Qwen3-VL embeddings [B, T, 12*2560] = [B, T, 30720]
         # The bridge handles single-layer → fused conversion
-        txt_fused = conditioning_krea2_to_mlx(self.positive, precision)
+        txt_fused = bridge.conditioning_krea2_to_mlx(self.positive, precision)
         txt_len = txt_fused.shape[1]
 
         # Target image token grid (in patches): latent is height//8 x width//8,

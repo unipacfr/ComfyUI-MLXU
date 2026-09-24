@@ -23,6 +23,7 @@ from .checkpoint_source import open_checkpoint
 from .config import MiniMaxH3Config, detect_minimax_h3_config
 from .model import MiniMaxH3Model
 from .quantized_linear import DEFAULT_BITS, DEFAULT_GROUP_SIZE, requantize
+from ..common import _check_weight_match
 
 # Only these four per-block linears are large enough to matter for memory
 # (7168x5376-class matrices, x50 main blocks + x2 token_refiner blocks);
@@ -30,20 +31,6 @@ from .quantized_linear import DEFAULT_BITS, DEFAULT_GROUP_SIZE, requantize
 # output heads) stays dense -- see quantized_linear.py's module docstring.
 _QUANTIZE_SUFFIXES = ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")
 
-
-def _check_weight_match(matched: int, total: int, label: str, path: str | Path) -> None:
-    """Same guard as `native/__init__.py::_check_weight_match` (zero matches
-    means the checkpoint's keys don't match this architecture at all --
-    likely misdetected, would otherwise run silently on random init).
-    Reimplemented locally rather than imported: `apple_silicon_nodes/
-    native/__init__.py` pulls in every other family's model modules at
-    import time (FLUX.1, Krea2, ...), an unrelated and heavy dependency for
-    this one small check."""
-    if matched == 0:
-        raise RuntimeError(
-            f"ASDX: {label} matched 0/{total} params from checkpoint "
-            f"'{Path(path).name}' -- its keys don't match the expected architecture at all."
-        )
 
 
 def _is_big_linear(path: str, module: nn.Module) -> bool:

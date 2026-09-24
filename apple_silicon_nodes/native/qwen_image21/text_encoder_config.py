@@ -28,6 +28,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from ..common import to_mlx_dtype
+
 
 @dataclass(frozen=True)
 class Qwen3VL8BTextEncoderConfig:
@@ -55,10 +57,7 @@ class Qwen3VL8BTextEncoderConfig:
 
     @property
     def mlx_dtype(self) -> mx.Dtype:
-        dtype_map = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}
-        if self.dtype not in dtype_map:
-            raise ValueError(f"ASDX: unknown Qwen3-VL-8B text encoder dtype {self.dtype!r}")
-        return dtype_map[self.dtype]
+        return to_mlx_dtype(self.dtype, "Qwen3-VL-8B text encoder")
 
 
 def detect_qwen3vl_8b_text_encoder_config(

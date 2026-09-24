@@ -13,6 +13,8 @@ import math
 
 import mlx.core as mx
 
+from ..common import timestep_embedding  # noqa: F401  (re-exported)
+
 
 def rope_freqs(pos: mx.array, dim: int, theta: float) -> mx.array:
     """[N, dim/2, 2, 2] rotation-matrix RoPE table for one axis."""
@@ -47,14 +49,3 @@ def apply_rope(x: mx.array, freqs: mx.array) -> mx.array:
     return out.reshape(B, H, N, D).astype(x.dtype)
 
 
-def timestep_embedding(t: mx.array, dim: int, max_period: float = 10000.0,
-                        time_factor: float = 1000.0) -> mx.array:
-    """Sinusoidal timestep embedding, matching comfy.ldm.flux.layers.timestep_embedding."""
-    t = time_factor * t
-    half = dim // 2
-    freqs = mx.exp(-math.log(max_period) * mx.arange(half, dtype=mx.float32) / half)
-    args = t[:, None].astype(mx.float32) * freqs[None, :]
-    emb = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
-    if dim % 2:
-        emb = mx.concatenate([emb, mx.zeros((emb.shape[0], 1), dtype=emb.dtype)], axis=-1)
-    return emb

@@ -13,6 +13,8 @@ from typing import Any
 
 import mlx.core as mx
 
+from ..common import to_mlx_dtype
+
 
 @dataclass(frozen=True)
 class QwenImage21Config:
@@ -33,10 +35,7 @@ class QwenImage21Config:
 
     @property
     def mlx_dtype(self) -> mx.Dtype:
-        dtype_map = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}
-        if self.dtype not in dtype_map:
-            raise ValueError(f"ASDX: unknown Qwen Image 2.1 DiT dtype {self.dtype!r}")
-        return dtype_map[self.dtype]
+        return to_mlx_dtype(self.dtype, "Qwen Image 2.1 DiT")
 
 
 def detect_qwen_image21_config(state_dict: dict[str, Any], dtype: str = "float16") -> QwenImage21Config:
