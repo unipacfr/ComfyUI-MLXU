@@ -1,40 +1,14 @@
-"""Metadata sidecar saving for generated images.
+"""Generation metadata for sampled latents.
 
 Adapted from Mflux-ComfyUI's save_images_with_metadata pattern.
-Saves a JSON file alongside each output image containing all
-generation parameters for reproducibility and tracing.
+Builds the dict of generation parameters attached to output latents
+for reproducibility and tracing.
 """
 
 from __future__ import annotations
 
-import json
 import time
-from pathlib import Path
 from typing import Any
-
-
-def save_metadata_sidecar(image_path: str, metadata: dict[str, Any]) -> str:
-    """Save a JSON sidecar file alongside an output image.
-
-    The JSON file has the same basename as the image, with a .json extension.
-    Example: output_00001.png → output_00001.png.json
-
-    Args:
-        image_path: Absolute or relative path to the output image.
-        metadata: Dictionary of generation parameters to serialize.
-
-    Returns:
-        Path to the saved JSON sidecar file.
-    """
-    image_path = Path(image_path)
-    sidecar_path = image_path.with_suffix(image_path.suffix + ".json")
-
-    # Serialize with UTF-8 and pretty printing
-    json_str = json.dumps(metadata, indent=2, ensure_ascii=False, default=_json_default)
-    sidecar_path.write_text(json_str, encoding="utf-8")
-
-    print(f"[ASDX] Metadata saved: {sidecar_path}")
-    return str(sidecar_path)
 
 
 def build_generation_metadata(
@@ -115,50 +89,3 @@ def build_generation_metadata(
         meta["extras"] = extra
 
     return meta
-
-
-def extract_png_metadata(image_path: str) -> dict[str, Any] | None:
-    """Extract metadata from a PNG image's text chunks.
-
-    Reads the metadata embedded in a PNG file (if any) and returns
-    it as a dictionary. Returns None if no metadata is found.
-
-    Args:
-        image_path: Path to the PNG image.
-
-    Returns:
-        Dictionary of extracted metadata, or None if unavailable.
-    """
-    from PIL import Image
-
-    try:
-        with Image.open(image_path) as img:
-            if "text" not in img.info:
-                return None
-            raw_text = img.info["text"]
-            # PNG text chunks are dict: {"key": "value", ...}
-            metadata: dict[str, Any] = {}
-            for key, value in raw_text.items():
-                if key == "parameters":
-                    # ComfyUI-style parameters string
-                    metadata["parameters"] = value
-                elif key == "crossattr":
-                    # JSON embedded in crossattr
-                    try:
-                        metadata["embedded_json"] = json.loads(value)
-                    except json.JSONDecodeError:
-                        metadata["embedded_json"] = value
-                else:
-                    metadata[key] = value
-            return metadata
-    except Exception:
-        return None
-
-
-def _json_default(obj: Any) -> Any:
-    """Default JSON serializer for unsupported types."""
-    if hasattr(obj, "isoformat"):
-        return obj.isoformat()
-    if hasattr(obj, "__str__"):
-        return str(obj)
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")

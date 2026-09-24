@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import mlx.core as mx
-import numpy as np
 import torch
 from comfy_api.latest import io
 
@@ -76,11 +75,7 @@ class MFLUX_IMAGE:
 # ── Node: ImageToLatent ───────────────────────────────────────────────
 
 class ASDX_ImageToLatent(io.ComfyNode):
-    """VAE-encode an image to latent, return MFLUX_IMAGE.
-
-    Encodes a [B, H, W, C] image tensor to a [B, 16, H/8, W/8] FLUX
-    latent using the MLX VAE encoder.
-    """
+    """Wrap an image in an image-only MFLUX_IMAGE payload (no latent)."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -98,34 +93,10 @@ class ASDX_ImageToLatent(io.ComfyNode):
 
     @classmethod
     def execute(cls, image: torch.Tensor) -> io.NodeOutput:
-        try:
-            from . import bridge as mlx_bridge
-            from .mlx_vae import MLXVAE
-
-            # Transpose to [B, C, H, W] for VAE
-            img_bw = image.permute(0, 3, 1, 2) if image.ndim == 4 else image
-            # Normalize from [0, 1] to [-1, 1] for VAE
-            img_normalized = (img_bw - 0.5) / 0.5
-
-            # Use MLX VAE encoder
-            vae = MLXVAE()
-            latent = vae.encode(img_normalized)
-
-            # Convert back to PyTorch
-            latent_pt = torch.from_numpy(
-                np.array(latent.cpu().numpy(), dtype=np.float32)
-            )
-
-            return io.NodeOutput(MFLUX_IMAGE(
-                image=image,
-                latent=latent_pt,
-                source="input",
-                metadata={"width": image.shape[2], "height": image.shape[1]},
-            ))
-        except Exception as e:
-            print(f"[ASDX_ImageToLatent] Error: {e}")
-            # Fallback: return image-only payload
-            return io.NodeOutput(MFLUX_IMAGE(image=image, source="input"))
+        # Image-only payload: the former MLX VAE encode path imported a
+        # nonexistent `MLXVAE` and always fell through to this. Real encoding
+        # belongs to ASDX_VAEEncode (comfy.sd.VAE).
+        return io.NodeOutput(MFLUX_IMAGE(image=image, source="input"))
 
 
 # ── Node: MaskFromImage ───────────────────────────────────────────────

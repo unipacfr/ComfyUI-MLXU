@@ -1,10 +1,8 @@
 """Sigma scheduling for diffusion models.
 
-Adapted from DiffusionKit's FluxSampler and ModelSamplingDiscreteFlow.
+Adapted from DiffusionKit's ModelSamplingDiscreteFlow.
 Provides sigma/timestep conversion, noise scaling, and schedule generation
 for FLUX and discrete flow models.
-
-Also includes FluxLatentFormat for FLUX latent space transformation.
 """
 
 from __future__ import annotations
@@ -13,208 +11,10 @@ import math
 from typing import Any
 
 
-class FluxSampler:
-    """Sigma scheduling for FLUX models.
-
-    FLUX uses a continuous sigma schedule where:
-      - sigma(timestep) converts timestep [0, 1000] → sigma value
-      - timestep(sigma) converts sigma → timestep [0, 1000]
-      - The schedule supports a shift parameter for custom schedules
-
-    Sigmas range from 0 to 1000 (inclusive), giving 1001 values.
-    """
-
-    def __init__(self, shift: float = 1.0):
-        """
-        Args:
-            shift: Shift parameter for the sigma schedule.
-                   shift=1.0 gives the standard linear schedule.
-        """
-        self.shift = shift
-        self.num_steps = 1000
-        # Precompute sigmas for all timesteps
-        self._sigmas: list[float] = []
-        for i in range(self.num_steps + 1):
-            self._sigmas.append(self._sigma_from_timestep(i))
-
-    @property
-    def sigma_min(self) -> float:
-        """Minimum sigma value (at timestep 0)."""
-        return self._sigmas[0]
-
-    @property
-    def sigma_max(self) -> float:
-        """Maximum sigma value (at timestep 1000)."""
-        return self._sigmas[-1]
-
-    def sigma(self, timestep: float) -> float:
-        """Convert a timestep value to sigma.
-
-        Args:
-            timestep: Timestep value in [0, 1000].
-
-        Returns:
-            Sigma value.
-        """
-        t = timestep / 1000.0
-        if self.shift == 1.0:
-            return t
-        return self.shift * t / (1 + (self.shift - 1) * t)
-
-    def _sigma_from_timestep(self, i: int) -> float:
-        """Compute sigma for a specific timestep index."""
-        return self.sigma(float(i))
-
-    def timestep(self, sigma: float) -> float:
-        """Convert a sigma value to timestep.
-
-        Args:
-            sigma: Sigma value.
-
-        Returns:
-            Timestep value in [0, 1000].
-        """
-        return sigma * 1000.0
-
-    def noise_scaling(
-        self,
-        sigma: float,
-        noise: Any,
-        latent_image: Any,
-        max_denoise: bool = False,
-    ) -> Any:
-        """Scale noise for img2img or noising of latents.
-
-        Computes: sigma * noise + (1 - sigma) * latent_image
-
-        Args:
-            sigma: Current sigma value.
-            noise: Random noise tensor.
-            latent_image: Input latent image tensor.
-            max_denoise: If True, cap denoising strength.
-
-        Returns:
-            Noised latent tensor.
-        """
-        return sigma * noise + (1.0 - sigma) * latent_image
-
-    def calculate_denoised(self, sigma: float, model_output: Any, model_input: Any) -> Any:
-        """Calculate denoised output from model prediction.
-
-        Computes: model_input - model_output * sigma
-
-        Args:
-            sigma: Current sigma value.
-            model_output: Model's noise prediction.
-            model_input: Current latent input.
-
-        Returns:
-            Denoised latent tensor.
-        """
-        # Reshape sigma to broadcast correctly
-        sigma_shape = [sigma] + [1] * (model_output.ndim - 1)
-        return model_input - model_output * sigma
-
-
-class FlowSampler:
-    """Sigma scheduling for discrete flow matching models.
-
-    Similar to FluxSampler but uses a different sigma schedule
-    (starts from 1.0 instead of 0.0).
-    """
-
-    def __init__(self, shift: float = 1.0):
-        self.shift = shift
-        self.num_steps = 1000
-        self._sigmas: list[float] = []
-        for i in range(1, self.num_steps + 1):
-            self._sigmas.append(self._sigma_from_timestep(i))
-
-    @property
-    def sigma_min(self) -> float:
-        return self._sigmas[0]
-
-    @property
-    def sigma_max(self) -> float:
-        return self._sigmas[-1]
-
-    def sigma(self, timestep: float) -> float:
-        t = timestep / 1000.0
-        if self.shift == 1.0:
-            return t
-        return self.shift * t / (1 + (self.shift - 1) * t)
-
-    def _sigma_from_timestep(self, i: int) -> float:
-        return self.sigma(float(i))
-
-    def timestep(self, sigma: float) -> float:
-        return sigma * 1000.0
-
-    def noise_scaling(
-        self,
-        sigma: float,
-        noise: Any,
-        latent_image: Any,
-        max_denoise: bool = False,
-    ) -> Any:
-        return sigma * noise + (1.0 - sigma) * latent_image
-
-    def calculate_denoised(self, sigma: float, model_output: Any, model_input: Any) -> Any:
-        sigma_shape = [sigma] + [1] * (model_output.ndim - 1)
-        return model_input - model_output * sigma
-
-
-class Krea2Sampler:
-    """Sampler for Krea2 (SingleStreamDiT) flow-matching models.
-
-    Krea2 uses a linear flow schedule from sigma=1.0 to sigma=0.0,
-    with the same Euler update formula as FLUX:
-        noise = noise + output * (sigma_next - sigma_t)
-
-    Key differences from FLUX:
-      - No guidance embedding (CFG=1 for Turbo, CFG~3 for Raw)
-      - Text embedding from Qwen3-VL (2560-dim, not T5+CLIP)
-      - Flow matching schedule (linear 1→0)
-      - txtfusion adapter for text processing
-    """
-
-    def __init__(self):
-        self.num_steps = 1000
-
-    def sigma(self, timestep: float) -> float:
-        """Convert timestep to sigma for Krea2.
-
-        Krea2 uses a linear schedule: sigma = 1 - t/1000.
-        """
-        return 1.0 - timestep / 1000.0
-
-    def timestep(self, sigma: float) -> float:
-        """Convert sigma to timestep for Krea2."""
-        return (1.0 - sigma) * 1000.0
-
-    def noise_scaling(
-        self,
-        sigma: float,
-        noise: Any,
-        latent_image: Any,
-        max_denoise: bool = False,
-    ) -> Any:
-        """Scale noise for img2img in Krea2.
-
-        Same formula as FluxSampler: sigma * noise + (1 - sigma) * latent_image
-        """
-        return sigma * noise + (1.0 - sigma) * latent_image
-
-    def calculate_denoised(self, sigma: float, model_output: Any, model_input: Any) -> Any:
-        """Calculate denoised output from model prediction."""
-        sigma_shape = [sigma] + [1] * (model_output.ndim - 1)
-        return model_input - model_output * sigma
-
-
 class SDXLSampling:
     """Discrete DDPM/EPS sigma schedule for SDXL.
 
-    Fundamentally different from FLUX/Krea2's flow-matching schedule above:
+    Fundamentally different from FLUX/Krea2's flow-matching schedule:
     SDXL is trained on 1000 DISCRETE diffusion steps with a fixed
     beta/alpha_cumprod schedule, not a continuous sigma in [0,1]. Matches
     `comfy/model_sampling.py::ModelSamplingDiscrete` + `EPS` exactly:
@@ -324,45 +124,6 @@ def generate_sigmas_sdxl(steps: int) -> list[float]:
     sigmas = [sampling.sigma(t) for t in timesteps]
     sigmas.append(0.0)
     return sigmas
-
-
-class FluxLatentFormat:
-    """FLUX latent space transformation parameters.
-
-    FLUX uses specific scale and shift factors for converting
-    between pixel space and latent space representations.
-
-    Attributes:
-        scale_factor: Factor to multiply latents by (default 0.3611).
-        shift_factor: Value to subtract from latents (default 0.1159).
-    """
-
-    scale_factor: float = 0.3611
-    shift_factor: float = 0.1159
-
-    @classmethod
-    def process_in(cls, latent: Any) -> Any:
-        """Process latent for model input: (latent - shift) * scale.
-
-        Args:
-            latent: Input latent tensor.
-
-        Returns:
-            Processed latent tensor.
-        """
-        return (latent - cls.shift_factor) * cls.scale_factor
-
-    @classmethod
-    def process_out(cls, latent: Any) -> Any:
-        """Process latent for model output: latent / scale + shift.
-
-        Args:
-            latent: Output latent tensor.
-
-        Returns:
-            Reconstructed latent tensor.
-        """
-        return (latent / cls.scale_factor) + cls.shift_factor
 
 
 def flux_time_shift(mu: float, sigma: float, t: float) -> float:

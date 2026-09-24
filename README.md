@@ -58,7 +58,7 @@ from the safetensors header marker keys, never guessed from dtype alone.
                            │
               ┌────────────▼────────────┐
               │   ASDX_VAEDecode        │
-              │   (MLX VAE decode)      │
+              │   (ComfyUI VAE decode)  │
               └────────────┬────────────┘
                            │
               ┌────────────▼────────────┐
@@ -123,8 +123,8 @@ for the legacy path.
 | Node | Description |
 |------|-------------|
 | `🍏 ASDX Empty Latent` | Create an empty latent (`flux`/`flux2`/`sdxl` format) |
-| `🍏 ASDX VAE Decode (MLX)` | Decode latents via MLX VAE |
-| `🍏 ASDX VAE Encode (MLX)` | Encode images via MLX VAE |
+| `🍏 ASDX VAE Decode (MLX)` | Decode latents via ComfyUI's VAE (PyTorch/MPS) |
+| `🍏 ASDX VAE Encode (MLX)` | Encode images via ComfyUI's VAE (PyTorch/MPS) |
 
 Both VAE nodes retry automatically with a tiled encode/decode when MPS raises one
 of the two failures tiling fixes: a plain out-of-memory `RuntimeError`, or

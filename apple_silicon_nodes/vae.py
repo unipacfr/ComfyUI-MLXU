@@ -14,7 +14,6 @@ from typing import Any
 
 from comfy_api.latest import io
 
-import mlx.core as mx
 import torch
 
 
@@ -141,41 +140,10 @@ class ASDX_VAEDecode(io.ComfyNode):
 
         latent = samples["samples"]
 
-        # Always use the real ComfyUI/PyTorch VAE. `_decode_with_mlx_vae()`
-        # (below) has no real weight loading — it's an untrained placeholder
-        # that silently ignores `vae` and produces noise, not an image, for
-        # any latent that used to route through it (16ch: FLUX.1/Z-Image).
-        # SDXL (4ch) and Flux2 (128ch) already always used this real path.
-        # Left `_decode_with_mlx_vae`/`mlx_vae.py` in place, just unreferenced
-        # from here — a native MLX VAE decoder remains a separate future task.
+        # Always use the real ComfyUI/PyTorch VAE. The former MLX VAE path
+        # (`mlx_vae.py`, now deleted) was an untrained placeholder that
+        # silently produced noise for 16ch latents (FLUX.1/Z-Image).
         return io.NodeOutput(*cls._fallback_decode(latent, vae))
-
-    @staticmethod
-    def _decode_with_mlx_vae(latent: mx.array) -> mx.array:
-        """Decode using MLX VAE.
-
-        In production, this would use the native MLX VAE from sdmlx.
-        For now, we provide a placeholder that demonstrates the pattern.
-        """
-        # The real implementation would:
-        # 1. Load the VAE weights into an MLX VAE module
-        # 2. Call vae.decode(latent)
-        # 3. Return the decoded output
-
-        # Placeholder: for demonstration, just return the latent
-        # A real implementation needs the VAE module from sdmlx/mlx_sd
-        try:
-            from .mlx_vae import get_vae_decoder
-            vae = get_vae_decoder()
-            if vae is not None:
-                return vae.decode(latent)
-        except Exception:
-            pass
-
-        # Fallback: just return the latent (will produce garbage without real VAE)
-        # This should never be reached in a proper installation
-        print("[ASDX] VAE Decode: no MLX VAE available, using fallback")
-        return latent
 
     @staticmethod
     def _fallback_decode(latent: torch.Tensor, vae: Any) -> tuple[torch.Tensor]:
@@ -264,28 +232,13 @@ class ASDX_VAEEncode(io.ComfyNode):
             raise RuntimeError(f"ASDX VAE Encode: expected [B,H,W,C] image, got {pixels.shape}")
 
         # Always use the real ComfyUI/PyTorch VAE, mirroring ASDX_VAEDecode.execute()
-        # above: `_encode_with_mlx_vae()` below has no real weight loading -- it's an
-        # untrained placeholder that silently returns the raw pixels (mislabeled as a
-        # "latent") whenever the MLX encoder is unavailable, which it always is today.
+        # above (the deleted MLX placeholder returned raw pixels mislabeled as a latent).
         latent_torch = cls._fallback_encode(pixels, vae)
 
         elapsed = time.perf_counter() - t0
         print(f"[ASDX] VAE Encode: {latent_torch.shape}, {elapsed:.2f}s")
 
         return io.NodeOutput({"samples": latent_torch})
-
-    @staticmethod
-    def _encode_with_mlx_vae(image: mx.array) -> mx.array:
-        """Encode using MLX VAE encoder."""
-        try:
-            from .mlx_vae import get_vae_encoder
-            vae = get_vae_encoder()
-            if vae is not None:
-                return vae.encode(image)
-        except Exception:
-            pass
-        print("[ASDX] VAE Encode: no MLX VAE available, using fallback")
-        return image
 
     @staticmethod
     def _fallback_encode(pixels: torch.Tensor, vae: Any) -> torch.Tensor:
