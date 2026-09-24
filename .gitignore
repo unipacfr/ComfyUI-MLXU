@@ -18,9 +18,6 @@ MEMORY.md
 session-state.md
 ROADMAP.md
 
-# WIP nodes pending revisit, not registered -- kept locally, not published
-disabled_nodes/
-
 # Build artifact from local `uv`/pip builds
 *.egg-info/
 

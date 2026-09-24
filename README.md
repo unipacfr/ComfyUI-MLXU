@@ -147,8 +147,7 @@ comfy's own OOM fallback recognises neither on Apple Silicon.
 | `🍏 ASDX Depth Map` | Estimate a depth map from an image |
 | `🍏 ASDX Live Preview` | Stream intermediate latents during sampling |
 
-> ControlNet Union and IP-Adapter nodes exist in `disabled_nodes/` but are not currently
-> registered — kept for a future revisit, not deleted.
+> ControlNet Union and IP-Adapter nodes are not available (WIP code removed).
 
 ## MiniMax H3 (Apple Silicon native)
 
@@ -288,8 +287,8 @@ unresolved — root cause (DiT port vs. VAE decode bridge) not yet isolated.
 | Multi-LoRA stacking | ✅ | ✅ |
 | TeaCache acceleration | ✅ | ✅ |
 | SeaCache acceleration | ✅ | ✅ |
-| ControlNet Union | ✅ | 🚧 disabled (WIP, `disabled_nodes/`) |
-| IP-Adapter | ✅ | 🚧 disabled (WIP, `disabled_nodes/`) |
+| ControlNet Union | ✅ | ❌ not available |
+| IP-Adapter | ✅ | ❌ not available |
 | Kontext reference | ✅ | ✅ |
 | Code size | ~15K lines | ~3K lines |
 | Learning curve | Steep | Gentle |
