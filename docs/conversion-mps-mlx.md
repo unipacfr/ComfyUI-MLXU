@@ -9,7 +9,7 @@
 ## 1. Contexte
 
 Le projet ComfyUI-MLXU est actuellement un melange de :
-- **Nodes 100% MLX natif** (sampler, VAE, LoRA, ControlNet, IP-Adapter, loader)
+- **Nodes 100% MLX natif** (sampler, LoRA, loader)
 - **Nodes PyTorch MPS** (CLIP, Conditioning, Image Chain, Depth Map) qui utilisent l'infrastructure ComfyUI existante
 
 L'objectif est de migrer progressivement les nodes MPS vers du MLX natif pour :

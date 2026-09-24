@@ -28,9 +28,9 @@ Verifie en lisant le code, pas les checklists (qui n'ont jamais ete tenues a jou
 - **SDXL : txt2img uniquement.** `sampler/core.py::_run_sdxl` le documente explicitement :
   img2img / inpainting / depth / ControlNet ne sont pas cables (le dispatch de `run()`
   route vers `_run_sdxl` *avant* `_detect_mode()`, qui est specifique FLUX).
-- **ControlNet : indisponible hors FLUX.1.** Le package ControlNet est deplace dans
-  `disabled_nodes/controlnet/`, et `capability.py` declare `supports_controlnet=False`
-  pour `sdxl_base`, `zimage_base`, `zimage_turbo`.
+- **ControlNet : indisponible.** Le package WIP `disabled_nodes/controlnet/` et toute la
+  plomberie ControlNet du sampler ont ete supprimes (2026-09-24) ; un ControlNet serait
+  a reecrire par famille.
 - **LoRA SDXL : fonctionnel.** Detection de famille par cles (`lora.py:100`,
   signature `input_blocks.`) + `native/sdxl/weight_map.py::native_key_to_checkpoint_stem`
   (`lora.py:2299`). SDXL passe par la boucle de merge, pas par le chemin residuel FLUX.
@@ -125,7 +125,7 @@ Ce qui a ete construit a la place, et qui fait office de contrat :
   `"sdxl"` / `"zimage"`..., consommee par `sampler/core.py::run()` qui route vers une des
   cinq boucles de denoising dediees.
 - **`capability.py::CapabilityProfile`** : declaratif par famille (`generate_params`,
-  `requires`, `hard_block`, `latent_channels`, `supports_controlnet`) — c'est le seul
+  `requires`, `hard_block`, `latent_channels`) — c'est le seul
   "contrat" formel qu'une famille doit remplir.
 - **Schedulers** : `sampler/scheduling.py` (`generate_sigmas`, `generate_sigmas_sdxl`,
   `SDXLSampling`, schedulers karras/simple/sgm_uniform/beta) + `sampler/solvers.py`
@@ -157,7 +157,7 @@ Livre : `native/sdxl/`, `_run_sdxl`, LoRA SDXL, `latent.py` multi-canaux
 | Item | Etat | Detail |
 |------|------|--------|
 | img2img / inpainting SDXL | ❌ | `_run_sdxl` court-circuite `_detect_mode()`. Effort : 1-2j |
-| ControlNet SD | ❌ | `disabled_nodes/controlnet/` a reactiver puis porter. Effort : 2-3j |
+| ControlNet SD | ❌ | A reecrire (code WIP supprime le 2026-09-24). Effort : a re-estimer |
 
 ### Phase 2 — FLUX.2 Klein
 
@@ -527,7 +527,7 @@ ajoute un sous-package `native/<famille>/` sans toucher au noyau.
 | Architecture modele inconnue (pas de specs) | Moyenne | Eleve | Analyser les poids pour deduire l'architecture (inspecter le header safetensors AVANT d'ecrire le weight_map) |
 | Memoire insuffisante (Wan 14B) | Moyenne | Eleve | Quantification MLX (int8, fp8), streaming |
 | Incompatibilite numerique MLX vs PyTorch | Haute | Moyen | Recette `verify-checkpoint` avant toute annonce de support |
-| ControlNet non disponible hors FLUX.1 | Confirme | Moyen | `disabled_nodes/controlnet/` a reactiver et porter par famille |
+| ControlNet non disponible | Confirme | Moyen | A reecrire par famille (code WIP supprime le 2026-09-24) |
 | Modele video (Wan/SVD) : rope temporel + VAE 3D | Haute | Eleve | Aucun precedent dans le repo — prevoir une marge sur la phase 3 |
 
 ---
@@ -551,7 +551,7 @@ qu'un faux positif).
 
 ### Phase 1bis (completion SDXL)
 - [ ] img2img / inpainting cables pour SDXL
-- [ ] ControlNet SD fonctionne (reactivation de `disabled_nodes/controlnet/`)
+- [ ] ControlNet SD fonctionne (a reecrire, code WIP supprime)
 - [ ] Memoire et performances mesurees
 
 ### Phases 3-5

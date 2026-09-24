@@ -43,21 +43,9 @@
 │ 🍏 ASDX Multi LoRA Loader                   │ ✅ OK    │ ✅ MLX natif (delta weights) │ FLUX.1 (jusqu'a 5 LoRAs simultanes)            │
 │ 🍏 ASDX LoRA Schedule                       │ ✅ OK    │ ✅ MLX natif (weight delta)  │ FLUX.1 (modulation per-step)                   │
 ├─────────────────────────────────────────────┼──────────┼──────────────────────────────┼────────────────────────────────────────────────┤
-│  CONTROLNET                                  │          │                              │                                                │
-├─────────────────────────────────────────────┼──────────┼──────────────────────────────┼────────────────────────────────────────────────┤
-│ 🍏 ASDX ControlNet Union Loader             │ ✅ OK    │ ✅ MLX natif (ControlNet)    │ FLUX.1 (models ControlNet Union)               │
-│ 🍏 ASDX Apply ControlNet                    │ ✅ OK    │ ✅ MLX natif (residuals)     │ FLUX.1-dev (8 types: pose, depth, soft_edge,   │
-│                                             │          │                              │ line_canny, normal, segment, tile, repaint)     │
-├─────────────────────────────────────────────┼──────────┼──────────────────────────────┼────────────────────────────────────────────────┤
-│  IP-ADAPTER                                  │          │                              │                                                │
-├─────────────────────────────────────────────┼──────────┼──────────────────────────────┼────────────────────────────────────────────────┤
-│ 🍏 ASDX IP-Adapter Loader                   │ ✅ OK    │ ✅ MLX natif (proj weights)  │ FLUX.1 (models IP-Adapter plus)                │
-│ 🍏 ASDX CLIP Vision Encode                  │ ✅ OK    │ ⚠️ MLX (encodage simple)    │ FLUX.1 (images reference pour style)           │
-│ 🍏 ASDX Apply IP-Adapter                    │ ✅ OK    │ ✅ MLX natif (cross-attn)    │ FLUX.1 (injection cross-attention)             │
-├─────────────────────────────────────────────┼──────────┼──────────────────────────────┼────────────────────────────────────────────────┤
 │  IMAGE CHAIN                                 │          │                              │                                                │
 ├─────────────────────────────────────────────┼──────────┼──────────────────────────────┼────────────────────────────────────────────────┤
-│ 🍏 ASDX Image → Latent                      │ ✅ OK    │ ✅ MLX natif (VAE encoder)   │ FLUX.1 (img2img workflow)                      │
+│ 🍏 ASDX Image → Latent                      │ ✅ OK    │ ❌ image seule, sans latent  │ FLUX.1 (img2img workflow)                      │
 │ 🍏 ASDX Mask From Image                     │ ✅ OK    │ ⚠️ PyTorch (tensor ops)     │ Tous (masque binaire depuis image)             │
 │ 🍏 ASDX Mask Blur                           │ ✅ OK    │ ⚠️ PyTorch (conv2d)         │ Tous (flou gaussien sur masque)                │
 │ 🍏 ASDX Image Compositor                    │ ✅ OK    │ ⚠️ PyTorch (tensor ops)     │ Tous (composite image + masque)                │
@@ -80,7 +68,7 @@
 
 | Niveau | Description | Nodes |
 |--------|-------------|---------|
-| **100% MLX natif** | Tout tourne dans MLX, zero copie Unified Memory | Sampler, VAE Encode/Decode, LoRA (3), ControlNet (2), IP-Adapter (3), Diffusion/Checkpoint Loader, Empty Latent, Memory Profiler, Cache Manager |
+| **100% MLX natif** | Tout tourne dans MLX, zero copie Unified Memory | Sampler, VAE Encode/Decode, LoRA (3), Diffusion/Checkpoint Loader, Empty Latent, Memory Profiler, Cache Manager |
 | **Hybride** | Some MLX, some PyTorch MPS | Image Chain (4), Depth Map, Live Preview |
 | **PyTorch MPS (bridge)** | Utilise l'infrastructure ComfyUI standard | CLIP Loader, Dual CLIP Loader, CLIP Text Encode, Conditioning Merger |
 
@@ -88,13 +76,13 @@
 
 ## Compatibilite modeles par fonctionnalite
 
-| Modele | Sampler | LoRA | ControlNet | IP-Adapter | img2img | inpaint | depth |
-|--------|---------|------|------------|------------|---------|---------|-------|
-| FLUX.1-dev | ✅ | ✅ | ✅ | ✅ | ✅ (mode routing) | ❌ | ✅ (via node externe) |
-| FLUX.1-schnell | ✅ | ✅ | ❌ (hard-block) | ✅ | ✅ | ❌ | ❌ |
-| FLUX.1-fill | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ (mode fill) | ❌ |
-| FLUX.1-depth | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ (mode depth) |
-| FLUX.2-Klein | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ | ❌ |
+| Modele | Sampler | LoRA | img2img | inpaint | depth |
+|--------|---------|------|---------|---------|-------|
+| FLUX.1-dev | ✅ | ✅ | ✅ (mode routing) | ❌ | ✅ (via node externe) |
+| FLUX.1-schnell | ✅ | ✅ | ✅ | ❌ | ❌ |
+| FLUX.1-fill | ✅ | ✅ | ✅ | ✅ (mode fill) | ❌ |
+| FLUX.1-depth | ✅ | ✅ | ✅ | ❌ | ✅ (mode depth) |
+| FLUX.2-Klein | ✅ | ✅ | ✅ | ❌ | ❌ |
 
 ---
 
@@ -143,21 +131,6 @@
 | ASDX_MultiLoraLoader | 🍏 ASDX Multi LoRA Loader | `lora.py` | `(asdx_model,)` |
 | ASDX_LoraSchedule | 🍏 ASDX LoRA Schedule | `lora.py` | `(asdx_model,)` |
 
-### ControlNet (2)
-
-| Nom interne | Nom affiche | Fichier | Retourne |
-|-------------|-------------|---------|----------|
-| ASDX_ControlNetUnionLoader | 🍏 ASDX ControlNet Union Loader | `controlnet/__init__.py` | `(controlnet,)` |
-| ASDX_ApplyControlNet | 🍏 ASDX Apply ControlNet | `controlnet/__init__.py` | `(asdx_model,)` |
-
-### IP-Adapter (3)
-
-| Nom interne | Nom affiche | Fichier | Retourne |
-|-------------|-------------|---------|----------|
-| ASDX_IPAdapterLoader | 🍏 ASDX IP-Adapter Loader | `ip_adapter.py` | `(ip_adapter,)` |
-| ASDX_IPAdapterCLIPVisionEncode | 🍏 ASDX CLIP Vision Encode | `ip_adapter.py` | `(mlx_conditioning,)` |
-| ASDX_ApplyIPAdapter | 🍏 ASDX Apply IP-Adapter | `ip_adapter.py` | `(mlx_conditioning,)` |
-
 ### Image Chain (4)
 
 | Nom interne | Nom affiche | Fichier | Retourne |
@@ -187,12 +160,10 @@
 
 | Type | Description | Utilise par |
 |------|-------------|-------------|
-| `asdx_model` | Descriptor modele FLUX (transformer + config + capability) | Loader, LoRA, ControlNet, IP-Adapter, Sampler |
+| `asdx_model` | Descriptor modele FLUX (transformer + config + capability) | Loader, LoRA, Sampler |
 | `mlx_clip` | Handle encodeur de texte (wrapper ComfyUI CLIP) | CLIP Loader, CLIP Text Encode |
 | `mlx_vae` | Handle VAE MLX | Checkpoint Loader |
-| `mlx_conditioning` | Conditioning encodee (sortie CLIP Text Encode) | CLIP Text Encode, IP-Adapter, Sampler |
-| `controlnet` | Model ControlNet charge | ControlNet Loader, Apply ControlNet |
-| `ip_adapter` | Model IP-Adapter charge | IP-Adapter Loader, Apply IP-Adapter |
+| `mlx_conditioning` | Conditioning encodee (sortie CLIP Text Encode) | CLIP Text Encode, Sampler |
 | `mflux_image` | Dataclass image chain (image + latent + mask + depth) | ImageToLatent, MaskFromImage, MaskBlur, Compositor, DepthMap |
 | `LATENT` | Latent ComfyUI standard (dict with samples tensor) | Sampler, VAE Encode/Decode, Empty FLUX Latent |
 | `IMAGE` | Image ComfyUI standard [B,H,W,C] float32 [0,1] | VAE Decode, Image Chain nodes |
@@ -240,13 +211,13 @@
 
 ## Capability Profiles
 
-| Profile | Modele | guidance | img2img | inpaint | depth | controlnet |
-|---------|--------|----------|---------|---------|-------|------------|
-| flux1_dev | FLUX.1-dev | ✅ | ❌ | ❌ | ❌ | ✅ |
-| flux1_schnell | FLUX.1-schnell | ❌ (hard-block) | ❌ | ❌ | ❌ | ❌ |
-| flux1_fill | FLUX.1-fill | ✅ | ✅ | ✅ | ❌ | ❌ |
-| flux1_depth | FLUX.1-depth | ✅ | ✅ | ❌ | ✅ | ❌ |
-| flux2_klein | FLUX.2-Klein | ✅ | ❌ | ❌ | ❌ | ✅ |
+| Profile | Modele | guidance | img2img | inpaint | depth |
+|---------|--------|----------|---------|---------|-------|
+| flux1_dev | FLUX.1-dev | ✅ | ❌ | ❌ | ❌ |
+| flux1_schnell | FLUX.1-schnell | ❌ (hard-block) | ❌ | ❌ | ❌ |
+| flux1_fill | FLUX.1-fill | ✅ | ✅ | ✅ | ❌ |
+| flux1_depth | FLUX.1-depth | ✅ | ✅ | ❌ | ✅ |
+| flux2_klein | FLUX.2-Klein | ✅ | ❌ | ❌ | ❌ |
 
 **Dispatch par nom de fichier :**
 - `fill` → flux1_fill
@@ -271,21 +242,6 @@
 
 ---
 
-## ControlNet Union — types supports
-
-| Type | Index | Description |
-|------|-------|-------------|
-| pose | 0 | Pose skeleton |
-| depth | 1 | Carte de profondeur |
-| soft_edge | 2 | Detection contours doux |
-| line_canny | 3 | Detection contours Canny |
-| normal | 4 | Carte de normales |
-| segment | 5 | Segmentation semantique |
-| tile | 6 | Tile/repaint haute resolution |
-| repaint | 7 | Repaint general |
-
----
-
 ## Chemines modeles attendus
 
 | Type | Dossier ComfyUI | Exemple |
@@ -294,5 +250,3 @@
 | Diffusion | `models/diffusion_models/` ou `models/unet/` | `flux1-dev-fp16.safetensors` |
 | CLIP | `models/text_encoders/` | `clip_l.safetensors`, `t5xxl.safetensors` |
 | LoRA | `models/loras/` | `example_lora.safetensors` |
-| ControlNet | `models/controlnet/` | `controlnet_union.safetensors` |
-| IP-Adapter | `models/ipadapter/` ou `models/unet/` | `ip-adapter-plus.safetensors` |
