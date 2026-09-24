@@ -53,9 +53,10 @@ Your goal is to build high-performance, robust, and clean custom nodes for Comfy
      `ComfyUI and the SceneWorks stack are the reference implementations`.
 
 7. **VAE Encode/Decode Fallbacks**:
-   * `MLXVAE()` (`mlx_vae.py`) is an untrained placeholder with no real weight
-     loading -- it must never be used for actual inference (it silently returns
-     garbage, e.g. raw pixels mislabeled as a latent). Every image<->latent path
+   * There is no MLX VAE: the former `MLXVAE()` / `mlx_vae.py` placeholder (no
+     real weight loading, silently returned garbage such as raw pixels mislabeled
+     as a latent) was deleted in commit 28c4641. Do not reintroduce one without
+     real weights -- see the canon record on VAE-to-MLX ROI. Every image<->latent path
      (`ASDX_VAEEncode`, `ASDX_VAEDecode`, img2img/inpaint noise prep, and the
      Krea2 Identity Edit pixel path) must route through the real ComfyUI
      `comfy.sd.VAE` fallback instead. This bug has

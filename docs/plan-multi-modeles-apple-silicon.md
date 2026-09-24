@@ -87,7 +87,7 @@ apple_silicon_nodes/native/
 ├── weight_format.py     # classification des conventions de quantification
 ├── weight_map.py        # mapping de cles FLUX.1
 ├── flux2/               # FLUX.2-Klein
-├── krea2/               # Krea2 (+ rope.py, text_encoder.py, nag.py)
+├── krea2/               # Krea2 (+ rope.py, text_encoder.py)
 ├── sdxl/                # SDXL UNet
 └── zimage/              # Z-Image (NextDiT)
 ```

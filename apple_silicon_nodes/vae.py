@@ -1,10 +1,8 @@
 """
 VAE Decode / Encode nodes
 =========================
-MLX-native VAE decoding and encoding for FLUX.
-
-Uses the MLX VAE implementation for zero-copy decoding on Apple Silicon,
-bridging only at the input/output boundaries.
+VAE decoding and encoding through ComfyUI's own `comfy.sd.VAE`
+(PyTorch/MPS), bridging only at the input/output boundaries.
 """
 
 from __future__ import annotations
@@ -111,11 +109,7 @@ class ASDX_VAELoader(io.ComfyNode):
 # ── VAE Decode ───────────────────────────────────────────────────────
 
 class ASDX_VAEDecode(io.ComfyNode):
-    """Decode FLUX latents to images using MLX VAE.
-
-    The VAE decoder runs entirely in MLX, only the final image tensor
-    is converted to PyTorch for ComfyUI downstream nodes.
-    """
+    """Decode latents to images using ComfyUI's VAE (PyTorch/MPS)."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
@@ -204,10 +198,7 @@ class ASDX_VAEDecode(io.ComfyNode):
 # ── VAE Encode ───────────────────────────────────────────────────────
 
 class ASDX_VAEEncode(io.ComfyNode):
-    """Encode images to FLUX latents using MLX VAE.
-
-    The encoding runs in MLX for Apple Silicon acceleration.
-    """
+    """Encode images to latents using ComfyUI's VAE (PyTorch/MPS)."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
