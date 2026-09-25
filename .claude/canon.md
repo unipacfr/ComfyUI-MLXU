@@ -121,3 +121,7 @@ Any model whose `comfy.latent_formats.LatentFormat` subclass defines `latents_me
 ## Cross-family native helpers live in the leaf module native/common.py
 kind: constraint | date: 2026-09-24 | status: canon
 Helpers shared by several `native/<family>/` modules (`to_mlx_dtype`, `timestep_embedding`, `rms_norm`, `_check_weight_match`) go in `native/common.py`, which imports only mlx and the stdlib -- never in `native/__init__.py`, and never copied per family. Because: `native/__init__.py` eagerly imports every family, and the `tests/support/` loaders register `native` as an empty namespace package to bypass it, so a helper placed there breaks isolated family tests; that constraint had produced 9 copies of `mlx_dtype` and 5 of `timestep_embedding` before the 2026-09-24 dedupe (commit a9e5398).
+
+## Qwen Image 2.1's text encoder is ComfyUI's CLIP, not an MLX port
+kind: choice | date: 2026-09-25 | status: canon
+Qwen Image 2.1 loads its Qwen3-VL-8B text encoder through `ASDX_CLIPLoader` (`type="qwen_image"`) and `ASDX_CLIPTextEncode`; the dedicated MLX port and its node pair were deleted. Because: per "Porting CLIP/T5/Qwen text encoders to MLX has weak memory ROI, except FP8 sources" the port bought nothing, and it silently diverged -- its math matched ComfyUI (min row cosine 0.99994) but it fed the DiT 33 rows instead of 19, missing the system-turn drop that lives in `QwenImage21TEModel.encode_token_weights`, outside the model itself.

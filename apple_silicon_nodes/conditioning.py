@@ -329,7 +329,7 @@ _SINGLE_CLIP_TYPES: list[str] = [
     "chroma",             # Chroma
     "ace",                # ACE
     "omnigen2",           # OmniGen2 — qwen vl 2.5 3B
-    "qwen_image",         # Qwen Image
+    "qwen_image",         # Qwen Image, Qwen Image 2.1 (with qwen3vl_8b)
     "hunyuan_image",      # Hunyuan Image — qwen2.5vl + byt5
     "hunyuan_video_15",   # Hunyuan Video 1.5
     "ovis",               # OVIS

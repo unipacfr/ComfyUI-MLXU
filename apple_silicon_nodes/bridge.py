@@ -458,20 +458,20 @@ def conditioning_flux2_to_mlx(
 def conditioning_qwen_image21_to_mlx(conditioning: Any, precision: mx.Dtype) -> mx.array:
     """Extract the Qwen3-VL-8B hidden states for Qwen Image 2.1's DiT.
 
-    Unlike Flux2/SDXL (which route through ComfyUI's real CLIP pipeline and a
-    standard conditioning list), Qwen Image 2.1's text encoder is a native MLX
-    module wired through a dedicated pair of nodes
-    (`ASDX_QwenImage21TextEncoderLoader`/`ASDX_QwenImage21TextEncode`, same pattern
-    as MiniMax H3) -- `conditioning` here is that pair's own dict output, not a
-    ComfyUI CONDITIONING list. `hidden_states` is `[S, hidden_size]` (no batch dim,
-    brick 1's convention); this adds one."""
-    if not isinstance(conditioning, dict) or conditioning.get("type") != "qwen_image21":
+    `conditioning` is `ASDX_CLIPTextEncode`'s output for an `ASDX_CLIPLoader`
+    with `type="qwen_image"` -- ComfyUI's real `QwenImage21TEModel`
+    (`comfy/text_encoders/qwen_image21.py`), which already drops the system turn.
+    `QwenImage21.extra_conds` (`comfy/model_base.py`) passes `cross_attn` through
+    unpadded, so this is a plain torch -> MLX conversion. `[1, S, 4096]`."""
+    if isinstance(conditioning, dict):
+        conditioning = conditioning.get("conditioning", conditioning)
+    cond_np = _to_numpy(conditioning[0][0])
+    if cond_np.ndim != 3 or cond_np.shape[-1] != 4096:
         raise RuntimeError(
-            "ASDX: Qwen Image 2.1 sampler expected the output of ASDX_QwenImage21TextEncode "
-            f"(dict with type='qwen_image21'), got {conditioning!r}."
+            "ASDX: Qwen Image 2.1 needs Qwen3-VL-8B conditioning [1,S,4096] from "
+            f"ASDX_CLIPLoader(type='qwen_image') -> ASDX_CLIPTextEncode, got {cond_np.shape}."
         )
-    hidden_states = conditioning["hidden_states"]
-    cond = hidden_states[None].astype(precision)
+    cond = mx.array(cond_np).astype(precision)
     mx.eval(cond)
     return cond
 

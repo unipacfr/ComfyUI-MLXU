@@ -30,17 +30,20 @@ def _stub_prepare_noise(latent_image, seed, noise_inds=None):
 _comfy_sample_stub.prepare_noise = _stub_prepare_noise
 
 
-def test_conditioning_qwen_image21_to_mlx_adds_batch_dim():
-    hidden_states = mx.random.normal((7, 4096))
-    conditioning = {"type": "qwen_image21", "hidden_states": hidden_states, "text": "a cat"}
+def test_conditioning_qwen_image21_to_mlx_converts_clip_text_encode_output():
+    hidden = torch.randn(1, 7, 4096)
+    conditioning = {"type": "clip", "conditioning": [[hidden, {"pooled_output": None}]], "text": "a cat"}
     cond = bridge_mod.conditioning_qwen_image21_to_mlx(conditioning, mx.float16)
     assert cond.shape == (1, 7, 4096)
     assert cond.dtype == mx.float16
+    np.testing.assert_allclose(np.array(cond.astype(mx.float32)), hidden.numpy(), atol=2e-3)
 
 
-def test_conditioning_qwen_image21_to_mlx_rejects_wrong_type():
-    with pytest.raises(RuntimeError, match="qwen_image21"):
-        bridge_mod.conditioning_qwen_image21_to_mlx({"type": "flux2"}, mx.float16)
+def test_conditioning_qwen_image21_to_mlx_rejects_wrong_encoder():
+    # e.g. clip_l (768-dim) loaded with the wrong clip_type
+    conditioning = {"type": "clip", "conditioning": [[torch.randn(1, 77, 768), {}]]}
+    with pytest.raises(RuntimeError, match="qwen_image"):
+        bridge_mod.conditioning_qwen_image21_to_mlx(conditioning, mx.float16)
 
 
 def test_mlx_to_comfy_latent_qwen_image21_shape():
