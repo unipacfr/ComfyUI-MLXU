@@ -71,3 +71,11 @@ def test_anima_sgm_uniform_matches_comfy_reference():
 def test_anima_simple_30_matches_comfy_reference():
     got = scheduling.calculate_sigmas("anima", "simple", 30)
     np.testing.assert_allclose(got, _SIMPLE_30, atol=1e-5)
+
+
+def test_zimage_normal_matches_anima_reference():
+    """Z-Image (multiplier 1.0, shift 3.0) shares the same ModelSamplingDiscreteFlow
+    curve family as Anima -- pin it to the same reference list so a later split of
+    the shared branch cannot silently revert Z-Image."""
+    got = scheduling.calculate_sigmas("zimage", "normal", 30)
+    np.testing.assert_allclose(got, _NORMAL_30, atol=1e-5)

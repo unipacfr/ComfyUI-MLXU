@@ -55,6 +55,12 @@ def test_conditioning_wrong_width_names_the_loader():
         bridge.conditioning_anima_to_mlx(_cond(hidden=4096), mx.bfloat16)
 
 
+def test_conditioning_multi_entry_rejected():
+    combined = _cond() + _cond()
+    with pytest.raises(RuntimeError, match="ConditioningCombine"):
+        bridge.conditioning_anima_to_mlx(combined, mx.bfloat16)
+
+
 def test_latent_out_dewhitens_wan21():
     z = mx.zeros((1, 16, 4, 4))
     out = bridge.mlx_to_comfy_latent_anima(z, {"samples": z})["samples"]

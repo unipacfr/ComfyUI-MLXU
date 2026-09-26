@@ -67,6 +67,17 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+def _relative_l2(ref: np.ndarray, got: np.ndarray) -> float:
+    ref64, got64 = ref.astype(np.float64), got.astype(np.float64)
+    return float(np.linalg.norm(got64 - ref64) / np.linalg.norm(ref64))
+
+
+def _per_channel_min_cosine(ref: np.ndarray, got: np.ndarray) -> float:
+    """ref/got are [B,C,H,W] -- cosine per output channel, minimum across channels."""
+    cosines = [_cosine(ref[:, c], got[:, c]) for c in range(ref.shape[1])]
+    return float(min(cosines))
+
+
 def _make_inputs() -> dict[str, np.ndarray]:
     rng = np.random.default_rng(SEED)
     return dict(
@@ -161,6 +172,14 @@ def run_mlx(checkpoint: str, scratch: Path) -> None:
     np.save(scratch / "out_mlx_bf16.npy", out_bf16)
     print(f"[mlx] saved bf16/gpu output -> {scratch / 'out_mlx_bf16.npy'} (informational only)")
 
+    del model_bf16
+    mx.clear_cache()
+
+    model_fp16 = weight_map.load_anima_checkpoint(checkpoint, dtype="float16")
+    out_fp16 = forward(model_fp16, mx.stream(mx.gpu))
+    np.save(scratch / "out_mlx_fp16.npy", out_fp16)
+    print(f"[mlx] saved fp16/gpu output -> {scratch / 'out_mlx_fp16.npy'} (informational only)")
+
 
 def compare(scratch: Path) -> None:
     ref = np.load(scratch / "out_comfy_fp32.npy")
@@ -174,7 +193,28 @@ def compare(scratch: Path) -> None:
     if bf16_path.exists():
         bf16 = np.load(bf16_path)
         cos_bf16 = _cosine(ref, bf16)
-        print(f"[parity] bf16 comfy-vs-mlx (informational, no threshold): cosine={cos_bf16:.8f}")
+        min_cos_bf16 = _per_channel_min_cosine(ref, bf16)
+        rel_l2_bf16 = _relative_l2(ref, bf16)
+        print(
+            f"[parity] bf16 comfy-vs-mlx (informational, no threshold): cosine={cos_bf16:.8f}, "
+            f"per-channel min cosine={min_cos_bf16:.8f}, relative L2={rel_l2_bf16:.6f}, "
+            f"isfinite={bool(np.isfinite(bf16).all())}"
+        )
+
+    fp16_path = scratch / "out_mlx_fp16.npy"
+    if fp16_path.exists():
+        fp16 = np.load(fp16_path)
+        finite = bool(np.isfinite(fp16).all())
+        if finite:
+            cos_fp16 = _cosine(ref, fp16)
+            min_cos_fp16 = _per_channel_min_cosine(ref, fp16)
+            rel_l2_fp16 = _relative_l2(ref, fp16)
+            print(
+                f"[parity] fp16 comfy-vs-mlx (informational, no threshold): cosine={cos_fp16:.8f}, "
+                f"per-channel min cosine={min_cos_fp16:.8f}, relative L2={rel_l2_fp16:.6f}, isfinite={finite}"
+            )
+        else:
+            print("[parity] fp16 comfy-vs-mlx: output is NOT finite (NaN/Inf present)")
 
 
 def main() -> None:

@@ -42,7 +42,7 @@ def _cond(sign):
     return [[torch.full((1, 3, 1024), sign), {"t5xxl_ids": torch.tensor([1]), "t5xxl_weights": torch.tensor([1.0])}]]
 
 
-def _core(guidance, negative=True, width=128, height=128):
+def _core(guidance, negative=True, width=128, height=128, mode="auto", image=None, mask=None):
     positive = {"conditioning": _cond(1.0)}
     if negative:
         positive["_negative"] = _cond(-1.0)
@@ -74,6 +74,9 @@ def _core(guidance, negative=True, width=128, height=128):
         sampler_name="euler",
         scheduler_name="normal",
         memory_shape=None,
+        mode=mode,
+        image=image,
+        mask=mask,
     )
 
 
@@ -121,3 +124,19 @@ def test_cfg_without_negative_raises():
 def test_odd_size_raises_before_compute():
     with pytest.raises(Exception, match="16"):
         _core(guidance=1.0, width=120, height=128).run(steps=1, seed=0)
+
+
+def test_img2img_mode_raises():
+    image = torch.zeros(1, 128, 128, 3)
+    with pytest.raises(RuntimeError, match="text-to-image"):
+        _core(guidance=1.0, image=image).run(steps=1, seed=0)
+
+
+def test_explicit_inpaint_mode_raises():
+    with pytest.raises(RuntimeError, match="text-to-image"):
+        _core(guidance=1.0, mode="inpaint").run(steps=1, seed=0)
+
+
+def test_txt2img_auto_mode_with_no_image_passes():
+    core = _core(guidance=1.0, negative=False, mode="auto", image=None, mask=None)
+    core.run(steps=1, seed=0)

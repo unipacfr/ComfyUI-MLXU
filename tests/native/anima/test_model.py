@@ -88,7 +88,7 @@ def test_forward_matches_comfy(hw):
         got = np.array(ours(mx.array(x.numpy()[:, :, 0]), mx.array(sigma.numpy()), ctx))
     assert got.shape == want.shape
     max_abs_diff = np.max(np.abs(got - want))
-    np.testing.assert_allclose(got, want, atol=5e-4, rtol=5e-4), f"max abs diff {max_abs_diff}"
+    np.testing.assert_allclose(got, want, atol=5e-4, rtol=5e-4, err_msg=f"max abs diff {max_abs_diff}")
 
 
 def test_perturbed_weight_is_detected():
@@ -125,3 +125,67 @@ def test_rejects_odd_latent_grid():
     ours = _ours()
     with pytest.raises(ValueError, match="even"):
         ours(mx.zeros((1, 16, 7, 6)), mx.array([0.5]), mx.zeros((1, 512, 1024)))
+
+
+def test_batch2_matches_stacked_batch1():
+    """ComfyUI repeats conditioning to the latent batch size; a batch-1 context must
+    broadcast across a batch-B latent instead of crashing the cross-attention reshape."""
+    ours = _ours()
+    with CPU:
+        x1, x2 = mx.random.normal((1, 16, 8, 6), key=mx.random.key(0)), mx.random.normal((1, 16, 8, 6), key=mx.random.key(1))
+        sigma1, sigma2 = mx.array([0.5]), mx.array([0.3])
+        ctx = mx.random.normal((1, 512, 1024), key=mx.random.key(2))
+
+        out1 = np.array(ours(x1, sigma1, ctx))
+        out2 = np.array(ours(x2, sigma2, ctx))
+
+        x_batch = mx.concatenate([x1, x2], axis=0)
+        sigma_batch = mx.concatenate([sigma1, sigma2], axis=0)
+        out_batch = np.array(ours(x_batch, sigma_batch, ctx))
+
+    np.testing.assert_allclose(out_batch[0], out1[0], atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(out_batch[1], out2[0], atol=1e-5, rtol=1e-5)
+
+
+def test_fp16_output_finite_and_close_to_fp32():
+    """Default loader precision is float16 (config.py dtype default is bfloat16,
+    but the loader is commonly asked for float16); the fp32-residual-stream fp16
+    path (model.py: `if dtype == mx.float16`) was never measured on the tiny
+    random-weight model before this test."""
+    cfg32 = config_mod.AnimaConfig(dtype="float32", model_channels=WIDTH, num_blocks=BLOCKS, num_heads=HEADS)
+    cfg16 = config_mod.AnimaConfig(dtype="float16", model_channels=WIDTH, num_blocks=BLOCKS, num_heads=HEADS)
+    ours32 = model_mod.AnimaTransformer(cfg32)
+    ours16 = model_mod.AnimaTransformer(cfg16)
+
+    from mlx.utils import tree_flatten, tree_unflatten
+    # copy fp32 weights into the fp16 model (cast down), same values, different dtype.
+    flat32 = dict(tree_flatten(ours32.parameters()))
+    ours16.update(tree_unflatten([(k, v.astype(mx.float16)) for k, v in flat32.items()]))
+
+    x = mx.random.normal((1, 16, 8, 6), key=mx.random.key(5))
+    sigma = mx.array([0.6])
+    qwen = mx.random.normal((1, 9, 1024), key=mx.random.key(6))
+    ids = mx.array(np.random.default_rng(7).integers(0, 32128, (1, 6)).astype(np.int32))
+
+    with CPU:
+        ctx32 = ours32.encode_context(qwen, ids)
+        out32 = np.array(ours32(x, sigma, ctx32)).astype(np.float64)
+
+        ctx16 = ours16.encode_context(qwen.astype(mx.float16), ids)
+        out16 = np.array(ours16(x.astype(mx.float16), sigma, ctx16).astype(mx.float32)).astype(np.float64)
+
+    assert np.isfinite(out16).all()
+    max_abs_diff = float(np.max(np.abs(out32 - out16)))
+    cos = float(np.dot(out32.ravel(), out16.ravel()) /
+                (np.linalg.norm(out32.ravel()) * np.linalg.norm(out16.ravel())))
+    # Measured on this tiny model: max abs diff ~1.5e-3, cosine ~0.9999997.
+    # Tolerance below has ~1 order of magnitude margin above the measured value.
+    print(f"fp16 vs fp32 tiny-model: max abs diff={max_abs_diff}, cosine={cos}")
+    assert cos > 0.9999, f"fp16 vs fp32 cosine too low: {cos}"
+    assert max_abs_diff < 0.05, f"fp16 vs fp32 max abs diff too high: {max_abs_diff}"
+
+
+def test_context_batch_mismatch_raises():
+    ours = _ours()
+    with pytest.raises(ValueError, match="batch"):
+        ours(mx.zeros((3, 16, 8, 6)), mx.array([0.5, 0.5, 0.5]), mx.zeros((2, 512, 1024)))
