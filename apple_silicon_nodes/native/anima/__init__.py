@@ -7,5 +7,12 @@ from __future__ import annotations
 
 from .config import AnimaConfig, detect_anima_config
 from .model import AnimaTransformer
+from .weight_map import load_anima_checkpoint, strip_anima_prefix
 
-__all__ = ["AnimaConfig", "detect_anima_config", "AnimaTransformer"]
+__all__ = [
+    "AnimaConfig",
+    "detect_anima_config",
+    "AnimaTransformer",
+    "load_anima_checkpoint",
+    "strip_anima_prefix",
+]
