@@ -34,6 +34,10 @@ FLUX2_VAE_DOWNSCALE = 16
 # operates on the latent grid directly (no patch packing) — comfy/latent_formats.py.
 QWEN_IMAGE21_LATENT_CHANNELS = 64
 QWEN_IMAGE21_VAE_DOWNSCALE = 16
+# Anima: Wan21's 16ch/8x VAE latent (see native/config.py::process_wan21_latent_out
+# for the shared de-whitening), DiT patchifies 2x2 internally.
+ANIMA_LATENT_CHANNELS = 16
+ANIMA_VAE_DOWNSCALE = 8
 
 # ComfyUI image format: [B, H, W, C] range [0, 1] float32
 # FLUX VAE input/output expects [B, C, H, W] range [-1, 1] float16
@@ -476,6 +480,30 @@ def conditioning_qwen_image21_to_mlx(conditioning: Any, precision: mx.Dtype) -> 
     return cond
 
 
+def conditioning_anima_to_mlx(conditioning: Any, precision: mx.Dtype) -> tuple[mx.array, mx.array, mx.array]:
+    """Anima's text path: ComfyUI's `AnimaTEModel` (Qwen3-0.6B, via
+    `ASDX_CLIPLoader`) gives `[1,S,1024]` hidden states plus `t5xxl_ids`/
+    `t5xxl_weights` in the cond dict (`comfy/text_encoders/anima.py`). The MLX
+    LLM adapter consumes all three (`AnimaTransformer.encode_context`)."""
+    if isinstance(conditioning, dict):
+        conditioning = conditioning.get("conditioning", conditioning)
+    hidden_np = _to_numpy(conditioning[0][0])
+    extra = conditioning[0][1] if len(conditioning[0]) > 1 else {}
+    if hidden_np.ndim != 3 or hidden_np.shape[-1] != 1024 or "t5xxl_ids" not in extra:
+        raise RuntimeError(
+            "ASDX: Anima needs the Qwen3-0.6B Anima text encoder's conditioning ([1,S,1024] + "
+            f"t5xxl_ids) from ASDX_CLIPLoader -> ASDX_CLIPTextEncode; got hidden {hidden_np.shape}, "
+            f"keys {sorted(extra)}."
+        )
+    ids = mx.array(_to_numpy(extra["t5xxl_ids"]).astype(np.int32)[None])
+    weights_src = extra.get("t5xxl_weights")
+    weights = (mx.ones(ids.shape, dtype=mx.float32) if weights_src is None
+               else mx.array(_to_numpy(weights_src).astype(np.float32)[None]))
+    hidden = mx.array(hidden_np).astype(precision)
+    mx.eval(hidden, ids, weights)
+    return hidden, ids, weights
+
+
 def mlx_to_comfy_latent_flux2(
     latents: mx.array,
     height: int,
@@ -559,6 +587,18 @@ def mlx_to_comfy_latent_qwen_image21(latents: mx.array, template: dict[str, Any]
     samples = torch.from_numpy(np.array(latents, dtype=np.float32))
     out = dict(template)
     out["samples"] = samples
+    return out
+
+
+def mlx_to_comfy_latent_anima(latents: mx.array, template: dict[str, Any]) -> dict[str, Any]:
+    """[B,16,h,w] model-space latent -> true VAE space (`latent_formats.Wan21.process_out`,
+    applied once like `comfy/samplers.py`'s `process_latent_out`)."""
+    from .native.config import process_wan21_latent_out
+
+    samples = process_wan21_latent_out(latents.astype(mx.float32))
+    mx.eval(samples)
+    out = dict(template)
+    out["samples"] = torch.from_numpy(np.array(samples, dtype=np.float32))
     return out
 
 
@@ -792,6 +832,28 @@ def prepare_noise_from_latent_qwen_image21(
     noise_mlx = mx.array(noise_np).astype(precision)
     mx.eval(noise_mlx)
     return noise_mlx, height, width, (latent_h, latent_w)
+
+
+def prepare_noise_from_latent_anima(
+    latent: dict[str, Any], seed: int, precision: mx.Dtype
+) -> tuple[mx.array, int, int, tuple[int, int]]:
+    """Unit-gaussian noise for Anima, NCHW (the DiT patchifies internally)."""
+    if "samples" not in latent:
+        raise RuntimeError("ASDX: latent must be a Comfy LATENT with 'samples'.")
+    samples = latent["samples"]
+    if samples.ndim != 4 or tuple(samples.shape)[1] != ANIMA_LATENT_CHANNELS:
+        raise RuntimeError(
+            f"ASDX: needs {ANIMA_LATENT_CHANNELS}-channel Anima latent (ASDX Empty Latent, "
+            f"latent_format='anima'), got {tuple(samples.shape)}"
+        )
+    import comfy.sample
+    batch_inds = latent.get("batch_index") if "batch_index" in latent else None
+    noise = comfy.sample.prepare_noise(samples, int(seed), batch_inds)
+    noise_np = _to_numpy(noise)
+    _, _, latent_h, latent_w = noise_np.shape
+    noise_mlx = mx.array(noise_np).astype(precision)
+    mx.eval(noise_mlx)
+    return noise_mlx, latent_h * ANIMA_VAE_DOWNSCALE, latent_w * ANIMA_VAE_DOWNSCALE, (latent_h, latent_w)
 
 
 # ── Memory management ────────────────────────────────────────────────

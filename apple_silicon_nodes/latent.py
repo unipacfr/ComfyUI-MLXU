@@ -53,6 +53,8 @@ class ASDX_EmptyLatent(io.ComfyNode):
         # 64ch/16x VAE, no patchify (see bridge.py::QWEN_IMAGE21_LATENT_CHANNELS/
         # QWEN_IMAGE21_VAE_DOWNSCALE) -- confirmed via real comfy.sd.VAE.
         "qwen_image21": (64, 16),
+        # Wan21 16ch/8x VAE latent; the DiT patchifies 2x2 internally.
+        "anima": (16, 8),
     }
 
     @classmethod
