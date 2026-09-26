@@ -51,6 +51,7 @@ class LoRAFamilySignature:
 # share the exact double_blocks/single_blocks key namespace a plain "flux1"
 # LoRA targets, so they must not be flagged as a mismatch.
 _LORA_COMPATIBLE_BASE: dict[str, str] = {
+    "anima": "anima",
     "flux1": "flux1",
     "flux1_fill": "flux1",
     "flux1_depth": "flux1",
@@ -85,6 +86,12 @@ _LORA_COMPATIBLE_BASE: dict[str, str] = {
 # absent -- `_check_lora_compatibility` cross-checks actual block COUNTS
 # against the loaded model's config before refusing a flux1/flux2 mismatch
 # found here, to catch this ambiguity.
+_ANIMA_LORA_KEY_RE = re.compile(
+    r"blocks[._]\d+[._](?:(?:self|cross)_attn[._]output_proj|adaln_modulation_(?:self_attn|cross_attn|mlp))"
+    r"|llm_adapter[._]"
+)
+
+
 def detect_lora_family(path: Path) -> LoRAFamilySignature:
     """Header-only (no tensor data) detection of which base family a LoRA
     file targets, from distinctive key fragments. Zero or multiple matching
@@ -111,6 +118,11 @@ def detect_lora_family(path: Path) -> LoRAFamilySignature:
     # txt_attn.qkv, so this never collides with the flux1 signature above.
     if any(".attn.wq." in k or ".attn.wk." in k or ".attn.wv." in k for k in keys):
         matches["krea2"] = "attn.wq/wk/wv"
+    # Anima (Cosmos-Predict2 DiT): `output_proj` and the per-block
+    # `adaln_modulation_{self_attn,cross_attn,mlp}` lists are Cosmos-only names
+    # (dotted or kohya-flat), `llm_adapter` is Anima's own text adapter.
+    if any(_ANIMA_LORA_KEY_RE.search(k) for k in keys):
+        matches["anima"] = "blocks.*.output_proj/adaln_modulation_*/llm_adapter"
 
     if len(matches) != 1:
         return LoRAFamilySignature(family="unknown", evidence=tuple(sorted(matches)))
@@ -1641,6 +1653,101 @@ def _apply_lora_residual_to_zimage(transformer: Any, lora: "LoRAAdapter") -> Any
     return new_transformer
 
 
+def _is_text_encoder_lora_key(key: str) -> bool:
+    """Kohya `lora_te*` / ComfyUI `text_encoders.*` (`qwen3_06b`) keys.
+
+    `_load_lora_file` has no DiT/TE split -- these land in `lora.factors`
+    beside the DiT keys -- while `_apply_lora_to_clip` re-reads the raw file
+    on its own. So they are not unrouted DiT keys for the strict check below.
+    """
+    return key.startswith("lora_te") or "text_encoder" in key or "qwen3_06b" in key
+
+
+def _apply_lora_residual_to_anima(transformer: Any, lora: "LoRAAdapter") -> Any:
+    """Anima forward-time-residual LoRA attach, targets enumerated from the
+    live module tree rather than a hand-written table.
+
+    Every `nn.Linear` reachable from `transformer` is probed under its dotted
+    native name (`_lookup_native_or_kohya` / `_lookup_lokr` cover dotted,
+    PEFT-after-prefix-strip and kohya-flat). Anima keeps several Sequentials
+    as PLAIN python lists (`adaln_modulation_*`, `final_layer.adaln_modulation`,
+    `t_embedder`, `x_embedder.proj`, the adapter's `mlp`), which the shared
+    `_adapt_leaf` (`.layers`-only) would silently skip -- so this walks lists
+    and modules itself, cloning only the path down to each touched leaf.
+    Returns a NEW transformer; untouched sub-trees are shared by reference.
+
+    Strict routing (mlx-gen `adapters.rs`): any non-text-encoder key left
+    unconsumed raises instead of reporting a partial "attached N/M".
+    """
+    present = {*lora.factors, *lora.deltas, *lora.lokr_factors, *lora.loha_factors}
+    consumed: set[str] = set()
+
+    def _consume(native_key: str) -> None:
+        # The spelling the lookups resolved: dotted first, then kohya-flat.
+        stem, _, suffix = native_key.rpartition(".")
+        consumed.add(native_key if native_key in present
+                     else f"lora_unet_{stem.replace('.', '_')}.{suffix}")
+
+    def _attach(linear: nn.Linear, name: str) -> nn.Linear:
+        key = f"{name}.weight"
+        lokr = _lookup_lokr(lora, key)
+        pair, delta = (None, None) if lokr is not None else _lookup_native_or_kohya(lora, key)
+        _, bias = _lookup_native_or_kohya(lora, f"{name}.bias")
+        if lokr is None and pair is None and delta is None and bias is None:
+            return linear
+        leaf = _ensure_adaptable(linear)
+        if lokr is not None:
+            _upsert_lokr_factor(leaf, lokr[0], lokr[1], lora.scale)
+        elif pair is not None:
+            _upsert_lora_factor(leaf, pair[0], pair[1], lora.scale)
+        elif delta is not None:
+            leaf.merge_delta(delta, lora.scale)
+        if lokr is not None or pair is not None or delta is not None:
+            _consume(key)
+        # A bias delta on a bias-free Linear stays unconsumed -> strict error.
+        if bias is not None and leaf.merge_bias_delta(bias, lora.scale):
+            _consume(f"{name}.bias")
+        return leaf
+
+    def _walk(node: Any, name: str) -> Any:
+        """Return `node` itself when nothing under it changed, else a clone."""
+        if isinstance(node, nn.Linear):
+            return _attach(node, name)
+        if isinstance(node, list):
+            new = [_walk(child, f"{name}.{i}") for i, child in enumerate(node)]
+            return new if any(n is not o for n, o in zip(new, node)) else node
+        if not isinstance(node, nn.Module):
+            return node
+        changed = {}
+        for key, child in node.items():
+            if isinstance(child, (nn.Module, list)):
+                new_child = _walk(child, f"{name}.{key}" if name else key)
+                if new_child is not child:
+                    changed[key] = new_child
+        if not changed:
+            return node
+        clone = copy.copy(node)
+        for key, new_child in changed.items():
+            setattr(clone, key, new_child)
+        return clone
+
+    new_transformer = _walk(transformer, "")
+
+    unrouted = sorted(k for k in present - consumed if not _is_text_encoder_lora_key(k))
+    if unrouted:
+        raise RuntimeError(
+            f"ASDX: LoRA '{lora.name}' has {len(unrouted)} unrouted key(s) that match no "
+            f"Anima module (e.g. {', '.join(unrouted[:5])}) -- refusing a partial apply."
+        )
+    if not consumed:
+        print("[ASDX] LoRA: no matching weights found")
+        return transformer
+    adapter = sum(1 for k in consumed if k.startswith(("llm_adapter.", "lora_unet_llm_adapter_")))
+    print(f"[ASDX] LoRA (residual, Anima): attached {len(consumed)}/{len(consumed)} adapters "
+          f"(dit={len(consumed) - adapter}, llm_adapter={adapter})")
+    return new_transformer
+
+
 def _apply_lora_to_minimax_h3(transformer: Any, lora: "LoRAAdapter", config: Any) -> Any:
     """Merge LoRA deltas into MiniMax H3's DiT, dequantizing/requantizing
     the four big per-block linears (`attn.qkv_proj`, `attn.out_proj`,
@@ -2389,21 +2496,6 @@ class ASDX_LoraLoader(io.ComfyNode):
         this is cheap relative to a real checkpoint reload — only the
         LoRA-targeted arrays are freshly computed.
         """
-        if isinstance(transformer, AnimaTransformer):
-            # Anima has no Phase 1-3 forward-time residual and no merge branch
-            # below (its DiT weight names don't match any of the
-            # double_blocks./img_attn./etc. patterns those branches key on) --
-            # detect_lora_family also has no Anima signature, so falling
-            # through here would either silently no-op or misfile the LoRA
-            # under a generic name-merge. Every LoRA application path (static
-            # ASDX_LoraLoader, ASDX_MultiLoraLoader, and the per-step
-            # ASDX_LoraSchedule rescale in sampler/core.py::_update_lora_schedule)
-            # calls this one staticmethod, so the guard here covers all of them.
-            raise RuntimeError(
-                "ASDX: LoRA is not supported for Anima yet -- remove the LoRA "
-                "loader or use ComfyUI's native nodes for this model."
-            )
-
         from mlx.utils import tree_flatten, tree_unflatten
 
         if not lora.deltas and not lora.factors and not lora.lokr_factors \
@@ -2435,6 +2527,10 @@ class ASDX_LoraLoader(io.ComfyNode):
             # Z-Image -- Phase 3 forward-time residual, see canon and the
             # module comment above `_apply_lora_residual_to_zimage`.
             return _apply_lora_residual_to_zimage(transformer, lora)
+        if isinstance(transformer, AnimaTransformer):
+            # Walks the live module tree (plain-list Sequentials included)
+            # and refuses unrouted keys, see `_apply_lora_residual_to_anima`.
+            return _apply_lora_residual_to_anima(transformer, lora)
         if isinstance(transformer, MiniMaxH3Model):
             # MiniMax H3's DiT keeps its 4 big per-block linears in MLX's
             # quantized format (memory, not a Phase 1-3 residual choice) --
