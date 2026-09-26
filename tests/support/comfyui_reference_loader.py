@@ -77,6 +77,23 @@ def load_real_comfy_text_encoders():
     return minimax, qwen_vl, llama, ops
 
 
+def load_real_comfy_anima():
+    """Real `comfy.ldm.anima.model` + `comfy.ops`, for Anima parity tests."""
+    if not _COMFYUI_ROOT.exists() or not _COMFYUI_VENV_SITE_PACKAGES.exists():
+        pytest.skip("ComfyUI install not present on this machine")
+    for name in list(sys.modules):
+        if name == "comfy" or name.startswith("comfy."):
+            del sys.modules[name]
+    sys.path.insert(0, str(_COMFYUI_ROOT))
+    sys.path.insert(0, str(_COMFYUI_VENV_SITE_PACKAGES))
+    try:
+        import comfy.ldm.anima.model as anima_model
+        import comfy.ops as ops
+    except ImportError as e:
+        pytest.skip(f"comfy.ldm.anima.model not importable: {e}")
+    return anima_model, ops
+
+
 _COMFYUI_NAMESPACES = (
     "comfy", "comfy_extras", "comfy_api", "comfy_execution", "comfy_aimdo", "comfy_kitchen",
     "nodes", "folder_paths", "server", "execution", "app",
