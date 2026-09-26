@@ -18,6 +18,7 @@ Inspired by [SDMLX](https://github.com/elef4/SDMLX), this project takes the core
 | Z-Image (+ turbo) | 16ch | Distinct patch-token axis order from FLUX |
 | Flux2 / Klein | 128ch | 16x VAE downscale |
 | SDXL (incl. Illustrious/Pony/NoobAI-style) | 4ch | Direct UNet latent grid, no 2x2 patchify |
+| Anima (+ Turbo, int8 convrot) | 16ch | Cosmos-Predict2 MiniTrainDIT + LLM adapter; Qwen3-0.6B text encoder stays in ComfyUI |
 
 Model family is auto-detected from the checkpoint filename/keys. Quantized checkpoints
 (FP8_SCALED, INT8 ConvRot/tensorwise) are dequantized on load — the format is classified
@@ -101,6 +102,9 @@ Ported from ComfyUI's own sampler/scheduler algorithms (`comfy/k_diffusion/
 sampling.py`, `comfy/samplers.py`) and verified numerically against them.
 TeaCache/SeaCache require `sampler_name` in `euler`/`ddim` (their step-skip
 heuristic assumes a single, stateless model call per step).
+Z-Image's and Anima's `normal` (and other) sigma schedules now port ComfyUI's
+`ModelSamplingDiscreteFlow` exactly (1000-step table, multiplier 1.0); Z-Image
+renders with a given seed/scheduler differ slightly from before this change.
 
 Krea2 Identity Edit: the recommended path is the dedicated
 `🍏 ASDX Krea2 Identity Edit` node — wire your source **image** + the VAE into
@@ -220,6 +224,29 @@ negative/CFG (the model has no guidance embedding).
 Minimal graph: `CLIP Loader` (`qwen_image`) -> `CLIP Text Encode` -> `Sampler` (with `Diffusion Loader`'s
 `model` and `Empty Latent`'s `latent` as the other two required inputs) -> `VAE Decode (MLX)`
 (with `VAE Loader`'s `vae`) -> `SaveImage`.
+
+## Anima (Apple Silicon native)
+
+Text-to-image, run on the native MLX Anima DiT (Cosmos-Predict2 MiniTrainDIT + LLM adapter).
+No dedicated nodes: the Qwen3-0.6B text encoder loads through `🍏 ASDX CLIP Loader` with the
+default `type = "stable_diffusion"` (ComfyUI's own `AnimaTEModel`, auto-detected from the
+encoder checkpoint), and `🍏 ASDX CLIP Text Encode` turns the prompt into conditioning. The LLM
+adapter itself runs in native MLX, once per prompt, inside the sampler.
+
+Accepted DiT checkpoint formats: bf16 safetensors and int8 convrot, via the standard
+`🍏 ASDX Diffusion Loader`. Load the VAE with `🍏 ASDX VAE Loader` (Wan2.1/Qwen VAE).
+`🍏 ASDX Empty Latent` needs `latent_format = "anima"` (16ch, 8x VAE downscale); width/height
+must be a multiple of 16. LoRA is not supported yet on Anima (`ASDX_MultiLoraLoader` raises a
+clear error rather than silently ignoring the checkpoint).
+
+CFG: base and aesthetic checkpoints use true two-pass classifier-free guidance, cfg ~4.5, and
+need a negative prompt merged in via `🍏 ASDX Conditioning Merger`; Turbo checkpoints run a
+single pass at cfg 1.0 with no negative required.
+
+Minimal graph: `Diffusion Loader` (bf16 or int8 convrot) -> `CLIP Loader` (Qwen3-0.6B TE) -> two
+`CLIP Text Encode` (positive/negative) -> `Conditioning Merger` -> `Empty Latent`
+(`latent_format = anima`) -> `Sampler` (cfg 4.5 base/aesthetic, or cfg 1.0 for Turbo) ->
+`VAE Decode (MLX)` -> `SaveImage`.
 
 ## Installation
 
