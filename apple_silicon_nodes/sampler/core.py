@@ -2063,6 +2063,11 @@ class _SamplerCore:
         `self.guidance` when > 1 (base/aesthetic ~4.5), single pass at 1.0 (turbo).
         The LLM adapter runs once per prompt here, like ComfyUI's
         `Anima.extra_conds` -> `preprocess_text_embeds`, not per step."""
+        if self._detect_mode() != SamplerMode.TEXT_TO_IMAGE:
+            raise RuntimeError(
+                "ASDX: Anima only supports text-to-image; img2img/inpaint/fill/depth mode and "
+                "image/mask inputs are not supported -- run Anima with no image, mask or depth_image input."
+            )
         cap_module.require_divisible_dims(self.width, self.height, 16, "anima")
         precision = self.config.mlx_dtype
         cfg_scale = float(self.guidance) if self.guidance and self.guidance > 0 else 1.0

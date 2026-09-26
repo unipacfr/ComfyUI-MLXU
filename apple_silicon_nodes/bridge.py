@@ -487,6 +487,11 @@ def conditioning_anima_to_mlx(conditioning: Any, precision: mx.Dtype) -> tuple[m
     LLM adapter consumes all three (`AnimaTransformer.encode_context`)."""
     if isinstance(conditioning, dict):
         conditioning = conditioning.get("conditioning", conditioning)
+    if len(conditioning) != 1:
+        raise RuntimeError(
+            "Anima supports a single conditioning entry per prompt; ConditioningCombine / "
+            "area conditioning is not supported -- encode one prompt per ASDX_CLIPTextEncode"
+        )
     hidden_np = _to_numpy(conditioning[0][0])
     extra = conditioning[0][1] if len(conditioning[0]) > 1 else {}
     if hidden_np.ndim != 3 or hidden_np.shape[-1] != 1024 or "t5xxl_ids" not in extra:

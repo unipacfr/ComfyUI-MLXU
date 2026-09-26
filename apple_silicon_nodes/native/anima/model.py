@@ -175,6 +175,13 @@ class AnimaTransformer(nn.Module):
         emb = self.t_embedding_norm(sincos)
 
         context = context.astype(dtype)
+        if context.shape[0] != b:
+            if context.shape[0] != 1:
+                raise ValueError(
+                    f"ASDX: Anima context batch {context.shape[0]} does not match latent batch {b} "
+                    "(must be 1 or match the latent batch)."
+                )
+            context = mx.broadcast_to(context, (b,) + context.shape[1:])
         if dtype == mx.float16:  # predict2.py:907-912: fp32 residual stream under fp16 compute
             x = x.astype(mx.float32)
         for block in self.blocks:
