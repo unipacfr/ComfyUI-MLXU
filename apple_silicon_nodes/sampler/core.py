@@ -2072,8 +2072,7 @@ class _SamplerCore:
         precision = self.config.mlx_dtype
         cfg_scale = float(self.guidance) if self.guidance and self.guidance > 0 else 1.0
 
-        ctx_pos = self.transformer.encode_context(*bridge.conditioning_anima_to_mlx(self.positive, precision))
-        ctx_neg = None
+        negative = None
         if cfg_scale != 1.0:
             negative = self.positive.get("_negative") if isinstance(self.positive, dict) else None
             if negative is None:
@@ -2081,11 +2080,31 @@ class _SamplerCore:
                     "ASDX: Anima with cfg > 1 needs a negative prompt. Merge the positive and "
                     "negative ASDX_CLIPTextEncode outputs with ASDX_ConditioningMerger, or set cfg to 1.0 (turbo)."
                 )
-            ctx_neg = self.transformer.encode_context(*bridge.conditioning_anima_to_mlx(negative, precision))
-        if ctx_neg is not None:
-            mx.eval(ctx_pos, ctx_neg)
+
+        def _encode_context() -> tuple[Any, Any]:
+            pos = self.transformer.encode_context(*bridge.conditioning_anima_to_mlx(self.positive, precision))
+            neg = None
+            if negative is not None:
+                neg = self.transformer.encode_context(*bridge.conditioning_anima_to_mlx(negative, precision))
+                mx.eval(pos, neg)
+            else:
+                mx.eval(pos)
+            return pos, neg
+
+        # When a LoRA schedule is attached, an `llm_adapter.*` target's strength
+        # changes every step, so the context must be re-encoded INSIDE the loop
+        # (right after `_update_lora_schedule`) to follow it -- see item 1 in
+        # the final-fix report. Encoding once here would freeze the adapter at
+        # its pre-loop (unscheduled) strength for the whole run, and because
+        # `_rescale_attached_lora`'s fast path mutates the cached transformer in
+        # place, a cache-hit re-queue would even start from the PREVIOUS run's
+        # last-step strength, making identical runs diverge. Without a
+        # schedule, the adapter strength is constant, so encoding once before
+        # the loop (as ComfyUI's `Anima.extra_conds` does) is correct and cheap.
+        if self.lora_schedule is None:
+            ctx_pos, ctx_neg = _encode_context()
         else:
-            mx.eval(ctx_pos)
+            ctx_pos = ctx_neg = None
 
         def velocity(x_at, sigma_at):
             t = mx.array([sigma_at], dtype=mx.float32)
@@ -2107,6 +2126,7 @@ class _SamplerCore:
             if self.lora_schedule is not None:
                 self.lora_schedule["step"] = t
                 self.transformer = self._update_lora_schedule(self.transformer, self.config, self.lora_schedule, t, steps)
+                ctx_pos, ctx_neg = _encode_context()
 
             v = velocity(self.noise, sigma_t)
             mx.eval(v)
