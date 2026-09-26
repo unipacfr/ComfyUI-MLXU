@@ -281,3 +281,27 @@ def test_foreign_lora_on_anima_refused(tmp_path):
     with pytest.raises(ValueError, match="anima LoRA"):
         lora_mod._check_lora_compatibility(anima, krea2_model)
     lora_mod._check_lora_compatibility(anima, anima_model)
+
+
+def test_unsupported_loha_tucker_refused_on_anima(base, tmp_path):
+    """A LoHa target in the Tucker/CP variant is dropped (never populated
+    into `loha_factors`) by `_load_lora_file`, so the strict-routing
+    `present - consumed` diff in `_apply_lora_residual_to_anima` can't see it
+    on its own -- it must be refused via `lora.unsupported_loha` instead."""
+    stem = "lora_unet_blocks_0_self_attn_q_proj"
+    rank = 4
+    rng = np.random.default_rng(50)
+    tensors = {
+        f"{stem}.hada_w1_a": rng.standard_normal((32, rank)).astype(np.float32),
+        f"{stem}.hada_w1_b": rng.standard_normal((rank, 32)).astype(np.float32),
+        f"{stem}.hada_w2_a": rng.standard_normal((32, rank)).astype(np.float32),
+        f"{stem}.hada_w2_b": rng.standard_normal((rank, 32)).astype(np.float32),
+        f"{stem}.hada_t1": rng.standard_normal((rank, rank, rank)).astype(np.float32),
+    }
+    path = _write(tmp_path, "loha_tucker.safetensors", tensors)
+    lora = ASDX_LoraLoader._load_lora_file(path)
+    assert lora.unsupported_loha == [stem]
+    assert not lora.loha_factors
+
+    with pytest.raises(RuntimeError, match="unsupported LoKr/LoHa"):
+        ASDX_LoraLoader._apply_lora_to_transformer(base, lora, _CFG)

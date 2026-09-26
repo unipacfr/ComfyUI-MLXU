@@ -231,7 +231,9 @@ Text-to-image, run on the native MLX Anima DiT (Cosmos-Predict2 MiniTrainDIT + L
 No dedicated nodes: the Qwen3-0.6B text encoder loads through `🍏 ASDX CLIP Loader` with the
 default `type = "stable_diffusion"` (ComfyUI's own `AnimaTEModel`, auto-detected from the
 encoder checkpoint), and `🍏 ASDX CLIP Text Encode` turns the prompt into conditioning. The LLM
-adapter itself runs in native MLX, once per prompt, inside the sampler.
+adapter itself runs in native MLX, inside the sampler -- once per prompt, unless an
+`ASDX_LoraSchedule` is attached, in which case it re-encodes every step so an `llm_adapter.*`
+target follows the schedule too.
 
 Accepted DiT checkpoint formats: bf16 safetensors and int8 convrot, via the standard
 `🍏 ASDX Diffusion Loader`. Load the VAE with `🍏 ASDX VAE Loader` (Wan2.1/Qwen VAE).
@@ -242,9 +244,10 @@ LoRA is supported (`🍏 ASDX LoRA Loader`/`ASDX_MultiLoraLoader`/`ASDX_LoraSche
 every other family): kohya-style (`lora_unet_...`, including the adaLN-modulation dialect some
 Anima trainers ship) and PEFT (`diffusion_model....lora_A/lora_B`) files both work, and
 `llm_adapter.*` targets (the LLM adapter feeding the Qwen3-0.6B hidden states into the DiT) are
-routed the same as DiT targets. Routing is strict: any LoRA key that matches no Anima module
-raises a clear error instead of silently applying a partial LoRA. DoRA (`*.dora_scale`) files
-are refused outright -- not supported by any family yet.
+routed the same as DiT targets. Routing is strict: any LoRA key that matches no Anima module, or
+a LoKr/LoHa target in an unsupported form (Tucker/CP variant, missing factor), raises a clear
+error instead of silently applying a partial LoRA. DoRA (`*.dora_scale`) files are refused
+outright -- not supported by any family yet; use ComfyUI's native LoRA loader for those.
 
 CFG: on the sampler node this is the `guidance` widget (default 3.5), not a separate `cfg`
 widget. Base and aesthetic checkpoints use true two-pass classifier-free guidance and need a

@@ -256,6 +256,13 @@ class LoRAAdapter:
     # two low-rank products is inherently full-size -- so these materialize on
     # demand like any other delta, one target at a time.
     loha_factors: dict[str, tuple[mx.array, mx.array, mx.array, mx.array, float]] = field(default_factory=dict)
+    # Stems of LoKr/LoHa targets `_load_lora_file` could not resolve (Tucker/CP
+    # variant, or a missing/non-2-D factor) and therefore skipped -- never
+    # populated into `lokr_factors`/`loha_factors` above, so the strict-routing
+    # check in `_apply_lora_residual_to_anima` can't see them via `present`
+    # alone. Kept here so that check can still refuse a partial apply.
+    unsupported_lokr: list[str] = field(default_factory=list)
+    unsupported_loha: list[str] = field(default_factory=list)
     # None means the file has no ".alpha" key (see _load_lora_file) -- not
     # the same as alpha=1.0, the two fall back to different scales below.
     alpha: float | None = None
@@ -1677,8 +1684,20 @@ def _apply_lora_residual_to_anima(transformer: Any, lora: "LoRAAdapter") -> Any:
     Returns a NEW transformer; untouched sub-trees are shared by reference.
 
     Strict routing (mlx-gen `adapters.rs`): any non-text-encoder key left
-    unconsumed raises instead of reporting a partial "attached N/M".
+    unconsumed raises instead of reporting a partial "attached N/M". This
+    also covers LoKr/LoHa targets `_load_lora_file` itself could not resolve
+    (Tucker/CP variant, missing factor) -- those never reach `present` below
+    since they were dropped before loading, so they are checked separately
+    against `lora.unsupported_lokr`/`unsupported_loha` instead of falling out
+    of the `present - consumed` diff.
     """
+    unsupported = list(lora.unsupported_lokr) + list(lora.unsupported_loha)
+    if unsupported:
+        raise RuntimeError(
+            f"ASDX: LoRA '{lora.name}' has {len(unsupported)} unsupported LoKr/LoHa "
+            f"target(s) (Tucker/CP variant or missing factor, e.g. {unsupported[0]}) "
+            f"-- refusing a partial apply."
+        )
     present = {*lora.factors, *lora.deltas, *lora.lokr_factors, *lora.loha_factors}
     consumed: set[str] = set()
 
@@ -2272,7 +2291,8 @@ class ASDX_LoraLoader(io.ComfyNode):
             # -- refuse instead of applying a partial, wrong-magnitude LoRA.
             raise RuntimeError(
                 f"{path.name}: DoRA LoRAs are not supported (found {len(dora_keys)} "
-                f"'*.dora_scale' key(s), e.g. {dora_keys[0]})"
+                f"'*.dora_scale' key(s), e.g. {dora_keys[0]}) -- use ComfyUI's native "
+                f"LoRA loader for DoRA files"
             )
 
         # Extract deltas from raw weights
@@ -2480,6 +2500,8 @@ class ASDX_LoraLoader(io.ComfyNode):
                        if not (isinstance(v, tuple) and v[0] is None and v[1] is None)}
 
         lora.alpha = alpha_value
+        lora.unsupported_lokr = unsupported_lokr
+        lora.unsupported_loha = unsupported_loha
         mx.eval(*lora.deltas.values(),
                 *(t for pair in lora.factors.values() for t in pair))
         return lora
@@ -2510,7 +2532,8 @@ class ASDX_LoraLoader(io.ComfyNode):
         from mlx.utils import tree_flatten, tree_unflatten
 
         if not lora.deltas and not lora.factors and not lora.lokr_factors \
-                and not lora.loha_factors:
+                and not lora.loha_factors and not lora.unsupported_lokr \
+                and not lora.unsupported_loha:
             print("[ASDX] LoRA: no matching weights found")
             return transformer
 
