@@ -598,7 +598,13 @@ class AdaptableLinear(nn.Linear):
             residual = (x @ a.T) @ b.T
             y = y + (scale * residual).astype(y.dtype)
         for w1, w2, scale in self._lokr_factors:
-            y = y + (scale * _kron_matmul(x.astype(w1.dtype), w1, w2)).astype(y.dtype)
+            # No cast, same natural-promotion rule as the low-rank pair path
+            # above (f16 x bf16 -> f32 inside `_kron_matmul`'s matmuls) --
+            # casting x down to the factor dtype first (the old behavior)
+            # truncated f16 activations to bf16 before they ever reached the
+            # kron contraction, which is what caused the Krea2 LoKr precision
+            # regression once factors stopped being upcast to float32.
+            y = y + (scale * _kron_matmul(x, w1, w2)).astype(y.dtype)
         return y
 
     def merge_delta(self, delta: mx.array, scale: float) -> None:

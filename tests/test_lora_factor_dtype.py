@@ -176,6 +176,44 @@ def test_alpha_and_rank_follow_file_order(tmp_path):
     assert lora_mod.base_lora_scale(lora.alpha, lora.rank) == alpha / rank
 
 
+def test_f16_activations_bf16_lokr_factors_promote_to_f32():
+    # Krea2 regression: f16 activations x bf16 LoKr factors must promote to
+    # float32 inside `_kron_matmul`, matching the low-rank pair path's rule,
+    # not truncate x down to bf16 first (the old `x.astype(w1.dtype)` cast).
+    mx.random.seed(4)
+    w1 = (mx.random.normal((4, 4)) * 0.1).astype(mx.bfloat16)
+    w2 = (mx.random.normal((6, IN // 4)) * 0.1).astype(mx.bfloat16)
+    layer = _layer(mx.float16)
+    layer._lokr_factors.append((w1, w2, 0.5))
+    x = mx.random.normal((3, IN)).astype(mx.float16)
+    y = layer(x)
+    assert y.dtype == mx.float16
+
+    base = nn.Linear.__call__(layer, x)
+    # No-cast reference (what `__call__` must produce now).
+    no_cast_ref = base + (0.5 * lora_mod._kron_matmul(x, w1, w2)).astype(mx.float16)
+    assert mx.array_equal(y, no_cast_ref)
+
+    # Mutation evidence: the old `x.astype(w1.dtype)` cast truncates x to
+    # bf16 before the kron contraction, which changes the actual layer
+    # output on these magnitudes -- so `y` must NOT match that reference.
+    old_cast_ref = base + (0.5 * lora_mod._kron_matmul(x.astype(w1.dtype), w1, w2)).astype(mx.float16)
+    assert not mx.array_equal(y, old_cast_ref)
+
+
+def test_bf16_activations_bf16_lokr_factors_stay_bf16():
+    mx.random.seed(5)
+    w1 = (mx.random.normal((4, 4)) * 0.1).astype(mx.bfloat16)
+    w2 = (mx.random.normal((6, IN // 4)) * 0.1).astype(mx.bfloat16)
+    layer = _layer(mx.bfloat16)
+    layer._lokr_factors.append((w1, w2, 0.5))
+    x = mx.random.normal((3, IN)).astype(mx.bfloat16)
+    y = layer(x)
+    assert y.dtype == mx.bfloat16
+    ref = nn.Linear.__call__(layer, x) + (0.5 * lora_mod._kron_matmul(x, w1, w2)).astype(mx.bfloat16)
+    assert mx.array_equal(y, ref)
+
+
 def test_f8_tensor_refused(tmp_path):
     # A real F8_E4M3 tensor, which `mx.load` would hand back as uint8 bytes.
     torch = pytest.importorskip("torch")
