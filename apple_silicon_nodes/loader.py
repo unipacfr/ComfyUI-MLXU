@@ -153,6 +153,8 @@ _QWEN_IMAGE21_HINTS = {
     "qwen_image21": "qwen_image21",
 }
 
+_ANIMA_HINTS = ("anima",)
+
 # Distinctive tensor key for the DiT (verified against the real checkpoint header in
 # brick 2: `transformer_blocks.0.img_mlp.gate_up.weight`, unique to this family's fused
 # SwiGLU MLP naming -- SDXL/Z-Image/Flux2/Krea2 use their own distinct markers, none of
@@ -231,6 +233,11 @@ def _detect_model_type(path: Path) -> str:
             if hint in name:
                 hint_type = "flux2"
                 break
+    if hint_type is None:
+        for hint in _ANIMA_HINTS:
+            if hint in name:
+                hint_type = "anima"
+                break
 
     if hint_type is not None:
         # Unlike the generic dev/schnell/kontext hints below, these claim a
@@ -276,14 +283,8 @@ def _detect_model_type_from_keys(path: Path) -> str:
     if any(_QWEN_IMAGE21_STRUCTURAL_KEY in k for k in keys):
         return "qwen_image21"
     if any("llm_adapter." in k for k in keys):
-        # Anima (Cosmos-Predict2 MiniTrainDIT + LLM adapter, comfy/ldm/anima)
-        # has no native port: falling through to "dev" loaded it as FLUX with
-        # 1/780 params matched and a 16-channel latent assumption.
-        raise RuntimeError(
-            f"ASDX: {path.name} is an Anima checkpoint (llm_adapter.* keys), "
-            "which has no native MLX port yet -- use ComfyUI's own "
-            "UNETLoader/KSampler for this model."
-        )
+        # Anima: Cosmos-Predict2 MiniTrainDIT + LLM adapter (comfy/ldm/anima).
+        return "anima"
     return "dev"
 
 
@@ -436,6 +437,10 @@ def _load_transformer_for_type(
         else:
             transformer = load_qwen_image21_dit_checkpoint(path, dtype=dtype)
         return transformer, transformer.config
+    elif model_type == "anima":
+        from .native.anima import load_anima_checkpoint
+        transformer = load_anima_checkpoint(path, dtype=dtype)
+        return transformer, transformer.config
     else:
         # FLUX.1 path
         guidance_embed = model_type == "dev"
@@ -460,6 +465,7 @@ _MODEL_TYPE_CAPABILITY = {
     # unblock rather than a redesign of Krea2 turbo/raw detection.
     "krea2": "krea2_base",
     "qwen_image21": "qwen_image21_base",
+    "anima": "anima_base",
 }
 
 

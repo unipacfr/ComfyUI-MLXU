@@ -164,6 +164,14 @@ class _SamplerCore:
         if model_type == "qwen_image21":
             return self._run_qwen_image21(steps, seed)
 
+        # ── Anima routing ─────────────────────────────────────────────
+        # Cosmos-Predict2 MiniTrainDIT + LLM adapter (comfy/ldm/anima), velocity
+        # output on a [B,16,H,W] latent (no packed tokens), with true two-pass
+        # CFG on `self.guidance` (base/aesthetic) or a single pass at cfg=1.0
+        # (turbo) -- route before any FLUX/qwen-specific calls below.
+        if model_type == "anima":
+            return self._run_anima(steps, seed)
+
         # ── SDXL routing ──────────────────────────────────────────────
         # SDXL is an EPS-prediction conv UNet on a discrete DDPM schedule,
         # not a flow-matching DiT — completely different noise shape (NHWC
@@ -2047,4 +2055,85 @@ class _SamplerCore:
 
         bridge.clear_mlx_cache()
 
+        return out_latent
+
+    def _run_anima(self, steps: int, seed: int) -> dict:
+        """Anima sampling loop: ModelType.FLOW (shift 3.0, timestep = sigma),
+        velocity output (denoised = x - v*sigma), true two-pass CFG on
+        `self.guidance` when > 1 (base/aesthetic ~4.5), single pass at 1.0 (turbo).
+        The LLM adapter runs once per prompt here, like ComfyUI's
+        `Anima.extra_conds` -> `preprocess_text_embeds`, not per step."""
+        cap_module.require_divisible_dims(self.width, self.height, 16, "anima")
+        precision = self.config.mlx_dtype
+        cfg_scale = float(self.guidance) if self.guidance and self.guidance > 0 else 1.0
+
+        ctx_pos = self.transformer.encode_context(*bridge.conditioning_anima_to_mlx(self.positive, precision))
+        ctx_neg = None
+        if cfg_scale != 1.0:
+            negative = self.positive.get("_negative") if isinstance(self.positive, dict) else None
+            if negative is None:
+                raise RuntimeError(
+                    "ASDX: Anima with cfg > 1 needs a negative prompt. Merge the positive and "
+                    "negative ASDX_CLIPTextEncode outputs with ASDX_ConditioningMerger, or set cfg to 1.0 (turbo)."
+                )
+            ctx_neg = self.transformer.encode_context(*bridge.conditioning_anima_to_mlx(negative, precision))
+        if ctx_neg is not None:
+            mx.eval(ctx_pos, ctx_neg)
+        else:
+            mx.eval(ctx_pos)
+
+        def velocity(x_at, sigma_at):
+            t = mx.array([sigma_at], dtype=mx.float32)
+            v = self.transformer(x_at, t, ctx_pos)
+            if ctx_neg is not None:
+                v_neg = self.transformer(x_at, t, ctx_neg)
+                v = v_neg + cfg_scale * (v - v_neg)
+            return v
+
+        sigmas = calculate_sigmas(self.model_type, self.scheduler_name, steps, self.width, self.height)
+        solver_state: dict[str, Any] = {}
+        mx.reset_peak_memory()
+        step_times: list[float] = []
+        t_start = time.perf_counter()
+        for t in range(steps):
+            step_start = time.perf_counter()
+            sigma_t = sigmas[t]
+            sigma_next = sigmas[t + 1] if t + 1 < len(sigmas) else 0.0
+            if self.lora_schedule is not None:
+                self.lora_schedule["step"] = t
+                self.transformer = self._update_lora_schedule(self.transformer, self.config, self.lora_schedule, t, steps)
+
+            v = velocity(self.noise, sigma_t)
+            mx.eval(v)
+            denoised = self.noise - v * sigma_t
+
+            def _model_call(x_at, sigma_at):
+                out = velocity(x_at, sigma_at)
+                mx.eval(out)
+                return x_at - out * sigma_at
+
+            self.noise, solver_state = solvers.step(
+                self.sampler_name, x=self.noise, sigma=sigma_t, sigma_next=sigma_next,
+                denoised=denoised, state=solver_state, seed=seed, step_index=t,
+                is_flow_matching=self._is_flow_matching, model_call=_model_call,
+            )
+            mx.eval(self.noise)
+            step_times.append(time.perf_counter() - step_start)
+            if (t + 1) % 5 == 0 or t == 0:
+                print(f"[ASDX] Anima Step {t + 1}/{steps} - {step_times[-1]:.3f}s")
+
+        if self.low_memory_mode:
+            from ..loader import clear_model_cache
+            clear_model_cache()
+            self.transformer = None
+
+        out_latent = bridge.mlx_to_comfy_latent_anima(self.noise, {"samples": self.noise})
+        out_latent["sdmlx_model_type"] = self.model_type
+        mem = bridge.collect_mlx_memory()
+        avg = sum(step_times) / len(step_times) if step_times else 0
+        print(f"[ASDX] Anima Sampling complete: {time.perf_counter() - t_start:.1f}s total, "
+              f"{avg:.3f}s/step, {mem['peak_gb']:.1f}GB peak, cfg={cfg_scale:.1f}")
+        if self.memory_shape is not None:
+            record_observation(self.memory_shape, mx.get_peak_memory())
+        bridge.clear_mlx_cache()
         return out_latent

@@ -146,6 +146,31 @@ def time_snr_shift(shift: float, t: float) -> float:
     return shift * t / (1.0 + (shift - 1.0) * t)
 
 
+def _discrete_flow_fixed_shift_sigmas(shift: float, steps: int) -> list[float]:
+    """Sigma schedule for a `ModelSamplingDiscreteFlow`-backed model with
+    multiplier=1.0 (Z-Image, Anima) -- matches `comfy.samplers.normal_scheduler`
+    run on a real `ModelSamplingDiscreteFlow` instance exactly.
+
+    Same double-application shape as `_flux_fixed_shift_sigmas` (its
+    ModelSamplingFlux analog): `ModelSamplingDiscreteFlow.timestep(sigma) ==
+    sigma * multiplier` is also the identity when multiplier=1.0, so the
+    linspace endpoint is itself a sigma value (`sigma_min = time_snr_shift(shift,
+    1/1000)`, using the class's own default `timesteps=1000`), which then gets
+    run back through `time_snr_shift` again per grid point via `.sigma()`.
+    Verified against a real `ModelSamplingDiscreteFlow(shift=3.0,
+    multiplier=1.0)` run through `comfy.samplers.calculate_sigmas(..., "normal",
+    ...)` -- see tests/test_scheduling_anima.py's header for the exact command.
+    """
+    sigma_min = time_snr_shift(shift, 1.0 / 1000.0)
+    if steps > 1:
+        timesteps = [1.0 + (sigma_min - 1.0) * i / (steps - 1) for i in range(steps)]
+    else:
+        timesteps = [1.0]
+    sigmas = [time_snr_shift(shift, t) for t in timesteps]
+    sigmas.append(0.0)
+    return sigmas
+
+
 def _flux_fixed_shift_sigmas(shift: float, steps: int) -> list[float]:
     """Sigma schedule for a `ModelSamplingFlux`-backed model with a fixed
     (non-resolution-dependent) shift -- matches `comfy.samplers.
@@ -245,12 +270,18 @@ def generate_sigmas(
         sigmas = _flux_fixed_shift_sigmas(shift, steps)
         return sigmas
 
-    if model_type in ("zimage", "zimage_turbo"):
+    if model_type in ("zimage", "zimage_turbo", "anima"):
         # Flow matching with a FIXED shift (not resolution-dependent like
         # FLUX-dev's mu) — comfy/supported_models.py::ZImage.sampling_settings.
+        # Anima: ModelSamplingDiscreteFlow shift=3.0, multiplier=1.0 (comfy/
+        # supported_models.py::Anima) -- same curve as Z-Image. Verified
+        # end-to-end against a real ModelSamplingDiscreteFlow instance (see
+        # tests/test_scheduling_anima.py): the naive `time_snr_shift(shift,
+        # 1-i/steps)` grid this branch used before was NOT what comfy's
+        # normal_scheduler produces (it undershoots how close to 0 the
+        # timestep grid gets) -- `_discrete_flow_fixed_shift_sigmas` matches.
         shift = 3.0
-        sigmas = [time_snr_shift(shift, 1.0 - i / steps) for i in range(steps)]
-        sigmas.append(0.0)
+        sigmas = _discrete_flow_fixed_shift_sigmas(shift, steps)
         return sigmas
 
     if model_type == "flux2":
@@ -305,7 +336,7 @@ def _flow_shift_fn(model_type: str, width: int = 1024, height: int = 1024):
         return lambda t: flux_time_shift(1.15, 1.0, t)
     if model_type == "qwen_image21":
         return lambda t: flux_time_shift(0.69, 1.0, t)
-    if model_type in ("zimage", "zimage_turbo"):
+    if model_type in ("zimage", "zimage_turbo", "anima"):
         return lambda t: time_snr_shift(3.0, t)
     if model_type == "flux2":
         return lambda t: time_snr_shift(2.02, t)

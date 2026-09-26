@@ -243,6 +243,17 @@ CAPABILITY_PROFILES: dict[str, CapabilityProfile] = {
         # downscale_ratio=16 -- see the brick 3 design spec).
         latent_channels=64,
     ),
+    # ── Anima (Cosmos-Predict2 2B DiT + LLM adapter, 685/685 weights matched) ──
+    "anima_base": CapabilityProfile(
+        family="anima",
+        name="Anima",
+        generate_params={"cfg_scale": "float", "negative": "string", "width": "int", "height": "int", "steps": "int"},
+        # Base/aesthetic need true CFG with a negative; turbo runs at cfg 1.0 without one,
+        # so the negative is checked in _run_anima against the actual cfg, not required here.
+        requires=frozenset(),
+        hard_block=frozenset(),
+        latent_channels=16,
+    ),
 }
 
 
