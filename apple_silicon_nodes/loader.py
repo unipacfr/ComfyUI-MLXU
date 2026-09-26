@@ -275,6 +275,15 @@ def _detect_model_type_from_keys(path: Path) -> str:
         return "krea2"
     if any(_QWEN_IMAGE21_STRUCTURAL_KEY in k for k in keys):
         return "qwen_image21"
+    if any("llm_adapter." in k for k in keys):
+        # Anima (Cosmos-Predict2 MiniTrainDIT + LLM adapter, comfy/ldm/anima)
+        # has no native port: falling through to "dev" loaded it as FLUX with
+        # 1/780 params matched and a 16-channel latent assumption.
+        raise RuntimeError(
+            f"ASDX: {path.name} is an Anima checkpoint (llm_adapter.* keys), "
+            "which has no native MLX port yet -- use ComfyUI's own "
+            "UNETLoader/KSampler for this model."
+        )
     return "dev"
 
 
