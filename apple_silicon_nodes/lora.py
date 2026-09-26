@@ -461,7 +461,11 @@ def _lokr_factor_pair(
             a_arr, b_arr = _as_mx(a), _as_mx(b)
             if a_arr.ndim != 2 or b_arr.ndim != 2:
                 return None
-            arr = a_arr @ b_arr
+            # Rebuild in float32 and round back to the file dtype once --
+            # matmul directly in bf16 bakes an extra rounding on top of the
+            # one this factor already got when the scale is applied below.
+            file_dtype = a_arr.dtype
+            arr = (a_arr.astype(mx.float32) @ b_arr.astype(mx.float32)).astype(file_dtype)
             rank = a_arr.shape[1]
         if arr.ndim != 2:
             return None
@@ -2290,14 +2294,28 @@ class ASDX_LoraLoader(io.ComfyNode):
                         f"{path.name}: unsupported LoRA tensor dtype {entry.dtype} "
                         f"for '{key}' -- only BF16/F16/F32 LoRA factors are supported"
                     )
-            # File (data-offset) order: `mx.load` iterates in hash order, but
-            # the first `.alpha` and first factor rank found set the
-            # file-level scale below, so iterate in the order the old
-            # `safetensors.torch.load_file` gave -- its tensor data order
-            # (hash order changed real files' scale by 2x; plain sorted order
-            # differs from it on 9 of 339 library files).
-            loaded = mx.load(str(path))
-            raw = {k: loaded[k] for k in sorted(header, key=lambda k: header[k].data_offsets)}
+            if any(entry.dtype == "F64" for entry in header.values()):
+                # `mx.load` raises an opaque "[safetensor] unsupported dtype
+                # F64" on any F64 tensor (some older trainers write an F64
+                # `.alpha` scalar) -- fall back to the torch->numpy route,
+                # same as .pt/.bin below, which handles F64 fine.
+                import torch
+                import safetensors.torch
+                state = safetensors.torch.load_file(path, device="cpu")
+                raw = {}
+                for k, v in state.items():
+                    if v.dtype == torch.bfloat16:
+                        v = v.float()
+                    raw[k] = v.cpu().numpy()
+            else:
+                # File (data-offset) order: `mx.load` iterates in hash order, but
+                # the first `.alpha` and first factor rank found set the
+                # file-level scale below, so iterate in the order the old
+                # `safetensors.torch.load_file` gave -- its tensor data order
+                # (hash order changed real files' scale by 2x; plain sorted order
+                # differs from it on 9 of 339 library files).
+                loaded = mx.load(str(path))
+                raw = {k: loaded[k] for k in sorted(header, key=lambda k: header[k].data_offsets)}
         elif path.suffix == ".pt" or path.suffix == ".bin":
             import torch
             state = torch.load(path, map_location="cpu")
@@ -2430,8 +2448,13 @@ class ASDX_LoraLoader(io.ComfyNode):
                     unsupported_lokr.append(stem)
                     continue
                 w1_arr, w2_arr, rank = factors
+                # Bake the scale in float32 and round back to w2's file
+                # dtype once -- multiplying directly in bf16 rounds twice
+                # (once here, once when w2 was itself rebuilt/loaded).
+                scaled_w2 = (w2_arr.astype(mx.float32)
+                             * _lycoris_scale(_alpha_of(stem, raw), rank)).astype(w2_arr.dtype)
                 lora.lokr_factors[_strip_and_normalize_key(f"{stem}.weight")] = (
-                    w1_arr, w2_arr * _lycoris_scale(_alpha_of(stem, raw), rank),
+                    w1_arr, scaled_w2,
                 )
             elif key.endswith((".lokr_w2", ".lokr_w1_a", ".lokr_w1_b",
                                ".lokr_w2_a", ".lokr_w2_b", ".lokr_t2")):
@@ -2528,7 +2551,8 @@ class ASDX_LoraLoader(io.ComfyNode):
         lora.unsupported_lokr = unsupported_lokr
         lora.unsupported_loha = unsupported_loha
         mx.eval(*lora.deltas.values(),
-                *(t for pair in lora.factors.values() for t in pair))
+                *(t for pair in lora.factors.values() for t in pair),
+                *(t for pair in lora.lokr_factors.values() for t in pair[:2]))
         return lora
 
     @staticmethod
