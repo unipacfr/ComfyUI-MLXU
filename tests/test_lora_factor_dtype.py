@@ -126,11 +126,20 @@ def test_delta_from_factors_returns_f32():
 
 
 def test_lokr_and_loha_materialize_f32():
-    w1 = mx.ones((2, 2), dtype=mx.bfloat16)
-    w2 = mx.ones((3, 4), dtype=mx.bfloat16)
-    assert lora_mod._delta_from_lokr(w1, w2).dtype == mx.float32
-    p = [mx.ones((OUT, RANK), dtype=mx.bfloat16), mx.ones((RANK, IN), dtype=mx.bfloat16)] * 2
-    assert lora_mod._delta_from_loha(*p, 0.5).dtype == mx.float32
+    mx.random.seed(3)
+    w1 = mx.random.normal((2, 2)).astype(mx.bfloat16)
+    w2 = mx.random.normal((3, 4)).astype(mx.bfloat16)
+    d = lora_mod._delta_from_lokr(w1, w2)
+    assert d.dtype == mx.float32
+    f1, f2 = w1.astype(mx.float32), w2.astype(mx.float32)
+    ref = mx.concatenate([mx.concatenate([f1[i, j] * f2 for j in range(2)], axis=1)
+                          for i in range(2)], axis=0)   # explicit kron(w1, w2)
+    assert mx.array_equal(d, ref)
+    p = [mx.random.normal(s).astype(mx.bfloat16) for s in ((OUT, RANK), (RANK, IN))] * 2
+    d = lora_mod._delta_from_loha(*p, 0.5)
+    assert d.dtype == mx.float32
+    f = [t.astype(mx.float32) for t in p]
+    assert mx.array_equal(d, ((f[0] @ f[1]) * (f[2] @ f[3])) * 0.5)
 
 
 def test_merge_delta_bf16_raw_delta_matches_f32_path():
@@ -141,3 +150,40 @@ def test_merge_delta_bf16_raw_delta_matches_f32_path():
     ref = layer.weight + (0.3 * delta.astype(mx.float32)).astype(mx.bfloat16)
     layer.merge_delta(delta, 0.3)
     assert mx.array_equal(layer.weight, ref)
+
+
+def test_alpha_and_rank_follow_file_order(tmp_path):
+    # The first `.alpha` and first factor rank set the file-level scale, so
+    # the load must iterate in the file's tensor data order (what the old
+    # `safetensors.torch.load_file` returned), never `mx.load`'s hash order.
+    tensors = {}
+    for i, (alpha, rank) in enumerate([(16.0, 32), (32.0, 8), (4.0, 16), (8.0, 4),
+                                        (2.0, 64), (64.0, 2), (1.0, 1), (12.0, 12)]):
+        stem = f"lora_unet_blocks_{i}_{'qkvmozxa'[i]}"
+        tensors[f"{stem}.lora_down.weight"] = mx.zeros((rank, IN))
+        tensors[f"{stem}.lora_up.weight"] = mx.zeros((OUT, rank))
+        tensors[f"{stem}.alpha"] = mx.array(alpha)
+    path = tmp_path / "multi.safetensors"
+    mx.save_safetensors(str(path), tensors)
+    hdr = lora_mod.read_safetensors_header(path).tensors
+    file_order = sorted(hdr, key=lambda k: hdr[k].data_offsets)
+    assert list(mx.load(str(path))) != file_order, "setup: hash order must differ from file order"
+    alpha = float(tensors[next(k for k in file_order if k.endswith(".alpha"))])
+    # kohya pairs are registered when their `.lora_up` key is reached.
+    rank = tensors[next(k for k in file_order if k.endswith(".lora_up.weight"))].shape[1]
+    lora = ASDX_LoraLoader._load_lora_file(path)
+    assert (lora.alpha, lora.rank) == (alpha, rank)
+    assert lora_mod.base_lora_scale(lora.alpha, lora.rank) == alpha / rank
+
+
+def test_f8_tensor_refused(tmp_path):
+    # A real F8_E4M3 tensor, which `mx.load` would hand back as uint8 bytes.
+    torch = pytest.importorskip("torch")
+    if not hasattr(torch, "float8_e4m3fn"):
+        pytest.skip("torch without float8")
+    from safetensors.torch import save_file
+    path = tmp_path / "f8.safetensors"
+    save_file({f"{KEY[:-7]}.lora_A.weight": torch.ones(RANK, IN).to(torch.float8_e4m3fn),
+               f"{KEY[:-7]}.lora_B.weight": torch.ones(OUT, RANK)}, str(path))
+    with pytest.raises(RuntimeError, match="F8_E4M3"):
+        ASDX_LoraLoader._load_lora_file(path)

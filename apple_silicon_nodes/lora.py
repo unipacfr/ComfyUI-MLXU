@@ -2273,7 +2273,25 @@ class ASDX_LoraLoader(io.ComfyNode):
             # low-rank factors reach `AdaptableLinear` as stored -- the old
             # torch->numpy route upcast every bf16 factor to float32 (numpy
             # has no bf16), which made the per-step residual run in float32.
-            raw = mx.load(str(path))
+            #
+            # `mx.load` returns F8 tensors as raw uint8 bytes, which would be
+            # applied silently as garbage values (the torch route raised) --
+            # refuse byte/F8 dtypes from the header's real dtype string.
+            header = read_safetensors_header(path).tensors
+            for key, entry in header.items():
+                if entry.dtype.startswith("F8") or entry.dtype in ("U8", "I8"):
+                    raise RuntimeError(
+                        f"{path.name}: unsupported LoRA tensor dtype {entry.dtype} "
+                        f"for '{key}' -- only BF16/F16/F32 LoRA factors are supported"
+                    )
+            # File (data-offset) order: `mx.load` iterates in hash order, but
+            # the first `.alpha` and first factor rank found set the
+            # file-level scale below, so iterate in the order the old
+            # `safetensors.torch.load_file` gave -- its tensor data order
+            # (hash order changed real files' scale by 2x; plain sorted order
+            # differs from it on 9 of 339 library files).
+            loaded = mx.load(str(path))
+            raw = {k: loaded[k] for k in sorted(header, key=lambda k: header[k].data_offsets)}
         elif path.suffix == ".pt" or path.suffix == ".bin":
             import torch
             state = torch.load(path, map_location="cpu")
