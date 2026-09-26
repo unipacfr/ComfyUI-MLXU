@@ -9,8 +9,11 @@ ComfyUI weights (`scripts/anima_parity.py`, fp32 cosine > 0.9999). Only the
 Qwen3-0.6B text encoder stays in ComfyUI/PyTorch, loaded through
 `ASDX_CLIPLoader`; the LLM adapter that consumes its hidden states runs once
 per prompt in MLX (`AnimaTransformer.encode_context`), not per sampling step.
-Not yet supported: LoRA (`lora.py` raises a clear error for Anima) and
-img2img/inpaint (no `process_wan21_latent_in` noise-blend path)."""
+LoRA is supported (`lora.py::_apply_lora_residual_to_anima`): kohya (incl. adaLN-modulation)
+and PEFT dialects, `llm_adapter.*` targets routed alongside the DiT, strict routing (an
+unrouted key raises). Verified against the real LoRA library and ComfyUI's own
+`load_lora_for_models` (`scripts/anima_parity.py --lora ...`, fp32 CPU diff-cosine > 0.999).
+Not yet supported: img2img/inpaint (no `process_wan21_latent_in` noise-blend path)."""
 
 from __future__ import annotations
 

@@ -236,8 +236,15 @@ adapter itself runs in native MLX, once per prompt, inside the sampler.
 Accepted DiT checkpoint formats: bf16 safetensors and int8 convrot, via the standard
 `🍏 ASDX Diffusion Loader`. Load the VAE with `🍏 ASDX VAE Loader` (Wan2.1/Qwen VAE).
 `🍏 ASDX Empty Latent` needs `latent_format = "anima"` (16ch, 8x VAE downscale); width/height
-must be a multiple of 16. LoRA is not supported yet on Anima (`ASDX_MultiLoraLoader` raises a
-clear error rather than silently ignoring the checkpoint).
+must be a multiple of 16.
+
+LoRA is supported (`🍏 ASDX LoRA Loader`/`ASDX_MultiLoraLoader`/`ASDX_LoraSchedule`, same as
+every other family): kohya-style (`lora_unet_...`, including the adaLN-modulation dialect some
+Anima trainers ship) and PEFT (`diffusion_model....lora_A/lora_B`) files both work, and
+`llm_adapter.*` targets (the LLM adapter feeding the Qwen3-0.6B hidden states into the DiT) are
+routed the same as DiT targets. Routing is strict: any LoRA key that matches no Anima module
+raises a clear error instead of silently applying a partial LoRA. DoRA (`*.dora_scale`) files
+are refused outright -- not supported by any family yet.
 
 CFG: on the sampler node this is the `guidance` widget (default 3.5), not a separate `cfg`
 widget. Base and aesthetic checkpoints use true two-pass classifier-free guidance and need a
