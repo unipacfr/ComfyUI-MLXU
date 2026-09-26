@@ -6,5 +6,6 @@ The Qwen3-0.6B text encoder is ComfyUI's own `AnimaTEModel` (via
 from __future__ import annotations
 
 from .config import AnimaConfig, detect_anima_config
+from .model import AnimaTransformer
 
-__all__ = ["AnimaConfig", "detect_anima_config"]
+__all__ = ["AnimaConfig", "detect_anima_config", "AnimaTransformer"]
