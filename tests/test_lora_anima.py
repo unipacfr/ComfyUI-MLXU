@@ -242,6 +242,16 @@ def test_text_encoder_keys_are_not_unrouted(base, tmp_path, capsys):
     assert _attached(capsys) == (1, 1)
 
 
+def test_dora_scale_refused(base, tmp_path):
+    name = "blocks.0.self_attn.q_proj"
+    a, b = _factors(base, name, seed=40)
+    tensors = {**_kohya(name, a, b, alpha=2.0),
+               f"lora_unet_blocks_0_self_attn_q_proj.dora_scale": np.ones((1,), dtype=np.float32)}
+    path = _write(tmp_path, "dora.safetensors", tensors)
+    with pytest.raises(RuntimeError, match="DoRA"):
+        ASDX_LoraLoader._load_lora_file(path)
+
+
 def _header_file(tmp_path, fname, keys):
     return _write(tmp_path, fname, {k: np.zeros((1, 1), dtype=np.float32) for k in keys})
 

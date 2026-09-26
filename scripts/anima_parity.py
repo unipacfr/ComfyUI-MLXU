@@ -13,6 +13,16 @@ comparison. Re-running either half alone re-generates fresh random inputs
 unless the other half already wrote them to --scratch first, so always do
 the `--only comfy` pass first (it also writes the shared inputs).
 
+Add `--lora PATH --strength S` to BOTH invocations (same PATH/strength on
+each side) to run the LoRA leg instead of (in addition to) the base-model
+leg: ComfyUI applies the LoRA via `comfy.sd.load_lora_for_models` +
+`model_patcher.patch_model()` (proven applied: its output must differ from
+the unpatched base), MLX via `ASDX_LoraLoader._load_lora_file` +
+`_apply_lora_to_transformer` at the same strength. Pass criterion (fp32,
+CPU stream both sides): cosine of the LoRA-induced difference
+`(v_lora - v_base)` between the two sides > 0.999, norm ratio within 1%.
+Harness self-check still runs first on each side's own v_lora.
+
 Pass criterion: cosine similarity of the two velocity outputs > 0.9999 in
 float32 -- ComfyUI on CPU float32 vs MLX float32 under `mx.stream(mx.cpu)`.
 The MLX CPU stream is required for the comparison: float32 matmul on the
@@ -101,11 +111,12 @@ def _inputs(scratch: Path) -> dict[str, np.ndarray]:
     return inputs
 
 
-def run_comfy(checkpoint: str, scratch: Path) -> None:
+def run_comfy(checkpoint: str, scratch: Path, lora_path: str | None = None, strength: float = 1.0) -> None:
     import torch
 
     sys.path.insert(0, str(COMFYUI_ROOT))
     import comfy.sd  # noqa: E402  (path insert must happen first)
+    import comfy.utils  # noqa: E402
 
     inputs = _inputs(scratch)
     x = torch.from_numpy(inputs["x"])[:, :, None]  # [1,16,64,64] -> [1,16,1,64,64]
@@ -114,30 +125,52 @@ def run_comfy(checkpoint: str, scratch: Path) -> None:
     ids = torch.from_numpy(inputs["ids"])
     weights = torch.from_numpy(inputs["weights"])[..., None]  # [1,12] -> [1,12,1]
 
+    def forward(dit) -> np.ndarray:
+        dit.eval()
+        with torch.no_grad():
+            return dit(x, sigma, qwen, t5xxl_ids=ids, t5xxl_weights=weights).numpy()[:, :, 0]
+
     model = comfy.sd.load_diffusion_model(checkpoint, model_options={"dtype": torch.float32})
-    dit = model.model.diffusion_model
-    dit.eval()
 
-    with torch.no_grad():
-        out_a = dit(x, sigma, qwen, t5xxl_ids=ids, t5xxl_weights=weights).numpy()[:, :, 0]
-        out_b = dit(x, sigma, qwen, t5xxl_ids=ids, t5xxl_weights=weights).numpy()[:, :, 0]
-
+    out_a = forward(model.model.diffusion_model)
+    out_b = forward(model.model.diffusion_model)
     diff = float(np.max(np.abs(out_a - out_b)))
     cos = _cosine(out_a, out_b)
-    print(f"[comfy] harness self-check: max abs diff={diff!r}, cosine={cos!r}")
-    _assert_self_match(diff, cos, "ComfyUI")
-
+    print(f"[comfy] harness self-check (base): max abs diff={diff!r}, cosine={cos!r}")
+    _assert_self_match(diff, cos, "ComfyUI base")
     np.save(scratch / "out_comfy_fp32.npy", out_a)
-    print(f"[comfy] saved fp32 output -> {scratch / 'out_comfy_fp32.npy'}")
+    print(f"[comfy] saved fp32 base output -> {scratch / 'out_comfy_fp32.npy'}")
+
+    if lora_path is None:
+        return
+
+    lora_sd = comfy.utils.load_torch_file(lora_path)
+    patched = comfy.sd.load_lora_for_models(model, None, lora_sd, strength, 0)[0]
+    dit_lora = patched.patch_model()  # applies patches in place, returns the patched torch model
+    try:
+        out_lora_a = forward(dit_lora.diffusion_model)
+        out_lora_b = forward(dit_lora.diffusion_model)
+    finally:
+        patched.unpatch_model()
+
+    diff_lora = float(np.max(np.abs(out_lora_a - out_lora_b)))
+    cos_lora = _cosine(out_lora_a, out_lora_b)
+    print(f"[comfy] harness self-check (lora): max abs diff={diff_lora!r}, cosine={cos_lora!r}")
+    _assert_self_match(diff_lora, cos_lora, "ComfyUI lora")
+
+    # Prove the patch was actually applied: the LoRA-ed output must differ
+    # from the unpatched base output on the SAME inputs.
+    applied_diff = float(np.max(np.abs(out_lora_a - out_a)))
+    print(f"[comfy] LoRA patch applied: max abs diff vs base={applied_diff!r} "
+          f"({'OK' if applied_diff > 0 else 'NO-OP -- patch not applied!'})")
+    assert applied_diff > 0, "ComfyUI LoRA patch had no effect -- patch_model() did not apply it"
+
+    np.save(scratch / "out_comfy_lora_fp32.npy", out_lora_a)
+    print(f"[comfy] saved fp32 lora output -> {scratch / 'out_comfy_lora_fp32.npy'}")
 
 
-def run_mlx(checkpoint: str, scratch: Path) -> None:
+def run_mlx(checkpoint: str, scratch: Path, lora_path: str | None = None, strength: float = 1.0) -> None:
     import mlx.core as mx
-
-    sys.path.insert(0, str(REPO_ROOT / "tests"))
-    from support.anima_module_loader import load_native_module  # noqa: E402
-
-    weight_map = load_native_module("anima.weight_map")
 
     inputs = _inputs(scratch)
 
@@ -152,6 +185,49 @@ def run_mlx(checkpoint: str, scratch: Path) -> None:
             return np.array(out)
 
     cpu = mx.stream(mx.cpu)
+
+    if lora_path is not None:
+        # Same comfy-stub loader tests/test_lora_anima_real.py uses, so
+        # ASDX_LoraLoader._load_lora_file/_apply_lora_to_transformer see the
+        # exact code path a real workflow's LoRA Loader node runs.
+        sys.path.insert(0, str(REPO_ROOT / "tests"))
+        from support.comfy_stub import install_comfy_stubs, load_node_module  # noqa: E402
+
+        install_comfy_stubs()
+        lora_mod = load_node_module("lora")
+        weight_map = load_node_module("native.anima.weight_map")
+
+        model_fp32 = weight_map.load_anima_checkpoint(checkpoint, dtype="float32")
+        out_a = forward(model_fp32, cpu)
+        np.save(scratch / "out_mlx_fp32.npy", out_a)
+        print(f"[mlx] saved fp32/cpu base output -> {scratch / 'out_mlx_fp32.npy'}")
+
+        lora = lora_mod.ASDX_LoraLoader._load_lora_file(Path(lora_path))
+        lora.scale = lora_mod.base_lora_scale(lora.alpha, lora.rank) * strength
+        with cpu:
+            lora_model = lora_mod.ASDX_LoraLoader._apply_lora_to_transformer(model_fp32, lora, None)
+        out_lora_a = forward(lora_model, cpu)
+        out_lora_b = forward(lora_model, cpu)
+
+        diff_lora = float(np.max(np.abs(out_lora_a - out_lora_b)))
+        cos_lora = _cosine(out_lora_a, out_lora_b)
+        print(f"[mlx] harness self-check (lora, fp32/cpu): max abs diff={diff_lora!r}, cosine={cos_lora!r}")
+        _assert_self_match(diff_lora, cos_lora, "MLX lora")
+
+        applied_diff = float(np.max(np.abs(out_lora_a - out_a)))
+        print(f"[mlx] LoRA patch applied: max abs diff vs base={applied_diff!r} "
+              f"({'OK' if applied_diff > 0 else 'NO-OP -- patch not applied!'})")
+        assert applied_diff > 0, "MLX LoRA apply had no effect"
+
+        np.save(scratch / "out_mlx_lora_fp32.npy", out_lora_a)
+        print(f"[mlx] saved fp32/cpu lora output -> {scratch / 'out_mlx_lora_fp32.npy'}")
+        return
+
+    sys.path.insert(0, str(REPO_ROOT / "tests"))
+    from support.anima_module_loader import load_native_module  # noqa: E402
+
+    weight_map = load_native_module("anima.weight_map")
+
     model_fp32 = weight_map.load_anima_checkpoint(checkpoint, dtype="float32")
     out_a = forward(model_fp32, cpu)
     out_b = forward(model_fp32, cpu)
@@ -217,19 +293,59 @@ def compare(scratch: Path) -> None:
             print("[parity] fp16 comfy-vs-mlx: output is NOT finite (NaN/Inf present)")
 
 
+def compare_lora(scratch: Path) -> None:
+    """The real check for a LoRA leg: compare the LoRA-INDUCED DIFFERENCE
+    `(v_lora - v_base)` between ComfyUI and MLX, not just the full outputs
+    -- two frameworks can agree closely on the (dominant) base signal while
+    disagreeing on a LoRA effect that is a small fraction of its magnitude.
+    Pass: difference cosine > 0.999 and norm ratio within 1%."""
+    base_comfy = np.load(scratch / "out_comfy_fp32.npy")
+    base_mlx = np.load(scratch / "out_mlx_fp32.npy")
+    lora_comfy = np.load(scratch / "out_comfy_lora_fp32.npy")
+    lora_mlx = np.load(scratch / "out_mlx_lora_fp32.npy")
+
+    cos_full = _cosine(lora_comfy, lora_mlx)
+    print(f"[parity] lora full-output comfy-vs-mlx: cosine={cos_full:.8f}")
+
+    d_comfy = (lora_comfy - base_comfy).astype(np.float64)
+    d_mlx = (lora_mlx - base_mlx).astype(np.float64)
+    cos_diff = float(np.dot(d_comfy.reshape(-1), d_mlx.reshape(-1))
+                      / (np.linalg.norm(d_comfy) * np.linalg.norm(d_mlx)))
+    norm_comfy = float(np.linalg.norm(d_comfy))
+    norm_mlx = float(np.linalg.norm(d_mlx))
+    norm_ratio = norm_mlx / norm_comfy if norm_comfy else float("nan")
+    within_1pct = abs(norm_ratio - 1.0) <= 0.01
+    status = "PASS" if (cos_diff > 0.999 and within_1pct) else "FAIL"
+    print(
+        f"[parity] lora-induced-diff comfy-vs-mlx: cosine={cos_diff:.8f} (threshold >0.999), "
+        f"norm ratio (mlx/comfy)={norm_ratio:.6f} (threshold within 1%), "
+        f"|comfy diff|={norm_comfy:.6e}, |mlx diff|={norm_mlx:.6e} ({status})"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     parser.add_argument("--scratch", default=str(Path(tempfile.gettempdir()) / "anima_parity"))
     parser.add_argument("--only", choices=["comfy", "mlx"], default=None,
                          help="Run only one half (use when the other interpreter lacks torch+comfy or mlx).")
+    parser.add_argument("--lora", default=None, help="LoRA .safetensors path -- run the LoRA leg instead of the base-model-only leg.")
+    parser.add_argument("--strength", type=float, default=1.0)
     args = parser.parse_args()
     scratch = Path(args.scratch)
 
     if args.only in (None, "comfy"):
-        run_comfy(args.checkpoint, scratch)
+        run_comfy(args.checkpoint, scratch, args.lora, args.strength)
     if args.only in (None, "mlx"):
-        run_mlx(args.checkpoint, scratch)
+        run_mlx(args.checkpoint, scratch, args.lora, args.strength)
+
+    if args.lora is not None:
+        needed = ("out_comfy_fp32.npy", "out_mlx_fp32.npy", "out_comfy_lora_fp32.npy", "out_mlx_lora_fp32.npy")
+        if all((scratch / n).exists() for n in needed):
+            compare_lora(scratch)
+        else:
+            print(f"[parity] only one half has run so far; rerun with --only <the other half> --scratch {scratch} --lora {args.lora} --strength {args.strength}")
+        return
 
     if (scratch / "out_comfy_fp32.npy").exists() and (scratch / "out_mlx_fp32.npy").exists():
         compare(scratch)

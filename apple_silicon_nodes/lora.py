@@ -2264,6 +2264,17 @@ class ASDX_LoraLoader(io.ComfyNode):
         else:
             raise ValueError(f"Unsupported LoRA format: {path.suffix}")
 
+        dora_keys = [k for k in raw if k.endswith("dora_scale")]
+        if dora_keys:
+            # `dora_scale` carries DoRA's magnitude component; no branch below
+            # matches that suffix, so it would otherwise be silently DROPPED
+            # and the LoRA would apply its direction-only delta with no error
+            # -- refuse instead of applying a partial, wrong-magnitude LoRA.
+            raise RuntimeError(
+                f"{path.name}: DoRA LoRAs are not supported (found {len(dora_keys)} "
+                f"'*.dora_scale' key(s), e.g. {dora_keys[0]})"
+            )
+
         # Extract deltas from raw weights
         lora = LoRAAdapter(name=name)
         deltas: dict[str, tuple[mx.array, mx.array]] = {}  # key -> (A, B) or diff
