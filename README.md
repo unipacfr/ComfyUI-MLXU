@@ -239,13 +239,18 @@ Accepted DiT checkpoint formats: bf16 safetensors and int8 convrot, via the stan
 must be a multiple of 16. LoRA is not supported yet on Anima (`ASDX_MultiLoraLoader` raises a
 clear error rather than silently ignoring the checkpoint).
 
-CFG: base and aesthetic checkpoints use true two-pass classifier-free guidance, cfg ~4.5, and
-need a negative prompt merged in via `🍏 ASDX Conditioning Merger`; Turbo checkpoints run a
-single pass at cfg 1.0 with no negative required.
+CFG: on the sampler node this is the `guidance` widget (default 3.5), not a separate `cfg`
+widget. Base and aesthetic checkpoints use true two-pass classifier-free guidance and need a
+negative prompt merged in via `🍏 ASDX Conditioning Merger` -- set `guidance` to ~4.5 for these;
+without a negative prompt, `guidance` > 1.0 raises a clear error naming the merger. Turbo
+checkpoints run a single pass with no negative required -- set `guidance` to 1.0. Anima only
+supports text-to-image: connecting an `image`/`mask`/`depth_image` input, or picking an
+img2img/inpaint/fill/depth sampler mode, raises a clear error. Live preview is not available
+for Anima yet.
 
 Minimal graph: `Diffusion Loader` (bf16 or int8 convrot) -> `CLIP Loader` (Qwen3-0.6B TE) -> two
 `CLIP Text Encode` (positive/negative) -> `Conditioning Merger` -> `Empty Latent`
-(`latent_format = anima`) -> `Sampler` (cfg 4.5 base/aesthetic, or cfg 1.0 for Turbo) ->
+(`latent_format = anima`) -> `Sampler` (`guidance` 4.5 for base/aesthetic, or 1.0 for Turbo) ->
 `VAE Decode (MLX)` -> `SaveImage`.
 
 ## Installation
