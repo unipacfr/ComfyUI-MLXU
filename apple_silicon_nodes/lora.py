@@ -335,9 +335,10 @@ def _delta_from_factors(a: mx.array, b: mx.array) -> mx.array:
         # delta gets added to is [out, kh, kw, in] (see native/sdxl/model.py's
         # checkpoint-load transpose) -- without this, the delta silently has
         # the wrong shape for the target parameter it's summed into.
-        return delta.transpose(0, 2, 3, 1).astype(b.dtype)
-    # Standard LoRA: delta = B @ A
-    return (b.astype(mx.float32) @ a.astype(mx.float32)).astype(b.dtype)
+        return delta.transpose(0, 2, 3, 1)
+    # Standard LoRA: delta = B @ A, float32 whatever the factors' file dtype
+    # (merge paths narrow it to the target weight's dtype themselves).
+    return b.astype(mx.float32) @ a.astype(mx.float32)
 
 
 def _materialize_delta(key: str, lora: "LoRAAdapter") -> mx.array | None:
@@ -515,6 +516,7 @@ def _delta_from_loha(
     The tucker/CP variant (`hada_t1`/`hada_t2`, conv-only in LyCORIS) is NOT
     handled here; callers detect and report it rather than guessing.
     """
+    w1a, w1b, w2a, w2b = (p.astype(mx.float32) for p in (w1a, w1b, w2a, w2b))
     return (((w1a @ w1b) * (w2a @ w2b)) * scale)
 
 
@@ -530,13 +532,13 @@ def _delta_from_lokr(w1: mx.array, w2: mx.array) -> mx.array:
     sources" record warns about -- it produced a 118.6GB peak on a real 64GB
     machine before this was made lazy.
 
-    Kept in the factors' own dtype rather than promoted to float32: the
-    product is a single elementwise multiply with no accumulation, so there
-    is nothing for the wider type to protect, and float32 here doubles the
-    transient cost of the largest array in the whole apply path.
+    Returned float32 like every other full-size materialization: the factors
+    now keep their file dtype (bf16), and this matches the float32 delta the
+    old bf16->float32 load upcast produced, so merge precision is unchanged.
     """
     r1, c1 = w1.shape
     r2, c2 = w2.shape
+    w1, w2 = w1.astype(mx.float32), w2.astype(mx.float32)
     return (w1.reshape(r1, 1, c1, 1) * w2.reshape(1, r2, 1, c2)).reshape(r1 * r2, c1 * c2)
 
 
@@ -590,7 +592,10 @@ class AdaptableLinear(nn.Linear):
     def __call__(self, x: mx.array) -> mx.array:
         y = super().__call__(x)
         for a, b, scale in self._lora_factors:
-            residual = (x.astype(a.dtype) @ a.T) @ b.T
+            # No cast: MLX's natural promotion (bf16 x bf16 -> bf16, bf16 x
+            # f16/f32 -> f32), narrowed to the host dtype before the add --
+            # mlx-gen `adapters.rs` `Adapter::residual` convention.
+            residual = (x @ a.T) @ b.T
             y = y + (scale * residual).astype(y.dtype)
         for w1, w2, scale in self._lokr_factors:
             y = y + (scale * _kron_matmul(x.astype(w1.dtype), w1, w2)).astype(y.dtype)
@@ -609,7 +614,7 @@ class AdaptableLinear(nn.Linear):
         array, so this is safe even though the clone initially shares the
         same underlying array reference as the leaf it was cloned from.
         """
-        self.weight = self.weight + (scale * delta).astype(self.weight.dtype)
+        self.weight = self.weight + (scale * delta.astype(mx.float32)).astype(self.weight.dtype)
         # Force this merge to completion before returning, then drop the
         # buffers it allocated. MLX is lazy: without this, N merges build one
         # giant unevaluated graph that keeps every intermediate AND every
@@ -639,7 +644,7 @@ class AdaptableLinear(nn.Linear):
         """
         if "bias" not in self:
             return False
-        self.bias = self.bias + (scale * delta).astype(self.bias.dtype)
+        self.bias = self.bias + (scale * delta.astype(mx.float32)).astype(self.bias.dtype)
         return True
 
     @classmethod
@@ -1993,12 +1998,11 @@ def _assemble_fused_delta(
     if consumed == 0:
         return None, 0
     in_features = next(p.shape[1] for p in pieces if p is not None)
-    dtype = next(p.dtype for p in pieces if p is not None)
     blocks = [
         p.astype(mx.float32) if p is not None else mx.zeros((length, in_features), dtype=mx.float32)
         for p, length in zip(pieces, lengths)
     ]
-    return mx.concatenate(blocks, axis=0).astype(dtype), consumed
+    return mx.concatenate(blocks, axis=0), consumed
 
 
 def _resolve_flux_double_diffusers_lora(
@@ -2265,14 +2269,11 @@ class ASDX_LoraLoader(io.ComfyNode):
         name = path.stem
 
         if path.suffix == ".safetensors":
-            import torch
-            import safetensors.torch
-            state = safetensors.torch.load_file(path, device="cpu")
-            raw = {}
-            for k, v in state.items():
-                if v.dtype == torch.bfloat16:
-                    v = v.float()
-                raw[k] = v.cpu().numpy()
+            # `mx.load` keeps each tensor's file dtype (bf16 included), so the
+            # low-rank factors reach `AdaptableLinear` as stored -- the old
+            # torch->numpy route upcast every bf16 factor to float32 (numpy
+            # has no bf16), which made the per-step residual run in float32.
+            raw = mx.load(str(path))
         elif path.suffix == ".pt" or path.suffix == ".bin":
             import torch
             state = torch.load(path, map_location="cpu")
@@ -2327,7 +2328,7 @@ class ASDX_LoraLoader(io.ComfyNode):
                         pass
                 continue
 
-            weight_arr = mx.array(weight if isinstance(weight, mx.array) else weight)
+            weight_arr = _as_mx(weight)
 
             # Standard LoRA format: {prefix}.lora_A.{param} / {prefix}.lora_B.{param}
             if ".lora_A." in key:
@@ -2361,7 +2362,7 @@ class ASDX_LoraLoader(io.ComfyNode):
                         break
                 prefix = _normalize_native_lora_key(prefix)
                 if prefix not in deltas:
-                    deltas[prefix] = (deltas[prefix][0], None)
+                    deltas[prefix] = (None, None)
                 deltas[prefix] = (deltas[prefix][0], weight_arr)
             elif ".lora_up." in key:
                 # kohya-style format: {prefix}.lora_up.weight / {prefix}.lora_down.weight
