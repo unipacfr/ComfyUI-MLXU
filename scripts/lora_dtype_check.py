@@ -327,8 +327,10 @@ def run_lora(transformer, config, forward, lora_path: Path, lora_mod, rounds: in
     out_base = np.array(forward(transformer).astype(mx.float32))
     out_new = np.array(forward(transformer_new).astype(mx.float32))
     patch()
-    out_old = np.array(forward(transformer_old).astype(mx.float32))
-    restore()
+    try:
+        out_old = np.array(forward(transformer_old).astype(mx.float32))
+    finally:
+        restore()
 
     d_new = out_new - out_base
     d_old = out_old - out_base
@@ -343,8 +345,10 @@ def run_lora(transformer, config, forward, lora_path: Path, lora_mod, rounds: in
         t0 = time.perf_counter(); forward(transformer); t_base.append(time.perf_counter() - t0)
         t0 = time.perf_counter(); forward(transformer_new); t_new.append(time.perf_counter() - t0)
         patch()
-        t0 = time.perf_counter(); forward(transformer_old); t_old.append(time.perf_counter() - t0)
-        restore()
+        try:
+            t0 = time.perf_counter(); forward(transformer_old); t_old.append(time.perf_counter() - t0)
+        finally:
+            restore()
 
     return dict(
         lora_file=lora_path.name,
