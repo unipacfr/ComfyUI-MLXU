@@ -451,10 +451,19 @@ def calculate_sigmas(
             return generate_sigmas_sdxl(steps)
         return generate_sigmas(steps, model_type, width, height)
 
-    model_sampling: Any = (
-        SDXLSampling() if model_type == "sdxl"
-        else _FlowModelSampling(_flow_shift_fn(model_type, width, height))
-    )
+    if model_type == "sdxl":
+        model_sampling: Any = SDXLSampling()
+    elif model_type in ("zimage", "zimage_turbo", "anima"):
+        # ModelSamplingDiscreteFlow's default `timesteps=1000` (comfy/
+        # model_sampling.py::ModelSamplingDiscreteFlow.set_parameters), NOT
+        # ModelSamplingFlux's 10000 -- using the 10000-point default here made
+        # sigma_min = time_snr_shift(shift, 1e-4) instead of the real
+        # time_snr_shift(shift, 1e-3), which fed wrong tables into karras/
+        # sgm_uniform/simple/beta (confirmed against a real ModelSamplingDiscreteFlow
+        # instance: karras_20 was off by up to 0.077 before this fix).
+        model_sampling = _FlowModelSampling(_flow_shift_fn(model_type, width, height), num_steps=1000)
+    else:
+        model_sampling = _FlowModelSampling(_flow_shift_fn(model_type, width, height))
 
     if scheduler_name == "karras":
         return _karras_scheduler(model_sampling.sigma_min, model_sampling.sigma_max, steps)

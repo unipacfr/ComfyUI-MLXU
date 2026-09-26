@@ -29,6 +29,7 @@ from comfy_api.latest import io
 
 from . import bridge
 from .native import FluxTransformer
+from .native.anima import AnimaTransformer
 from .native.flux2 import Flux2Transformer
 from .native.krea2 import SingleStreamDiT
 from .native.minimax_h3.model import MiniMaxH3Model
@@ -2388,6 +2389,21 @@ class ASDX_LoraLoader(io.ComfyNode):
         this is cheap relative to a real checkpoint reload — only the
         LoRA-targeted arrays are freshly computed.
         """
+        if isinstance(transformer, AnimaTransformer):
+            # Anima has no Phase 1-3 forward-time residual and no merge branch
+            # below (its DiT weight names don't match any of the
+            # double_blocks./img_attn./etc. patterns those branches key on) --
+            # detect_lora_family also has no Anima signature, so falling
+            # through here would either silently no-op or misfile the LoRA
+            # under a generic name-merge. Every LoRA application path (static
+            # ASDX_LoraLoader, ASDX_MultiLoraLoader, and the per-step
+            # ASDX_LoraSchedule rescale in sampler/core.py::_update_lora_schedule)
+            # calls this one staticmethod, so the guard here covers all of them.
+            raise RuntimeError(
+                "ASDX: LoRA is not supported for Anima yet -- remove the LoRA "
+                "loader or use ComfyUI's native nodes for this model."
+            )
+
         from mlx.utils import tree_flatten, tree_unflatten
 
         if not lora.deltas and not lora.factors and not lora.lokr_factors \

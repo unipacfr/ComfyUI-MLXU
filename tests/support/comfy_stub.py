@@ -196,6 +196,18 @@ def load_node_module(module_name: str) -> types.ModuleType:
             "apple_silicon_nodes.native.krea2",
         ):
             sys.modules.pop(_name, None)
+    # Same poisoning, but for `apple_silicon_nodes.native.anima` specifically:
+    # `tests/support/anima_module_loader.py` (used by tests/native/anima/*)
+    # registers it as an empty namespace-package stub (no __init__ run), which
+    # can survive in sys.modules across the whole pytest session even when
+    # `apple_silicon_nodes.native` itself is the real package -- breaking
+    # `lora.py`'s `from .native.anima import AnimaTransformer`. Drop only the
+    # poisoned "anima" package entry; its real leaf submodules (model/config/
+    # weight_map, already imported with real __file__s) are reused when the
+    # package re-imports.
+    anima_mod = sys.modules.get("apple_silicon_nodes.native.anima")
+    if anima_mod is not None and getattr(anima_mod, "__file__", None) is None:
+        sys.modules.pop("apple_silicon_nodes.native.anima", None)
     full_name = f"apple_silicon_nodes.{module_name}"
     if full_name in sys.modules:
         return sys.modules[full_name]

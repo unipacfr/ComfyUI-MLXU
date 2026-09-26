@@ -83,6 +83,30 @@ def test_cfg_runs_two_passes_per_step():
     assert len(core.transformer.calls) == 4
 
 
+def test_cfg_output_value_matches_true_cfg_formula():
+    """Call-count checks alone can't tell `v_neg + cfg*(v_pos-v_neg)` (correct)
+    apart from a sign-swapped `v_pos + cfg*(v_neg-v_pos)` (wrong) -- both make
+    exactly 2 calls/step. With this fake (v_pos=0, v_neg=1), the correct
+    formula gives v=1-cfg; the swapped one gives v=cfg. Euler's update reduces
+    to `x_next = x + v*(sigma_next-sigma)` (`_to_d` docstring: d==v exactly
+    when denoised=x-v*sigma), which telescopes over a constant v from x_0=0 to
+    `x_final = v*(0-sigma_0) = -v*sigma_0` (schedule always ends at sigma=0) --
+    exact, no floating-point-schedule dependence beyond sigma_0 itself."""
+    steps = 2
+    cfg = 4.5
+    core = _core(guidance=cfg)
+    out = core.run(steps=steps, seed=0)
+
+    sigma_0 = core_mod.calculate_sigmas("anima", "normal", steps, 128, 128)[0]
+    expected_v = 1.0 - cfg  # v_neg(=1) + cfg*(v_pos(=0) - v_neg(=1))
+    expected_x = -expected_v * sigma_0
+
+    expected_latent = core_mod.bridge.mlx_to_comfy_latent_anima(
+        mx.full((1, 16, 16, 16), expected_x, dtype=mx.float32), {"samples": None}
+    )
+    torch.testing.assert_close(out["samples"], expected_latent["samples"], atol=1e-4, rtol=1e-4)
+
+
 def test_cfg_one_is_single_pass_and_needs_no_negative():
     core = _core(guidance=1.0, negative=False)
     core.run(steps=2, seed=0)
