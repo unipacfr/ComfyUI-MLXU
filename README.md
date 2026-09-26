@@ -236,7 +236,8 @@ adapter itself runs in native MLX, inside the sampler -- once per prompt, unless
 target follows the schedule too.
 
 Accepted DiT checkpoint formats: bf16 safetensors and int8 convrot, via the standard
-`🍏 ASDX Diffusion Loader`. Load the VAE with `🍏 ASDX VAE Loader` (Wan2.1/Qwen VAE).
+`🍏 ASDX Diffusion Loader`. All-in-one checkpoints that also bundle the text encoder and VAE
+load too; only the DiT is used, so the encoder and VAE still come from their own loaders. Load the VAE with `🍏 ASDX VAE Loader` (Wan2.1/Qwen VAE).
 `🍏 ASDX Empty Latent` needs `latent_format = "anima"` (16ch, 8x VAE downscale); width/height
 must be a multiple of 16.
 

@@ -13,6 +13,8 @@ from .config import detect_anima_config
 from .model import AnimaTransformer
 
 _PREFIXES = ("model.diffusion_model.", "net.")
+# All-in-one checkpoints bundle the text encoder and VAE; the DiT loader ignores them.
+_BUNDLED_PREFIXES = ("cond_stage_model.", "first_stage_model.")
 
 
 def strip_anima_prefix(key: str) -> str:
@@ -26,7 +28,11 @@ def load_anima_checkpoint(path: str | Path, dtype: str = "bfloat16") -> AnimaTra
     from .. import _load_safetensors
 
     path = Path(path)
-    state = {strip_anima_prefix(k): v for k, v in _load_safetensors(path).items()}
+    state = {
+        strip_anima_prefix(k): v
+        for k, v in _load_safetensors(path).items()
+        if not k.startswith(_BUNDLED_PREFIXES)
+    }
     config = detect_anima_config(state, dtype=dtype)
     model = AnimaTransformer(config)
 

@@ -14,6 +14,7 @@ wm = load_native_module("anima.weight_map")
 
 _DIR = Path("/Volumes/X10Pro/Images/models/diffusion_models/Anima")
 _BF16 = _DIR / "anime/WaiHassakuAnima.safetensors"
+_AIO = _DIR / "realistic/RealAnimeCAT_ANIMAv1_v2.safetensors"  # bundles TE + VAE
 _INT8 = _DIR / "anima/DaSiWa-ANIMA-ObsidianArchives-v2_int8_row-wise_convrot_runtime.safetensors"
 
 
@@ -22,7 +23,7 @@ def test_strip_prefix():
     assert wm.strip_anima_prefix("net.llm_adapter.embed.weight") == "llm_adapter.embed.weight"
 
 
-@pytest.mark.parametrize("path", [_BF16, _INT8], ids=["bf16", "int8_convrot"])
+@pytest.mark.parametrize("path", [_BF16, _INT8, _AIO], ids=["bf16", "int8_convrot", "all_in_one"])
 def test_real_checkpoint_loads_strictly(path, capsys):
     if not path.exists():
         pytest.skip(f"no local {path.name}")
